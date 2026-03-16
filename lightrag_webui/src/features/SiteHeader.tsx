@@ -1,6 +1,8 @@
+import { useEffect, useMemo, useState } from 'react'
 import Button from '@/components/ui/Button'
 import { SiteInfo, webuiPrefix } from '@/lib/constants'
 import AppSettings from '@/components/AppSettings'
+import { getWorkspaces, type WorkspaceItem } from '@/api/lightrag'
 import { TabsList, TabsTrigger } from '@/components/ui/Tabs'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
@@ -57,6 +59,81 @@ function TabsNavigation() {
 export default function SiteHeader() {
   const { t } = useTranslation()
   const { isGuestMode, coreVersion, apiVersion, username, webuiTitle, webuiDescription } = useAuthStore()
+  const currentTab = useSettingsStore.use.currentTab()
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
+  const workspaceHistory = useSettingsStore.use.workspaceHistory()
+  const setSelectedWorkspaceId = useSettingsStore.use.setSelectedWorkspaceId()
+  const [workspaceRemoteOptions, setWorkspaceRemoteOptions] = useState<WorkspaceItem[]>([])
+
+  useEffect(() => {
+    let disposed = false
+
+    const loadWorkspaces = async () => {
+      try {
+        const response = await getWorkspaces()
+        if (disposed) return
+        const apiWorkspaces = (response.workspace_items || [])
+          .map((item) => ({
+            workspace_id: item.workspace_id?.trim() || '',
+            workspace_name: item.workspace_name?.trim() || item.workspace_id?.trim() || ''
+          }))
+          .filter((item) => !!item.workspace_id)
+        setWorkspaceRemoteOptions(apiWorkspaces)
+
+        const firstWorkspaceId = apiWorkspaces[0]?.workspace_id
+        const selectedInRemoteList = apiWorkspaces.some(
+          (item) => item.workspace_id === selectedWorkspaceId
+        )
+
+        // Default selection should be the first workspace in returned list.
+        if (
+          firstWorkspaceId &&
+          (!selectedWorkspaceId ||
+            selectedWorkspaceId === 'default' ||
+            !selectedInRemoteList)
+        ) {
+          setSelectedWorkspaceId(firstWorkspaceId)
+        }
+      } catch (error) {
+        console.error('Failed to load workspaces:', error)
+      }
+    }
+
+    loadWorkspaces()
+    return () => {
+      disposed = true
+    }
+  }, [selectedWorkspaceId, setSelectedWorkspaceId])
+
+  const workspaceOptions = useMemo(() => {
+    const deduped = new Set<string>()
+    const options: WorkspaceItem[] = []
+
+    // Keep API order first so the first option can be used as default selection.
+    for (const item of workspaceRemoteOptions) {
+      const normalized = item.workspace_id.trim()
+      if (!normalized || deduped.has(normalized)) continue
+      deduped.add(normalized)
+      options.push({
+        workspace_id: normalized,
+        workspace_name: item.workspace_name?.trim() || normalized
+      })
+    }
+
+    for (const id of workspaceHistory) {
+      const normalized = id.trim()
+      if (!normalized || deduped.has(normalized)) continue
+      deduped.add(normalized)
+      options.push({ workspace_id: normalized, workspace_name: normalized })
+    }
+
+    if (options.length === 0) {
+      const fallbackWorkspace = selectedWorkspaceId.trim() || 'default'
+      options.push({ workspace_id: fallbackWorkspace, workspace_name: fallbackWorkspace })
+    }
+
+    return options
+  }, [selectedWorkspaceId, workspaceHistory, workspaceRemoteOptions])
 
   const versionDisplay = (coreVersion && apiVersion)
     ? `${coreVersion}/${apiVersion}`
@@ -109,8 +186,29 @@ export default function SiteHeader() {
         )}
       </div>
 
-      <nav className="w-[200px] flex items-center justify-end">
+      <nav className="min-w-[420px] flex items-center justify-end">
         <div className="flex items-center gap-2">
+          {(currentTab === 'documents' || currentTab === 'knowledge-graph' || currentTab === 'retrieval') && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-500 dark:text-gray-400">Workspace</span>
+              <select
+                className="h-7 w-44 rounded-md border border-input bg-background px-2 text-xs"
+                value={selectedWorkspaceId}
+                onChange={(event) => setSelectedWorkspaceId(event.target.value)}
+              >
+                {workspaceOptions.map((item) => (
+                  <option
+                    key={item.workspace_id}
+                    value={item.workspace_id}
+                  >
+                    {item.workspace_name === item.workspace_id
+                      ? item.workspace_id
+                      : `${item.workspace_name} (${item.workspace_id})`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           {versionDisplay && (
             <TooltipProvider>
               <Tooltip>

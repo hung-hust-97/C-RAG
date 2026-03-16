@@ -9,6 +9,11 @@ type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' 
 type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
 
 interface SettingsState {
+  selectedWorkspaceId: string
+  setSelectedWorkspaceId: (workspaceId: string) => void
+  workspaceHistory: string[]
+  addWorkspaceToHistory: (workspaceId: string) => void
+
   // Document manager settings
   showFileName: boolean
   setShowFileName: (show: boolean) => void
@@ -89,6 +94,8 @@ const useSettingsStoreBase = create<SettingsState>()(
     (set) => ({
       theme: 'system',
       language: 'en',
+      selectedWorkspaceId: 'default',
+      workspaceHistory: ['default'],
       showPropertyPanel: true,
       showNodeSearchBar: true,
       showLegend: false,
@@ -137,6 +144,25 @@ const useSettingsStoreBase = create<SettingsState>()(
       },
 
       setTheme: (theme: Theme) => set({ theme }),
+
+      setSelectedWorkspaceId: (workspaceId: string) => {
+        const normalized = workspaceId.trim() || 'default'
+        set((state) => {
+          const nextHistory = [normalized, ...state.workspaceHistory.filter((id) => id !== normalized)].slice(0, 20)
+          return {
+            selectedWorkspaceId: normalized,
+            workspaceHistory: nextHistory
+          }
+        })
+      },
+
+      addWorkspaceToHistory: (workspaceId: string) => {
+        const normalized = workspaceId.trim()
+        if (!normalized) return
+        set((state) => ({
+          workspaceHistory: [normalized, ...state.workspaceHistory.filter((id) => id !== normalized)].slice(0, 20)
+        }))
+      },
 
       setLanguage: (language: Language) => {
         set({ language })
@@ -238,8 +264,17 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 19,
+      version: 20,
       migrate: (state: any, version: number) => {
+        if (version < 20) {
+          state.selectedWorkspaceId = state.selectedWorkspaceId || 'default'
+          if (!Array.isArray(state.workspaceHistory) || state.workspaceHistory.length === 0) {
+            state.workspaceHistory = [state.selectedWorkspaceId]
+          }
+          if (!state.workspaceHistory.includes(state.selectedWorkspaceId)) {
+            state.workspaceHistory.unshift(state.selectedWorkspaceId)
+          }
+        }
         if (version < 2) {
           state.showEdgeLabel = false
         }

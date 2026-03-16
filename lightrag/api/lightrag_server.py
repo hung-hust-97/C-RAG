@@ -563,6 +563,91 @@ def create_app(args):
 
         return workspace
 
+    async def get_all_workspace_items() -> tuple[list[dict[str, str]], str]:
+        """Collect known workspaces with id-name mapping from storage, runtime, and input directories."""
+        default_workspace = normalize_workspace_id(args.workspace)
+        if not default_workspace:
+            default_workspace = get_default_workspace() or "default"
+
+        workspace_map: dict[str, str] = {default_workspace: default_workspace}
+        data_workspace_ids: set[str] = set()
+        workspace_map.update({ws: ws for ws in rag_instances.keys() if ws})
+        workspace_map.update({ws: ws for ws in doc_manager_instances.keys() if ws})
+
+        # Include workspace metadata persisted in PostgreSQL when available.
+        try:
+            db = getattr(getattr(rag.doc_status, "db", None), "query", None)
+            if db is not None:
+                rows = await rag.doc_status.db.query(
+                    "SELECT workspace_id, name FROM LIGHTRAG_WORKSPACES",
+                    multirows=True,
+                )
+                if rows:
+                    for row in rows:
+                        workspace_id = (row.get("workspace_id") or "").strip()
+                        if not workspace_id:
+                            continue
+                        workspace_name = (row.get("name") or "").strip() or workspace_id
+                        workspace_map[workspace_id] = workspace_name
+
+                # Fallback source: discover real workspace IDs from document status table.
+                status_rows = await rag.doc_status.db.query(
+                    "SELECT DISTINCT workspace FROM LIGHTRAG_DOC_STATUS",
+                    multirows=True,
+                )
+                if status_rows:
+                    for row in status_rows:
+                        workspace_id = (row.get("workspace") or "").strip()
+                        if not workspace_id:
+                            continue
+                        data_workspace_ids.add(workspace_id)
+                        workspace_map.setdefault(workspace_id, workspace_id)
+        except Exception as e:
+            logger.debug(f"Failed to read workspace metadata table: {e}")
+
+        input_root = Path(args.input_dir)
+        if input_root.exists() and input_root.is_dir():
+            # If files exist directly in root input dir, that implies default workspace usage.
+            has_root_files = any(item.is_file() for item in input_root.iterdir())
+            if has_root_files:
+                data_workspace_ids.add(default_workspace)
+                workspace_map.setdefault(default_workspace, default_workspace)
+
+            for item in input_root.iterdir():
+                if not item.is_dir():
+                    continue
+                if item.name.startswith("__"):
+                    continue
+                data_workspace_ids.add(item.name)
+                workspace_map.setdefault(item.name, item.name)
+
+        all_workspace_ids = sorted(ws for ws in workspace_map.keys() if ws)
+        data_first_ids = [
+            workspace_id for workspace_id in all_workspace_ids if workspace_id in data_workspace_ids
+        ]
+        remaining_ids = [
+            workspace_id for workspace_id in all_workspace_ids if workspace_id not in data_workspace_ids
+        ]
+        workspace_ids = data_first_ids + remaining_ids
+
+        # Ensure the server-configured default workspace is always pinned first.
+        if default_workspace in workspace_ids and workspace_ids[0] != default_workspace:
+            workspace_ids.remove(default_workspace)
+            workspace_ids.insert(0, default_workspace)
+
+        effective_default_workspace = workspace_ids[0] if workspace_ids else default_workspace
+
+        workspace_items = [
+            {
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_map.get(workspace_id, workspace_id)
+                or workspace_id,
+            }
+            for workspace_id in workspace_ids
+        ]
+
+        return workspace_items, effective_default_workspace
+
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1367,6 +1452,54 @@ def create_app(args):
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/workspaces",
+        dependencies=[Depends(combined_auth)],
+        summary="List available workspaces",
+        description="Returns known workspaces with workspace_id and workspace_name",
+    )
+    async def list_workspaces():
+        workspace_items, default_workspace = await get_all_workspace_items()
+        return {
+            "default_workspace": default_workspace,
+            # Keep this field for backward compatibility.
+            "workspaces": [item["workspace_id"] for item in workspace_items],
+            "workspace_items": workspace_items,
+        }
+
+    @app.put(
+        "/workspaces/{workspace_id}",
+        dependencies=[Depends(combined_auth)],
+        summary="Upsert workspace metadata",
+        description="Create or update workspace metadata (workspace_name) by workspace_id",
+    )
+    async def upsert_workspace(workspace_id: str, payload: dict[str, str]):
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        if not normalized_workspace_id:
+            raise HTTPException(status_code=400, detail="workspace_id cannot be empty")
+
+        workspace_name = (payload.get("workspace_name") or "").strip()
+        if not workspace_name:
+            workspace_name = normalized_workspace_id
+
+        db = getattr(getattr(rag.doc_status, "db", None), "ensure_workspace_metadata", None)
+        if db is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Workspace metadata table is only available for PostgreSQL doc status storage",
+            )
+
+        await rag.doc_status.db.ensure_workspace_metadata(
+            normalized_workspace_id,
+            workspace_name,
+        )
+
+        return {
+            "workspace_id": normalized_workspace_id,
+            "workspace_name": workspace_name,
+            "status": "ok",
+        }
 
     # Custom StaticFiles class for smart caching
     class SmartStaticFiles(StaticFiles):  # Renamed from NoCacheStaticFiles

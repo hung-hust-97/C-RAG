@@ -92,6 +92,18 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
         }
       }
 
+      // Seed workspace selector from backend default workspace on first run.
+      const backendWorkspace = health.configuration?.workspace?.trim()
+      if (backendWorkspace) {
+        const settings = useSettingsStore.getState()
+        const isInitialDefault = settings.selectedWorkspaceId === 'default' && settings.workspaceHistory.length <= 1
+        if (isInitialDefault) {
+          settings.setSelectedWorkspaceId(backendWorkspace)
+        } else {
+          settings.addWorkspaceToHistory(backendWorkspace)
+        }
+      }
+
       set({
         health: true,
         message: null,

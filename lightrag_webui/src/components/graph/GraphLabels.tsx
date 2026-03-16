@@ -18,6 +18,7 @@ import { getPopularLabels, searchLabels } from '@/api/lightrag'
 const GraphLabels = () => {
   const { t } = useTranslation()
   const label = useSettingsStore.use.queryLabel()
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
   const dropdownRefreshTrigger = useSettingsStore.use.searchLabelDropdownRefreshTrigger()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [refreshTrigger, setRefreshTrigger] = useState(0)
@@ -44,22 +45,17 @@ const GraphLabels = () => {
   // Initialize search history on component mount
   useEffect(() => {
     const initializeHistory = async () => {
-      const history = SearchHistoryManager.getHistory()
-
-      if (history.length === 0) {
-        // If no history exists, fetch popular labels and initialize
-        try {
-          const popularLabels = await getPopularLabels(popularLabelsDefaultLimit)
-          await SearchHistoryManager.initializeWithDefaults(popularLabels)
-        } catch (error) {
-          console.error('Failed to initialize search history:', error)
-          // No fallback needed, API is the source of truth
-        }
+      try {
+        const popularLabels = await getPopularLabels(popularLabelsDefaultLimit)
+        SearchHistoryManager.clearHistory()
+        await SearchHistoryManager.initializeWithDefaults(popularLabels)
+      } catch (error) {
+        console.error('Failed to initialize search history:', error)
       }
     }
 
     initializeHistory()
-  }, [])
+  }, [selectedWorkspaceId])
 
   // Force AsyncSelect to re-render when label changes externally (e.g., from entity rename/merge)
   useEffect(() => {

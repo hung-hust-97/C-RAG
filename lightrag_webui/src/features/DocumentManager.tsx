@@ -227,6 +227,7 @@ export default function DocumentManager() {
   const [docs, setDocs] = useState<DocsStatusesResponse | null>(null)
 
   const currentTab = useSettingsStore.use.currentTab()
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
   const showFileName = useSettingsStore.use.showFileName()
   const setShowFileName = useSettingsStore.use.setShowFileName()
   const documentsPageSize = useSettingsStore.use.documentsPageSize()
@@ -1108,6 +1109,7 @@ export default function DocumentManager() {
     }
   }, [
     currentTab,
+    selectedWorkspaceId,
     pagination.page,
     pagination.page_size,
     statusFilter,

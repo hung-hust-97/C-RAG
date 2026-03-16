@@ -199,6 +199,44 @@ class PostgreSQLDB:
             self.connection_retry_backoff_max,
             self.pool_close_timeout,
         )
+        self._registered_workspaces: dict[str, str] = {}
+
+    async def ensure_workspace_metadata(
+        self, workspace_id: str, workspace_name: str | None = None
+    ) -> None:
+        """Upsert workspace metadata row for workspace discovery and display."""
+        normalized_workspace_id = (workspace_id or "").strip()
+        if not normalized_workspace_id:
+            return
+
+        normalized_workspace_name = (workspace_name or normalized_workspace_id).strip()
+        if not normalized_workspace_name:
+            normalized_workspace_name = normalized_workspace_id
+
+        cached_name = self._registered_workspaces.get(normalized_workspace_id)
+        if cached_name == normalized_workspace_name:
+            return
+
+        upsert_workspace_sql = """
+        INSERT INTO LIGHTRAG_WORKSPACES (workspace, id, workspace_id, name, updated_at)
+        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+        ON CONFLICT (workspace, id)
+        DO UPDATE SET
+            workspace_id = EXCLUDED.workspace_id,
+            name = EXCLUDED.name,
+            updated_at = CURRENT_TIMESTAMP
+        """
+
+        await self.execute(
+            upsert_workspace_sql,
+            {
+                "workspace": normalized_workspace_id,
+                "id": normalized_workspace_id,
+                "workspace_id": normalized_workspace_id,
+                "name": normalized_workspace_name,
+            },
+        )
+        self._registered_workspaces[normalized_workspace_id] = normalized_workspace_name
 
     def _create_ssl_context(self) -> ssl.SSLContext | None:
         """Create SSL context based on configuration parameters."""
@@ -1909,6 +1947,13 @@ class PGKVStorage(BaseKVStorage):
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
 
+            try:
+                await self.db.ensure_workspace_metadata(self.workspace)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to upsert workspace metadata for '{self.workspace}': {e}"
+                )
+
     async def finalize(self):
         if self.db is not None:
             await ClientManager.release_client(self.db)
@@ -2845,6 +2890,13 @@ class PGVectorStorage(BaseVectorStorage):
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
 
+            try:
+                await self.db.ensure_workspace_metadata(self.workspace)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to upsert workspace metadata for '{self.workspace}': {e}"
+                )
+
             if not self.db.enable_vector:
                 raise ValueError(
                     "Cannot use PGVectorStorage when POSTGRES_ENABLE_VECTOR=false. Configure an alternative vector backend."
@@ -3265,6 +3317,13 @@ class PGDocStatusStorage(DocStatusStorage):
             else:
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
+
+            try:
+                await self.db.ensure_workspace_metadata(self.workspace)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to upsert workspace metadata for '{self.workspace}': {e}"
+                )
 
             # NOTE: Table creation is handled by PostgreSQLDB.initdb() during initialization
             # No need to create table here as it's already created in the TABLES dict
@@ -3949,6 +4008,13 @@ class PGGraphStorage(BaseGraphStorage):
             else:
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
+
+            try:
+                await self.db.ensure_workspace_metadata(self.workspace)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to upsert workspace metadata for '{self.workspace}': {e}"
+                )
 
             # Dynamically generate graph name based on workspace
             self.graph_name = self._get_workspace_graph_name()
@@ -5419,6 +5485,17 @@ def namespace_to_table_name(namespace: str) -> str:
 
 
 TABLES = {
+    "LIGHTRAG_WORKSPACES": {
+        "ddl": """CREATE TABLE LIGHTRAG_WORKSPACES (
+                    workspace VARCHAR(255) NOT NULL,
+                    id VARCHAR(255) NOT NULL,
+                    workspace_id VARCHAR(255) NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_WORKSPACES_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
     "LIGHTRAG_DOC_FULL": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_FULL (
                     id VARCHAR(255),

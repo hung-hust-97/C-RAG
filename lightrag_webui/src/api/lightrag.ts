@@ -138,6 +138,8 @@ export type QueryRequest = {
   user_prompt?: string
   /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
   enable_rerank?: boolean
+  /** Target workspace ID for this query. */
+  workspace_id?: string
 }
 
 export type QueryResponse = {
@@ -216,6 +218,7 @@ export type DocumentsRequest = {
   page_size: number
   sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'
   sort_direction: 'asc' | 'desc'
+  workspace_id?: string
 }
 
 export type PaginationInfo = {
@@ -273,6 +276,17 @@ export type LoginResponse = {
   api_version?: string
   webui_title?: string
   webui_description?: string
+}
+
+export type WorkspacesResponse = {
+  default_workspace: string
+  workspaces: string[]
+  workspace_items?: WorkspaceItem[]
+}
+
+export type WorkspaceItem = {
+  workspace_id: string
+  workspace_name: string
 }
 
 export const InvalidApiKeyError = 'Invalid API Key'
@@ -450,27 +464,40 @@ axiosInstance.interceptors.response.use(
 )
 
 // API methods
+const getSelectedWorkspaceId = (): string => {
+  const workspaceId = useSettingsStore.getState().selectedWorkspaceId?.trim()
+  return workspaceId || 'default'
+}
+
 export const queryGraphs = async (
   label: string,
   maxDepth: number,
   maxNodes: number
 ): Promise<LightragGraphType> => {
-  const response = await axiosInstance.get(`/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get(
+    `/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}&workspace_id=${encodeURIComponent(workspaceId)}`
+  )
   return response.data
 }
 
 export const getGraphLabels = async (): Promise<string[]> => {
-  const response = await axiosInstance.get('/graph/label/list')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get(`/graph/label/list?workspace_id=${encodeURIComponent(workspaceId)}`)
   return response.data
 }
 
 export const getPopularLabels = async (limit: number = popularLabelsDefaultLimit): Promise<string[]> => {
-  const response = await axiosInstance.get(`/graph/label/popular?limit=${limit}`)
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get(`/graph/label/popular?limit=${limit}&workspace_id=${encodeURIComponent(workspaceId)}`)
   return response.data
 }
 
 export const searchLabels = async (query: string, limit: number = searchLabelsDefaultLimit): Promise<string[]> => {
-  const response = await axiosInstance.get(`/graph/label/search?q=${encodeURIComponent(query)}&limit=${limit}`)
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get(
+    `/graph/label/search?q=${encodeURIComponent(query)}&limit=${limit}&workspace_id=${encodeURIComponent(workspaceId)}`
+  )
   return response.data
 }
 
@@ -489,17 +516,24 @@ export const checkHealth = async (): Promise<
 }
 
 export const getDocuments = async (): Promise<DocsStatusesResponse> => {
-  const response = await axiosInstance.get('/documents')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get(`/documents?workspace_id=${encodeURIComponent(workspaceId)}`)
   return response.data
 }
 
 export const scanNewDocuments = async (): Promise<ScanResponse> => {
-  const response = await axiosInstance.post('/documents/scan')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/scan', null, {
+    params: { workspace_id: workspaceId }
+  })
   return response.data
 }
 
 export const reprocessFailedDocuments = async (): Promise<ReprocessFailedResponse> => {
-  const response = await axiosInstance.post('/documents/reprocess_failed')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/reprocess_failed', null, {
+    params: { workspace_id: workspaceId }
+  })
   return response.data
 }
 
@@ -509,7 +543,11 @@ export const getDocumentsScanProgress = async (): Promise<LightragDocumentsScanP
 }
 
 export const queryText = async (request: QueryRequest): Promise<QueryResponse> => {
-  const response = await axiosInstance.post('/query', request)
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/query', {
+    ...request,
+    workspace_id: request.workspace_id ?? workspaceId
+  })
   return response.data
 }
 
@@ -518,6 +556,12 @@ export const queryTextStream = async (
   onChunk: (chunk: string) => void,
   onError?: (error: string) => void
 ) => {
+  const workspaceId = getSelectedWorkspaceId()
+  const requestWithWorkspace: QueryRequest = {
+    ...request,
+    workspace_id: request.workspace_id ?? workspaceId
+  }
+
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const headers: HeadersInit = {
@@ -535,7 +579,7 @@ export const queryTextStream = async (
     const response = await fetch(`${backendBaseUrl}/query/stream`, {
       method: 'POST',
       headers: headers,
-      body: JSON.stringify(request),
+      body: JSON.stringify(requestWithWorkspace),
     });
 
     if (!response.ok) {
@@ -558,7 +602,7 @@ export const queryTextStream = async (
             const retryResponse = await fetch(`${backendBaseUrl}/query/stream`, {
               method: 'POST',
               headers: retryHeaders,
-              body: JSON.stringify(request),
+              body: JSON.stringify(requestWithWorkspace),
             });
 
             if (!retryResponse.ok) {
@@ -780,12 +824,14 @@ export const queryTextStream = async (
 };
 
 export const insertText = async (text: string): Promise<DocActionResponse> => {
-  const response = await axiosInstance.post('/documents/text', { text })
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/text', { text, workspace_id: workspaceId })
   return response.data
 }
 
 export const insertTexts = async (texts: string[]): Promise<DocActionResponse> => {
-  const response = await axiosInstance.post('/documents/texts', { texts })
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/texts', { texts, workspace_id: workspaceId })
   return response.data
 }
 
@@ -793,8 +839,10 @@ export const uploadDocument = async (
   file: File,
   onUploadProgress?: (percentCompleted: number) => void
 ): Promise<DocActionResponse> => {
+  const workspaceId = getSelectedWorkspaceId()
   const formData = new FormData()
   formData.append('file', file)
+  formData.append('workspace_id', workspaceId)
 
   const response = await axiosInstance.post('/documents/upload', formData, {
     headers: {
@@ -826,7 +874,10 @@ export const batchUploadDocuments = async (
 }
 
 export const clearDocuments = async (): Promise<DocActionResponse> => {
-  const response = await axiosInstance.delete('/documents')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.delete('/documents', {
+    params: { workspace_id: workspaceId }
+  })
   return response.data
 }
 
@@ -907,7 +958,10 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
 }
 
 export const getPipelineStatus = async (): Promise<PipelineStatusResponse> => {
-  const response = await axiosInstance.get('/documents/pipeline_status')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get('/documents/pipeline_status', {
+    params: { workspace_id: workspaceId }
+  })
   return response.data
 }
 
@@ -915,7 +969,10 @@ export const cancelPipeline = async (): Promise<{
   status: 'cancellation_requested' | 'not_busy'
   message: string
 }> => {
-  const response = await axiosInstance.post('/documents/cancel_pipeline')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/cancel_pipeline', null, {
+    params: { workspace_id: workspaceId }
+  })
   return response.data
 }
 
@@ -947,11 +1004,13 @@ export const updateEntity = async (
   allowRename: boolean = false,
   allowMerge: boolean = false
 ): Promise<EntityUpdateResponse> => {
+  const workspaceId = getSelectedWorkspaceId()
   const response = await axiosInstance.post('/graph/entity/edit', {
     entity_name: entityName,
     updated_data: updatedData,
     allow_rename: allowRename,
-    allow_merge: allowMerge
+    allow_merge: allowMerge,
+    workspace_id: workspaceId
   })
   return response.data
 }
@@ -968,10 +1027,12 @@ export const updateRelation = async (
   targetEntity: string,
   updatedData: Record<string, any>
 ): Promise<DocActionResponse> => {
+  const workspaceId = getSelectedWorkspaceId()
   const response = await axiosInstance.post('/graph/relation/edit', {
     source_id: sourceEntity,
     target_id: targetEntity,
-    updated_data: updatedData
+    updated_data: updatedData,
+    workspace_id: workspaceId
   })
   return response.data
 }
@@ -983,7 +1044,10 @@ export const updateRelation = async (
  */
 export const checkEntityNameExists = async (entityName: string): Promise<boolean> => {
   try {
-    const response = await axiosInstance.get(`/graph/entity/exists?name=${encodeURIComponent(entityName)}`)
+    const workspaceId = getSelectedWorkspaceId()
+    const response = await axiosInstance.get(
+      `/graph/entity/exists?name=${encodeURIComponent(entityName)}&workspace_id=${encodeURIComponent(workspaceId)}`
+    )
     return response.data.exists
   } catch (error) {
     console.error('Error checking entity name:', error)
@@ -997,7 +1061,10 @@ export const checkEntityNameExists = async (entityName: string): Promise<boolean
  * @returns Promise with the track status response containing documents and summary
  */
 export const getTrackStatus = async (trackId: string): Promise<TrackStatusResponse> => {
-  const response = await axiosInstance.get(`/documents/track_status/${encodeURIComponent(trackId)}`)
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get(`/documents/track_status/${encodeURIComponent(trackId)}`, {
+    params: { workspace_id: workspaceId }
+  })
   return response.data
 }
 
@@ -1007,7 +1074,11 @@ export const getTrackStatus = async (trackId: string): Promise<TrackStatusRespon
  * @returns Promise with paginated documents response
  */
 export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<PaginatedDocsResponse> => {
-  const response = await axiosInstance.post('/documents/paginated', request)
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/paginated', {
+    ...request,
+    workspace_id: request.workspace_id ?? workspaceId
+  })
   return response.data
 }
 
@@ -1016,6 +1087,14 @@ export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<
  * @returns Promise with status counts response
  */
 export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> => {
-  const response = await axiosInstance.get('/documents/status_counts')
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get('/documents/status_counts', {
+    params: { workspace_id: workspaceId }
+  })
+  return response.data
+}
+
+export const getWorkspaces = async (): Promise<WorkspacesResponse> => {
+  const response = await axiosInstance.get('/workspaces')
   return response.data
 }

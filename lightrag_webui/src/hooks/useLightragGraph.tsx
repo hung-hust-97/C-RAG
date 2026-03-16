@@ -261,6 +261,7 @@ const createSigmaGraph = (rawGraph: RawGraph | null) => {
 const useLightrangeGraph = () => {
   const { t } = useTranslation()
   const queryLabel = useSettingsStore.use.queryLabel()
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
   const rawGraph = useGraphStore.use.rawGraph()
   const sigmaGraph = useGraphStore.use.sigmaGraph()
   const maxQueryDepth = useSettingsStore.use.graphQueryMaxDepth()
@@ -305,6 +306,22 @@ const useLightrangeGraph = () => {
       initialLoadRef.current = false
     }
   }, [queryLabel, rawGraph, sigmaGraph])
+
+  // Reset and refetch graph when workspace changes.
+  useEffect(() => {
+    const state = useGraphStore.getState()
+    state.reset()
+    state.setGraphDataFetchAttempted(false)
+    state.setLabelsFetchAttempted(false)
+    state.setLastSuccessfulQueryLabel('')
+    // Keep a usable default label so switching workspaces does not get stuck in empty mode.
+    if (!useSettingsStore.getState().queryLabel?.trim()) {
+      useSettingsStore.getState().setQueryLabel('*')
+    }
+    dataLoadedRef.current = false
+    initialLoadRef.current = false
+    emptyDataHandledRef.current = false
+  }, [selectedWorkspaceId])
 
   // Graph data fetching logic
   useEffect(() => {
@@ -403,8 +420,8 @@ const useLightrangeGraph = () => {
           const errorMessage = useBackendState.getState().message;
           const isAuthError = errorMessage && errorMessage.includes('Authentication required');
 
-          // Only clear queryLabel if it's not an auth error and current label is not empty
-          if (!isAuthError && currentQueryLabel) {
+          // Keep global label `*` to avoid sticky empty state when switching workspaces.
+          if (!isAuthError && currentQueryLabel && currentQueryLabel !== '*') {
             useSettingsStore.getState().setQueryLabel('');
           }
 

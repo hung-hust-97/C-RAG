@@ -91,6 +91,9 @@ api = [
     "pypdf>=6.1.0",                 # PDF processing
     "python-docx>=0.8.11,<2.0.0",  # DOCX processing
     "python-pptx>=0.6.21,<2.0.0",  # PPTX processing
+    # OCR fallback for scanned/image-based PDFs (requires system tesseract-ocr)
+    "pytesseract>=0.3.10",          # OCR wrapper for tesseract
+    "pdf2image>=1.16.0",            # PDF-to-image conversion (requires poppler-utils)
 ]
 
 # Advanced document processing engine (optional)

@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:17-bullseye
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: crag
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - milvus_network
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - milvus_network
+
+  milvus:
+    image: milvusdb/milvus:v2.5.11
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000        # kết nối nội bộ qua service name + port 9000
+      MINIO_ACCESS_KEY: minioadmin     # phải khớp với MINIO_ROOT_USER bên trên
+      MINIO_SECRET_KEY: minioadmin123  # phải khớp với MINIO_ROOT_PASSWORD
+    volumes:
+      - milvus_data:/var/lib/milvus
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+    #   interval: 30s
+    #   start_period: 180s
+    #   timeout: 20s
+    #   retries: 5
+    ports:
+      - "19531:19530"
+      - "19091:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - milvus_network
+
+  attu:
+    image: zilliz/attu:v2.6.4
+    restart: unless-stopped
+    environment:
+      MILVUS_URL: milvus:19530
+    ports:
+      - "3010:3000"
+    depends_on:
+      - milvus
+    networks:
+      - milvus_network
+
+  neo4j:
+    image: neo4j:5.26.0
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/Cmcati2026
+      NEO4J_dbms_memory_heap_initial__size: "1g"
+      NEO4J_dbms_memory_heap_max__size: "2g"
+      NEO4J_dbms_memory_pagecache_size: "1g"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+
+volumes:
+  postgres_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  milvus_network:
+    driver: bridge

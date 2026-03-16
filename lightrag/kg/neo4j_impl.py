@@ -1048,12 +1048,12 @@ class Neo4JStorage(BaseGraphStorage):
 
                 async def execute_upsert(tx: AsyncManagedTransaction):
                     query = f"""
-                    MERGE (n:`{workspace_label}` {{entity_id: $entity_id}})
+                    MERGE (n:`{workspace_label}` {{entity_id: $entity_id, workspace_id: $workspace_id}})
                     SET n += $properties
                     SET n:`{entity_type}`
                     """
                     result = await tx.run(
-                        query, entity_id=node_id, properties=properties
+                        query, entity_id=node_id, workspace_id=self.workspace, properties=properties
                     )
                     await result.consume()  # Ensure result is fully consumed
 
@@ -1100,9 +1100,9 @@ class Neo4JStorage(BaseGraphStorage):
                 async def execute_upsert(tx: AsyncManagedTransaction):
                     workspace_label = self._get_workspace_label()
                     query = f"""
-                    MATCH (source:`{workspace_label}` {{entity_id: $source_entity_id}})
+                    MATCH (source:`{workspace_label}` {{entity_id: $source_entity_id, workspace_id: $workspace_id}})
                     WITH source
-                    MATCH (target:`{workspace_label}` {{entity_id: $target_entity_id}})
+                    MATCH (target:`{workspace_label}` {{entity_id: $target_entity_id, workspace_id: $workspace_id}})
                     MERGE (source)-[r:DIRECTED]-(target)
                     SET r += $properties
                     RETURN r, source, target
@@ -1111,6 +1111,7 @@ class Neo4JStorage(BaseGraphStorage):
                         query,
                         source_entity_id=source_node_id,
                         target_entity_id=target_node_id,
+                        workspace_id=self.workspace,
                         properties=edge_properties,
                     )
                     try:

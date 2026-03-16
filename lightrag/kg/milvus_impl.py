@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from typing import Any, final
 from dataclasses import dataclass
 import numpy as np
@@ -22,6 +23,19 @@ config.read("config.ini", "utf-8")
 @final
 @dataclass
 class MilvusVectorDBStorage(BaseVectorStorage):
+    def _sanitize_workspace_for_collection(self, workspace: str) -> str:
+        """Normalize workspace prefix so Milvus collection names remain valid.
+
+        Milvus requires collection names to start with a letter or underscore and
+        contain only letters, digits, and underscores.
+        """
+        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", workspace.strip())
+        if not sanitized:
+            return "ws"
+        if not (sanitized[0].isalpha() or sanitized[0] == "_"):
+            sanitized = f"ws_{sanitized}"
+        return sanitized[:200]
+
     def _create_schema_for_namespace(self) -> CollectionSchema:
         """Create schema based on the current instance's namespace"""
 
@@ -35,6 +49,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             ),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
             FieldSchema(name="created_at", dtype=DataType.INT64),
+            FieldSchema(
+                name="workspace_id",
+                dtype=DataType.VARCHAR,
+                max_length=256,
+                nullable=True,
+            ),
         ]
 
         # Determine specific fields based on namespace
@@ -283,7 +303,21 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         )
                         self._create_scalar_index_fallback("full_doc_id", "INVERTED")
 
-                # No common indexes needed
+                # Common index: workspace_id for multi-tenant filtering
+                try:
+                    ws_index = self._get_index_params()
+                    ws_index.add_index(
+                        field_name="workspace_id", index_type="INVERTED"
+                    )
+                    self._client.create_index(
+                        collection_name=self.final_namespace,
+                        index_params=ws_index,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"[{self.workspace}] IndexParams method failed for workspace_id: {e}"
+                    )
+                    self._create_scalar_index_fallback("workspace_id", "INVERTED")
 
             else:
                 # Fallback to direct API calls if IndexParams is not available
@@ -303,6 +337,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 elif self.namespace.endswith("chunks"):
                     self._create_scalar_index_fallback("full_doc_id", "INVERTED")
 
+                # Common fallback index: workspace_id
+                self._create_scalar_index_fallback("workspace_id", "INVERTED")
+
             logger.info(
                 f"[{self.workspace}] Created indexes for collection: {self.namespace}"
             )
@@ -320,6 +357,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             "id": {"type": "VarChar", "is_primary": True},
             "vector": {"type": "FloatVector"},
             "created_at": {"type": "Int64"},
+            "workspace_id": {"type": "VarChar"},
         }
 
         # Add specific fields based on namespace
@@ -955,7 +993,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Build final_namespace with workspace prefix for data isolation
         # Keep original namespace unchanged for type detection logic
         if effective_workspace:
-            self.final_namespace = f"{effective_workspace}_{self.namespace}"
+            workspace_for_collection = self._sanitize_workspace_for_collection(
+                effective_workspace
+            )
+            self.final_namespace = f"{workspace_for_collection}_{self.namespace}"
+            if workspace_for_collection != effective_workspace:
+                logger.info(
+                    f"[{self.workspace}] Normalized workspace prefix for Milvus collection: "
+                    f"'{effective_workspace}' -> '{workspace_for_collection}'"
+                )
             logger.debug(
                 f"Final namespace with workspace prefix: '{self.final_namespace}'"
             )
@@ -973,9 +1019,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
         self.cosine_better_than_threshold = cosine_threshold
 
-        # Ensure created_at is in meta_fields
+        # Ensure created_at and workspace_id are in meta_fields
         if "created_at" not in self.meta_fields:
             self.meta_fields.add("created_at")
+        if "workspace_id" not in self.meta_fields:
+            self.meta_fields.add("workspace_id")
 
         # Initialize client as None - will be created in initialize() method
         self._client = None
@@ -1049,6 +1097,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             {
                 "id": k,
                 "created_at": current_time,
+                "workspace_id": self.workspace,
                 **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
             }
             for k, v in data.items()
@@ -1087,11 +1136,17 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Include all meta_fields (created_at is now always included)
         output_fields = list(self.meta_fields)
 
+        # Build workspace filter for multi-tenant isolation
+        workspace_filter = (
+            f'workspace_id == "{self.workspace}"' if self.workspace else None
+        )
+
         results = self._client.search(
             collection_name=self.final_namespace,
             data=embedding,
             limit=top_k,
             output_fields=output_fields,
+            filter=workspace_filter,
             search_params={
                 "metric_type": "COSINE",
                 "params": {"radius": self.cosine_better_than_threshold},

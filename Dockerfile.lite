@@ -73,6 +73,14 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 ENV UV_SYSTEM_PYTHON=1
 
+# Install system dependencies for OCR (tesseract) and PDF-to-image (poppler)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tesseract-ocr \
+        tesseract-ocr-vie \
+        poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy installed packages and application code
 COPY --from=builder /root/.local /root/.local
 COPY --from=builder /app/.venv /app/.venv

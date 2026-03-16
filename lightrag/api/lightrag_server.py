@@ -10,6 +10,7 @@ from fastapi.openapi.docs import (
     get_swagger_ui_oauth2_redirect_html,
 )
 import os
+import asyncio
 import logging
 import logging.config
 import sys
@@ -346,6 +347,80 @@ def create_app(args):
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
 
+    def build_rag_instance(workspace_id: str) -> LightRAG:
+        return LightRAG(
+            working_dir=args.working_dir,
+            workspace=workspace_id,
+            llm_model_func=create_llm_model_func(args.llm_binding),
+            llm_model_name=args.llm_model,
+            llm_model_max_async=args.max_async,
+            summary_max_tokens=args.summary_max_tokens,
+            summary_context_size=args.summary_context_size,
+            chunk_token_size=int(args.chunk_size),
+            chunk_overlap_token_size=int(args.chunk_overlap_size),
+            llm_model_kwargs=create_llm_model_kwargs(
+                args.llm_binding, args, llm_timeout
+            ),
+            embedding_func=embedding_func,
+            default_llm_timeout=llm_timeout,
+            default_embedding_timeout=embedding_timeout,
+            kv_storage=args.kv_storage,
+            graph_storage=args.graph_storage,
+            vector_storage=args.vector_storage,
+            doc_status_storage=args.doc_status_storage,
+            vector_db_storage_cls_kwargs={
+                "cosine_better_than_threshold": args.cosine_threshold
+            },
+            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+            enable_llm_cache=args.enable_llm_cache,
+            rerank_model_func=rerank_model_func,
+            max_parallel_insert=args.max_parallel_insert,
+            max_graph_nodes=args.max_graph_nodes,
+            addon_params={
+                "language": args.summary_language,
+                "entity_types": args.entity_types,
+            },
+            ollama_server_infos=ollama_server_infos,
+        )
+
+    rag_instances: dict[str, LightRAG] = {}
+    doc_manager_instances: dict[str, DocumentManager] = {}
+    rag_instances_lock = asyncio.Lock()
+
+    def normalize_workspace_id(workspace_id: str | None) -> str:
+        if workspace_id is None:
+            return args.workspace
+
+        normalized_workspace_id = workspace_id.strip()
+        if not normalized_workspace_id:
+            return args.workspace
+
+        return normalized_workspace_id
+
+    def get_doc_manager_for_workspace(workspace_id: str) -> DocumentManager:
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        if normalized_workspace_id not in doc_manager_instances:
+            doc_manager_instances[normalized_workspace_id] = DocumentManager(
+                args.input_dir, workspace=normalized_workspace_id
+            )
+        return doc_manager_instances[normalized_workspace_id]
+
+    async def get_rag_for_workspace(workspace_id: str) -> LightRAG:
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+
+        if normalized_workspace_id in rag_instances:
+            return rag_instances[normalized_workspace_id]
+
+        async with rag_instances_lock:
+            if normalized_workspace_id in rag_instances:
+                return rag_instances[normalized_workspace_id]
+
+            workspace_rag = build_rag_instance(normalized_workspace_id)
+            await workspace_rag.initialize_storages()
+            await workspace_rag.check_and_migrate_data()
+            rag_instances[normalized_workspace_id] = workspace_rag
+            return workspace_rag
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -356,6 +431,8 @@ def create_app(args):
             # Initialize database connections
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
+            rag_instances[normalize_workspace_id(args.workspace)] = rag
+            doc_manager_instances[normalize_workspace_id(args.workspace)] = doc_manager
 
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
@@ -366,7 +443,12 @@ def create_app(args):
 
         finally:
             # Clean up database connections
-            await rag.finalize_storages()
+            finalized_rag_ids: set[int] = set()
+            for cached_rag in rag_instances.values():
+                if id(cached_rag) in finalized_rag_ids:
+                    continue
+                await cached_rag.finalize_storages()
+                finalized_rag_ids.add(id(cached_rag))
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1053,40 +1135,7 @@ def create_app(args):
 
     # Initialize RAG with unified configuration
     try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            rerank_model_func=rerank_model_func,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params={
-                "language": args.summary_language,
-                "entity_types": args.entity_types,
-            },
-            ollama_server_infos=ollama_server_infos,
-        )
+        rag = build_rag_instance(args.workspace)
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
@@ -1097,10 +1146,25 @@ def create_app(args):
             rag,
             doc_manager,
             api_key,
+            get_rag_for_workspace=get_rag_for_workspace,
+            get_doc_manager_for_workspace=get_doc_manager_for_workspace,
         )
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(
+        create_query_routes(
+            rag,
+            api_key,
+            args.top_k,
+            get_rag_for_workspace=get_rag_for_workspace,
+        )
+    )
+    app.include_router(
+        create_graph_routes(
+            rag,
+            api_key,
+            get_rag_for_workspace=get_rag_for_workspace,
+        )
+    )
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)

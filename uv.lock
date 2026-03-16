@@ -2590,6 +2590,7 @@ api = [
     { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
+    { name = "pdf2image" },
     { name = "pipmaster" },
     { name = "psutil" },
     { name = "pycryptodome" },
@@ -2597,6 +2598,7 @@ api = [
     { name = "pyjwt" },
     { name = "pypdf" },
     { name = "pypinyin" },
+    { name = "pytesseract" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "python-jose", extra = ["cryptography"] },
@@ -2635,6 +2637,7 @@ evaluation = [
     { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
+    { name = "pdf2image" },
     { name = "pipmaster" },
     { name = "psutil" },
     { name = "pycryptodome" },
@@ -2642,6 +2645,7 @@ evaluation = [
     { name = "pyjwt" },
     { name = "pypdf" },
     { name = "pypinyin" },
+    { name = "pytesseract" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "python-jose", extra = ["cryptography"] },
@@ -2687,6 +2691,7 @@ offline = [
     { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
+    { name = "pdf2image" },
     { name = "pgvector" },
     { name = "pipmaster" },
     { name = "psutil" },
@@ -2697,6 +2702,7 @@ offline = [
     { name = "pymongo" },
     { name = "pypdf" },
     { name = "pypinyin" },
+    { name = "pytesseract" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "python-jose", extra = ["cryptography"] },
@@ -2766,6 +2772,7 @@ test = [
     { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
+    { name = "pdf2image" },
     { name = "pipmaster" },
     { name = "pre-commit" },
     { name = "psutil" },
@@ -2774,6 +2781,7 @@ test = [
     { name = "pyjwt" },
     { name = "pypdf" },
     { name = "pypinyin" },
+    { name = "pytesseract" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "python-docx" },
@@ -2829,14 +2837,15 @@ requires-dist = [
     { name = "neo4j", marker = "extra == 'offline-storage'", specifier = ">=5.0.0,<7.0.0" },
     { name = "networkx" },
     { name = "networkx", marker = "extra == 'api'" },
-    { name = "numpy", specifier = ">=1.24.0,<2.0.0" },
-    { name = "numpy", marker = "extra == 'api'", specifier = ">=1.24.0,<2.0.0" },
+    { name = "numpy", specifier = ">=1.24.0,<3.0.0" },
+    { name = "numpy", marker = "extra == 'api'", specifier = ">=1.24.0,<3.0.0" },
     { name = "ollama", marker = "extra == 'offline-llm'", specifier = ">=0.1.0,<1.0.0" },
     { name = "openai", marker = "extra == 'api'", specifier = ">=2.0.0,<3.0.0" },
     { name = "openai", marker = "extra == 'offline-llm'", specifier = ">=2.0.0,<3.0.0" },
     { name = "openpyxl", marker = "extra == 'api'", specifier = ">=3.0.0,<4.0.0" },
     { name = "pandas", specifier = ">=2.0.0,<2.4.0" },
     { name = "pandas", marker = "extra == 'api'", specifier = ">=2.0.0,<2.4.0" },
+    { name = "pdf2image", marker = "extra == 'api'", specifier = ">=1.16.0" },
     { name = "pgvector", marker = "extra == 'offline-storage'", specifier = ">=0.4.2,<1.0.0" },
     { name = "pipmaster" },
     { name = "pipmaster", marker = "extra == 'api'" },
@@ -2852,6 +2861,7 @@ requires-dist = [
     { name = "pypdf", marker = "extra == 'api'", specifier = ">=6.1.0" },
     { name = "pypinyin" },
     { name = "pypinyin", marker = "extra == 'api'" },
+    { name = "pytesseract", marker = "extra == 'api'", specifier = ">=0.3.10" },
     { name = "pytest", marker = "extra == 'pytest'", specifier = ">=8.4.2" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", marker = "extra == 'pytest'", specifier = ">=1.2.0" },
@@ -4197,6 +4207,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pdf2image"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/00/d8/b280f01045555dc257b8153c00dee3bc75830f91a744cd5f84ef3a0a64b1/pdf2image-1.17.0.tar.gz", hash = "sha256:eaa959bc116b420dd7ec415fcae49b98100dda3dd18cd2fdfa86d09f112f6d57", size = 12811, upload-time = "2024-01-07T20:33:01.965Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/62/33/61766ae033518957f877ab246f87ca30a85b778ebaad65b7f74fa7e52988/pdf2image-1.17.0-py3-none-any.whl", hash = "sha256:ecdd58d7afb810dffe21ef2b1bbc057ef434dabbac6c33778a38a3f7744a27e2", size = 11618, upload-time = "2024-01-07T20:32:59.957Z" },
+]
+
+[[package]]
 name = "pgvector"
 version = "0.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -5023,6 +5045,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b4/a4/784cf98c09e0dc22776b0d7d8a4a5b761218bcae4608c2416ce1e167c8af/pypinyin-0.55.0.tar.gz", hash = "sha256:b5711b3a0c6f76e67408ec6b2e3c4987a3a806b7c528076e7c7b86fcf0eaa66b", size = 839836, upload-time = "2025-07-20T12:01:50.657Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b9/7b/4cabc76fcc21c3c7d5c671d8783984d30ac9d3bb387c4ba784fca3cdfa3a/pypinyin-0.55.0-py2.py3-none-any.whl", hash = "sha256:d53b1e8ad2cdb815fb2cb604ed3123372f5a28c6f447571244aca36fc62a286f", size = 840203, upload-time = "2025-07-20T12:01:48.535Z" },
+]
+
+[[package]]
+name = "pytesseract"
+version = "0.3.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9f/a6/7d679b83c285974a7cb94d739b461fa7e7a9b17a3abfd7bf6cbc5c2394b0/pytesseract-0.3.13.tar.gz", hash = "sha256:4bf5f880c99406f52a3cfc2633e42d9dc67615e69d8a509d74867d3baddb5db9", size = 17689, upload-time = "2024-08-16T02:33:56.762Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/33/8312d7ce74670c9d39a532b2c246a853861120486be9443eebf048043637/pytesseract-0.3.13-py3-none-any.whl", hash = "sha256:7a99c6c2ac598360693d83a416e36e0b33a67638bb9d77fdcac094a3589d4b34", size = 14705, upload-time = "2024-08-16T02:36:10.09Z" },
 ]
 
 [[package]]

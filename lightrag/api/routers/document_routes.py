@@ -9,14 +9,16 @@ import aiofiles
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Literal
+from typing import Dict, List, Optional, Any, Literal, Callable, Awaitable
 from io import BytesIO
 from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
+    Form,
     File,
     HTTPException,
+    Request,
     UploadFile,
 )
 from pydantic import BaseModel, Field, field_validator
@@ -48,6 +50,46 @@ def _is_docling_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+@lru_cache(maxsize=1)
+def _is_ocr_available() -> bool:
+    """Check if pytesseract and pdf2image are available for OCR fallback.
+
+    Returns:
+        bool: True if both pytesseract and pdf2image are installed.
+    """
+    try:
+        import pytesseract  # noqa: F401  # type: ignore[import-not-found]
+        import pdf2image  # noqa: F401  # type: ignore[import-not-found]
+
+        return True
+    except ImportError:
+        return False
+
+
+def _extract_pdf_ocr(file_bytes: bytes, lang: str = "eng+vie") -> str:
+    """Extract text from a scanned/image-based PDF using OCR (pytesseract + pdf2image).
+
+    Args:
+        file_bytes: PDF file content as bytes.
+        lang: Tesseract language string (default includes English and Vietnamese).
+
+    Returns:
+        str: OCR-extracted text content.
+
+    Raises:
+        Exception: If OCR processing fails.
+    """
+    import pytesseract  # type: ignore[import-not-found]
+    from pdf2image import convert_from_bytes  # type: ignore[import-not-found]
+
+    images = convert_from_bytes(file_bytes, dpi=300)
+    pages_text: list[str] = []
+    for image in images:
+        text = pytesseract.image_to_string(image, lang=lang)
+        pages_text.append(text)
+    return "\n".join(pages_text)
 
 
 # Function to format datetime to ISO format string with timezone information
@@ -144,6 +186,7 @@ class ScanResponse(BaseModel):
     message: Optional[str] = Field(
         default=None, description="Additional details about the scanning operation"
     )
+    workspace_id: str = Field(description="Workspace identifier for this scan request")
     track_id: str = Field(description="Tracking ID for monitoring scanning progress")
 
     class Config:
@@ -219,6 +262,9 @@ class InsertTextRequest(BaseModel):
         description="The text to insert",
     )
     file_source: str = Field(default=None, min_length=0, description="File Source")
+    workspace_id: Optional[str] = Field(
+        default=None, description="Workspace identifier for this request"
+    )
 
     @field_validator("text", mode="after")
     @classmethod
@@ -253,6 +299,9 @@ class InsertTextsRequest(BaseModel):
     )
     file_sources: list[str] = Field(
         default=None, min_length=0, description="Sources of the texts"
+    )
+    workspace_id: Optional[str] = Field(
+        default=None, description="Workspace identifier for this request"
     )
 
     @field_validator("texts", mode="after")
@@ -292,6 +341,7 @@ class InsertResponse(BaseModel):
         description="Status of the operation"
     )
     message: str = Field(description="Message describing the operation result")
+    workspace_id: str = Field(description="Workspace identifier for this operation")
     track_id: str = Field(description="Tracking ID for monitoring processing status")
 
     class Config:
@@ -315,6 +365,7 @@ class ClearDocumentsResponse(BaseModel):
     status: Literal["success", "partial_success", "busy", "fail"] = Field(
         description="Status of the clear operation"
     )
+    workspace_id: str = Field(description="Workspace identifier for this operation")
     message: str = Field(description="Message describing the operation result")
 
     class Config:
@@ -435,6 +486,7 @@ class DocStatusResponse(BaseModel):
     status: DocStatus = Field(description="Current processing status")
     created_at: str = Field(description="Creation timestamp (ISO format string)")
     updated_at: str = Field(description="Last update timestamp (ISO format string)")
+    workspace_id: str = Field(description="Workspace identifier for this document")
     track_id: Optional[str] = Field(
         default=None, description="Tracking ID for monitoring progress"
     )
@@ -544,6 +596,7 @@ class TrackStatusResponse(BaseModel):
     """
 
     track_id: str = Field(description="The tracking ID")
+    workspace_id: str = Field(description="Workspace identifier for this request")
     documents: List[DocStatusResponse] = Field(
         description="List of documents associated with this track_id"
     )
@@ -598,6 +651,9 @@ class DocumentsRequest(BaseModel):
     )
     sort_direction: Literal["asc", "desc"] = Field(
         default="desc", description="Sort direction"
+    )
+    workspace_id: Optional[str] = Field(
+        default=None, description="Workspace identifier for this request"
     )
 
     class Config:
@@ -656,6 +712,7 @@ class PaginatedDocsResponse(BaseModel):
     documents: List[DocStatusResponse] = Field(
         description="List of documents for the current page"
     )
+    workspace_id: str = Field(description="Workspace identifier for this request")
     pagination: PaginationInfo = Field(description="Pagination information")
     status_counts: Dict[str, int] = Field(
         description="Count of documents by status for all documents"
@@ -705,6 +762,7 @@ class StatusCountsResponse(BaseModel):
         status_counts: Count of documents by status
     """
 
+    workspace_id: str = Field(description="Workspace identifier for this request")
     status_counts: Dict[str, int] = Field(description="Count of documents by status")
 
     class Config:
@@ -747,6 +805,7 @@ class PipelineStatusResponse(BaseModel):
     cur_batch: int = 0
     request_pending: bool = False
     latest_message: str = ""
+    workspace_id: str = ""
     history_messages: Optional[List[str]] = None
     update_status: Optional[dict] = None
 
@@ -1386,6 +1445,25 @@ async def pipeline_enqueue_file(
                                 file,
                                 global_args.pdf_decrypt_password,
                             )
+
+                        # If pypdf/docling returned only whitespace (scanned PDF),
+                        # try OCR as a last resort fallback.
+                        if not content.strip() and _is_ocr_available():
+                            logger.warning(
+                                f"[File Extraction]PDF text extraction returned no content for {file_path.name}. "
+                                "Attempting OCR fallback (this may take a moment)."
+                            )
+                            content = await asyncio.to_thread(
+                                _extract_pdf_ocr, file
+                            )
+                            if content.strip():
+                                logger.info(
+                                    f"[File Extraction]OCR fallback succeeded for {file_path.name}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[File Extraction]OCR fallback also returned no content for {file_path.name}"
+                                )
                     except Exception as e:
                         error_files = [
                             {
@@ -2040,15 +2118,66 @@ async def background_delete_documents(
 
 
 def create_document_routes(
-    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    api_key: Optional[str] = None,
+    get_rag_for_workspace: Optional[Callable[[str], Awaitable[LightRAG]]] = None,
+    get_doc_manager_for_workspace: Optional[Callable[[str], DocumentManager]] = None,
 ):
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
 
+    def normalize_workspace_id(workspace_id: Optional[str]) -> str:
+        if workspace_id is None:
+            return rag.workspace
+
+        normalized_workspace_id = workspace_id.strip()
+        if not normalized_workspace_id:
+            return rag.workspace
+
+        return normalized_workspace_id
+
+    async def resolve_request_context(
+        request: Optional[Request] = None,
+        workspace_id: Optional[str] = None,
+    ) -> tuple[str, LightRAG, DocumentManager]:
+        header_workspace_id = ""
+        if request is not None:
+            header_workspace_id = request.headers.get(
+                "LIGHTRAG-WORKSPACE-ID", ""
+            ).strip()
+            if not header_workspace_id:
+                header_workspace_id = request.headers.get(
+                    "LIGHTRAG-WORKSPACE", ""
+                ).strip()
+
+        resolved_workspace_id = normalize_workspace_id(workspace_id or header_workspace_id)
+
+        current_rag = (
+            await get_rag_for_workspace(resolved_workspace_id)
+            if get_rag_for_workspace is not None
+            else rag
+        )
+
+        if get_doc_manager_for_workspace is not None:
+            current_doc_manager = get_doc_manager_for_workspace(resolved_workspace_id)
+        elif resolved_workspace_id == doc_manager.workspace:
+            current_doc_manager = doc_manager
+        else:
+            current_doc_manager = DocumentManager(
+                str(doc_manager.base_input_dir), workspace=resolved_workspace_id
+            )
+
+        return resolved_workspace_id, current_rag, current_doc_manager
+
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
-    async def scan_for_new_documents(background_tasks: BackgroundTasks):
+    async def scan_for_new_documents(
+        background_tasks: BackgroundTasks,
+        request: Request,
+        workspace_id: Optional[str] = None,
+    ):
         """
         Trigger the scanning process for new documents.
 
@@ -2059,14 +2188,21 @@ def create_document_routes(
         Returns:
             ScanResponse: A response object containing the scanning status and track_id
         """
+        resolved_workspace_id, current_rag, current_doc_manager = (
+            await resolve_request_context(request, workspace_id)
+        )
+
         # Generate track_id with "scan" prefix for scanning operation
         track_id = generate_track_id("scan")
 
         # Start the scanning process in the background with track_id
-        background_tasks.add_task(run_scanning_process, rag, doc_manager, track_id)
+        background_tasks.add_task(
+            run_scanning_process, current_rag, current_doc_manager, track_id
+        )
         return ScanResponse(
             status="scanning_started",
             message="Scanning process has been initiated in the background",
+            workspace_id=resolved_workspace_id,
             track_id=track_id,
         )
 
@@ -2074,7 +2210,10 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+        background_tasks: BackgroundTasks,
+        request: Request,
+        file: UploadFile = File(...),
+        workspace_id: Optional[str] = Form(None),
     ):
         """
         Upload a file to the input directory and index it.
@@ -2128,13 +2267,19 @@ def create_document_routes(
             HTTPException: If the file type is not supported (400), file too large (413), or other errors occur (500).
         """
         try:
-            # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
+            resolved_workspace_id, current_rag, current_doc_manager = (
+                await resolve_request_context(request, workspace_id)
+            )
 
-            if not doc_manager.is_supported_file(safe_filename):
+            # Sanitize filename to prevent Path Traversal attacks
+            safe_filename = sanitize_filename(
+                file.filename, current_doc_manager.input_dir
+            )
+
+            if not current_doc_manager.is_supported_file(safe_filename):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
+                    detail=f"Unsupported file type. Supported types: {current_doc_manager.supported_extensions}",
                 )
 
             # Check file size limit (if configured)
@@ -2159,26 +2304,67 @@ def create_document_routes(
                     )
 
             # Check if filename already exists in doc_status storage
-            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
+            existing_doc_data = await current_rag.doc_status.get_doc_by_file_path(
+                safe_filename
+            )
+            retry_failed_file = False
             if existing_doc_data:
                 # Get document status and track_id from existing document
                 status = existing_doc_data.get("status", "unknown")
                 # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
                 existing_track_id = existing_doc_data.get("track_id") or ""
-                return InsertResponse(
-                    status="duplicated",
-                    message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
-                    track_id=existing_track_id,
-                )
+                normalized_status = str(status).strip().lower()
 
-            file_path = doc_manager.input_dir / safe_filename
+                # Allow retry when previous extraction failed for the same filename.
+                if normalized_status == DocStatus.FAILED.value:
+                    retry_failed_file = True
+                    failed_docs = await current_rag.doc_status.get_docs_by_status(
+                        DocStatus.FAILED
+                    )
+                    failed_doc_ids = [
+                        doc_id
+                        for doc_id, doc_status in failed_docs.items()
+                        if getattr(doc_status, "file_path", "") == safe_filename
+                    ]
+                    if failed_doc_ids:
+                        await current_rag.doc_status.delete(failed_doc_ids)
+                        logger.info(
+                            f"[File Extraction]Removed {len(failed_doc_ids)} FAILED record(s) for retry upload: {safe_filename}"
+                        )
+                else:
+                    return InsertResponse(
+                        status="duplicated",
+                        message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
+                        workspace_id=resolved_workspace_id,
+                        track_id=existing_track_id,
+                    )
+
+            file_path = current_doc_manager.input_dir / safe_filename
             # Check if file already exists in file system
             if file_path.exists():
-                return InsertResponse(
-                    status="duplicated",
-                    message=f"File '{safe_filename}' already exists in the input directory.",
-                    track_id="",
-                )
+                if retry_failed_file:
+                    try:
+                        file_path.unlink()
+                        logger.info(
+                            f"[File Extraction]Removed stale failed file before retry upload: {safe_filename}"
+                        )
+                    except Exception as cleanup_error:
+                        logger.error(
+                            f"[File Extraction]Failed to remove stale failed file {safe_filename}: {cleanup_error}"
+                        )
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                f"Failed to clean up stale failed file '{safe_filename}' before retry upload"
+                            ),
+                        )
+                else:
+                    return InsertResponse(
+                        status="duplicated",
+                        message=f"File '{safe_filename}' already exists in the input directory.",
+                        workspace_id=resolved_workspace_id,
+                        track_id="",
+                    )
 
             # Async streaming write with size check
             bytes_written = 0
@@ -2222,11 +2408,14 @@ def create_document_routes(
             track_id = generate_track_id("upload")
 
             # Add to background tasks and get track_id
-            background_tasks.add_task(pipeline_index_file, rag, file_path, track_id)
+            background_tasks.add_task(
+                pipeline_index_file, current_rag, file_path, track_id
+            )
 
             return InsertResponse(
                 status="success",
                 message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
+                workspace_id=resolved_workspace_id,
                 track_id=track_id,
             )
 
@@ -2242,7 +2431,9 @@ def create_document_routes(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
-        request: InsertTextRequest, background_tasks: BackgroundTasks
+        request: InsertTextRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
     ):
         """
         Insert text into the RAG system.
@@ -2261,13 +2452,17 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                http_request, request.workspace_id
+            )
+
             # Check if file_source already exists in doc_status storage
             if (
                 request.file_source
                 and request.file_source.strip()
                 and request.file_source != "unknown_source"
             ):
-                existing_doc_data = await rag.doc_status.get_doc_by_file_path(
+                existing_doc_data = await current_rag.doc_status.get_doc_by_file_path(
                     request.file_source
                 )
                 if existing_doc_data:
@@ -2278,13 +2473,14 @@ def create_document_routes(
                     return InsertResponse(
                         status="duplicated",
                         message=f"File source '{request.file_source}' already exists in document storage (Status: {status}).",
+                        workspace_id=resolved_workspace_id,
                         track_id=existing_track_id,
                     )
 
             # Check if content already exists by computing content hash (doc_id)
             sanitized_text = sanitize_text_for_encoding(request.text)
             content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
-            existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+            existing_doc = await current_rag.doc_status.get_by_id(content_doc_id)
             if existing_doc:
                 # Content already exists, return duplicated with existing track_id
                 status = existing_doc.get("status", "unknown")
@@ -2292,6 +2488,7 @@ def create_document_routes(
                 return InsertResponse(
                     status="duplicated",
                     message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
+                    workspace_id=resolved_workspace_id,
                     track_id=existing_track_id,
                 )
 
@@ -2300,7 +2497,7 @@ def create_document_routes(
 
             background_tasks.add_task(
                 pipeline_index_texts,
-                rag,
+                current_rag,
                 [request.text],
                 file_sources=[request.file_source],
                 track_id=track_id,
@@ -2309,6 +2506,7 @@ def create_document_routes(
             return InsertResponse(
                 status="success",
                 message="Text successfully received. Processing will continue in background.",
+                workspace_id=resolved_workspace_id,
                 track_id=track_id,
             )
         except Exception as e:
@@ -2322,7 +2520,9 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
-        request: InsertTextsRequest, background_tasks: BackgroundTasks
+        request: InsertTextsRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
     ):
         """
         Insert multiple texts into the RAG system.
@@ -2341,6 +2541,10 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                http_request, request.workspace_id
+            )
+
             # Check if any file_sources already exist in doc_status storage
             if request.file_sources:
                 for file_source in request.file_sources:
@@ -2349,8 +2553,10 @@ def create_document_routes(
                         and file_source.strip()
                         and file_source != "unknown_source"
                     ):
-                        existing_doc_data = await rag.doc_status.get_doc_by_file_path(
-                            file_source
+                        existing_doc_data = (
+                            await current_rag.doc_status.get_doc_by_file_path(
+                                file_source
+                            )
                         )
                         if existing_doc_data:
                             # Get document status and track_id from existing document
@@ -2360,6 +2566,7 @@ def create_document_routes(
                             return InsertResponse(
                                 status="duplicated",
                                 message=f"File source '{file_source}' already exists in document storage (Status: {status}).",
+                                workspace_id=resolved_workspace_id,
                                 track_id=existing_track_id,
                             )
 
@@ -2367,7 +2574,7 @@ def create_document_routes(
             for text in request.texts:
                 sanitized_text = sanitize_text_for_encoding(text)
                 content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
-                existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+                existing_doc = await current_rag.doc_status.get_by_id(content_doc_id)
                 if existing_doc:
                     # Content already exists, return duplicated with existing track_id
                     status = existing_doc.get("status", "unknown")
@@ -2375,6 +2582,7 @@ def create_document_routes(
                     return InsertResponse(
                         status="duplicated",
                         message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
+                        workspace_id=resolved_workspace_id,
                         track_id=existing_track_id,
                     )
 
@@ -2383,7 +2591,7 @@ def create_document_routes(
 
             background_tasks.add_task(
                 pipeline_index_texts,
-                rag,
+                current_rag,
                 request.texts,
                 file_sources=request.file_sources,
                 track_id=track_id,
@@ -2392,6 +2600,7 @@ def create_document_routes(
             return InsertResponse(
                 status="success",
                 message="Texts successfully received. Processing will continue in background.",
+                workspace_id=resolved_workspace_id,
                 track_id=track_id,
             )
         except Exception as e:
@@ -2402,7 +2611,9 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(
+        request: Request, workspace_id: Optional[str] = None
+    ):
         """
         Clear all documents from the RAG system.
 
@@ -2423,6 +2634,10 @@ def create_document_routes(
             HTTPException: Raised when a serious error occurs during the clearing process,
                           with status code 500 and error details in the detail field.
         """
+        resolved_workspace_id, current_rag, current_doc_manager = (
+            await resolve_request_context(request, workspace_id)
+        )
+
         from lightrag.kg.shared_storage import (
             get_namespace_data,
             get_namespace_lock,
@@ -2430,10 +2645,10 @@ def create_document_routes(
 
         # Get pipeline status and lock
         pipeline_status = await get_namespace_data(
-            "pipeline_status", workspace=rag.workspace
+            "pipeline_status", workspace=current_rag.workspace
         )
         pipeline_status_lock = get_namespace_lock(
-            "pipeline_status", workspace=rag.workspace
+            "pipeline_status", workspace=current_rag.workspace
         )
 
         # Check and set status with lock
@@ -2441,6 +2656,7 @@ def create_document_routes(
             if pipeline_status.get("busy", False):
                 return ClearDocumentsResponse(
                     status="busy",
+                    workspace_id=resolved_workspace_id,
                     message="Cannot clear documents while pipeline is busy",
                 )
             # Set busy to true
@@ -2466,17 +2682,17 @@ def create_document_routes(
             # Use drop method to clear all data
             drop_tasks = []
             storages = [
-                rag.text_chunks,
-                rag.full_docs,
-                rag.full_entities,
-                rag.full_relations,
-                rag.entity_chunks,
-                rag.relation_chunks,
-                rag.entities_vdb,
-                rag.relationships_vdb,
-                rag.chunks_vdb,
-                rag.chunk_entity_relation_graph,
-                rag.doc_status,
+                current_rag.text_chunks,
+                current_rag.full_docs,
+                current_rag.full_entities,
+                current_rag.full_relations,
+                current_rag.entity_chunks,
+                current_rag.relation_chunks,
+                current_rag.entities_vdb,
+                current_rag.relationships_vdb,
+                current_rag.chunks_vdb,
+                current_rag.chunk_entity_relation_graph,
+                current_rag.doc_status,
             ]
 
             # Log storage drop start
@@ -2529,7 +2745,11 @@ def create_document_routes(
                 logger.error(error_message)
                 if "history_messages" in pipeline_status:
                     pipeline_status["history_messages"].append(error_message)
-                return ClearDocumentsResponse(status="fail", message=error_message)
+                return ClearDocumentsResponse(
+                    status="fail",
+                    workspace_id=resolved_workspace_id,
+                    message=error_message,
+                )
 
             # Log file deletion start
             if "history_messages" in pipeline_status:
@@ -2541,7 +2761,7 @@ def create_document_routes(
             deleted_files_count = 0
             file_errors_count = 0
 
-            for file_path in doc_manager.input_dir.glob("*"):
+            for file_path in current_doc_manager.input_dir.glob("*"):
                 if file_path.is_file():
                     try:
                         file_path.unlink()
@@ -2576,7 +2796,11 @@ def create_document_routes(
                 pipeline_status["history_messages"].append(final_message)
 
             # Return response based on results
-            return ClearDocumentsResponse(status=status, message=final_message)
+            return ClearDocumentsResponse(
+                status=status,
+                workspace_id=resolved_workspace_id,
+                message=final_message,
+            )
         except Exception as e:
             error_msg = f"Error clearing documents: {str(e)}"
             logger.error(error_msg)
@@ -2598,7 +2822,9 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status() -> PipelineStatusResponse:
+    async def get_pipeline_status(
+        request: Request, workspace_id: Optional[str] = None
+    ) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -2623,6 +2849,10 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving pipeline status (500)
         """
         try:
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                request, workspace_id
+            )
+
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
                 get_namespace_lock,
@@ -2630,14 +2860,16 @@ def create_document_routes(
             )
 
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_rag.workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_rag.workspace
             )
 
             # Get update flags status for all namespaces
-            update_status = await get_all_update_flags_status(workspace=rag.workspace)
+            update_status = await get_all_update_flags_status(
+                workspace=current_rag.workspace
+            )
 
             # Convert MutableBoolean objects to regular boolean values
             processed_update_status = {}
@@ -2657,6 +2889,7 @@ def create_document_routes(
 
             # Add processed update_status to the status dictionary
             status_dict["update_status"] = processed_update_status
+            status_dict["workspace_id"] = resolved_workspace_id
 
             # Convert history_messages to a regular list if it's a Manager.list
             # and limit to latest 1000 entries with truncation message if needed
@@ -2697,7 +2930,9 @@ def create_document_routes(
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents() -> DocsStatusesResponse:
+    async def documents(
+        request: Request, workspace_id: Optional[str] = None
+    ) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
         To prevent excessive resource consumption, a maximum of 1,000 records is returned.
@@ -2716,6 +2951,8 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving document statuses (500).
         """
         try:
+            _, current_rag, _ = await resolve_request_context(request, workspace_id)
+
             statuses = (
                 DocStatus.PENDING,
                 DocStatus.PROCESSING,
@@ -2724,7 +2961,7 @@ def create_document_routes(
                 DocStatus.FAILED,
             )
 
-            tasks = [rag.get_docs_by_status(status) for status in statuses]
+            tasks = [current_rag.get_docs_by_status(status) for status in statuses]
             results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
 
             response = DocsStatusesResponse()
@@ -2775,6 +3012,7 @@ def create_document_routes(
                             status=doc_status.status,
                             created_at=format_datetime(doc_status.created_at),
                             updated_at=format_datetime(doc_status.updated_at),
+                            workspace_id=current_rag.workspace,
                             track_id=doc_status.track_id,
                             chunks_count=doc_status.chunks_count,
                             error_msg=doc_status.error_msg,
@@ -2995,7 +3233,11 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(
+        track_id: str,
+        request: Request,
+        workspace_id: Optional[str] = None,
+    ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -3015,6 +3257,10 @@ def create_document_routes(
             HTTPException: If track_id is invalid (400) or an error occurs (500).
         """
         try:
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                request, workspace_id
+            )
+
             # Validate track_id
             if not track_id or not track_id.strip():
                 raise HTTPException(status_code=400, detail="Track ID cannot be empty")
@@ -3022,7 +3268,7 @@ def create_document_routes(
             track_id = track_id.strip()
 
             # Get documents by track_id
-            docs_by_track_id = await rag.aget_docs_by_track_id(track_id)
+            docs_by_track_id = await current_rag.aget_docs_by_track_id(track_id)
 
             # Convert to response format
             documents = []
@@ -3037,6 +3283,7 @@ def create_document_routes(
                         status=doc_status.status,
                         created_at=format_datetime(doc_status.created_at),
                         updated_at=format_datetime(doc_status.updated_at),
+                        workspace_id=current_rag.workspace,
                         track_id=doc_status.track_id,
                         chunks_count=doc_status.chunks_count,
                         error_msg=doc_status.error_msg,
@@ -3052,6 +3299,7 @@ def create_document_routes(
 
             return TrackStatusResponse(
                 track_id=track_id,
+                workspace_id=resolved_workspace_id,
                 documents=documents,
                 total_count=len(documents),
                 status_summary=status_summary,
@@ -3071,6 +3319,7 @@ def create_document_routes(
     )
     async def get_documents_paginated(
         request: DocumentsRequest,
+        http_request: Request,
     ) -> PaginatedDocsResponse:
         """
         Get documents with pagination support.
@@ -3092,15 +3341,19 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving documents (500).
         """
         try:
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                http_request, request.workspace_id
+            )
+
             # Get paginated documents and status counts in parallel
-            docs_task = rag.doc_status.get_docs_paginated(
+            docs_task = current_rag.doc_status.get_docs_paginated(
                 status_filter=request.status_filter,
                 page=request.page,
                 page_size=request.page_size,
                 sort_field=request.sort_field,
                 sort_direction=request.sort_direction,
             )
-            status_counts_task = rag.doc_status.get_all_status_counts()
+            status_counts_task = current_rag.doc_status.get_all_status_counts()
 
             # Execute both queries in parallel
             (documents_with_ids, total_count), status_counts = await asyncio.gather(
@@ -3118,6 +3371,7 @@ def create_document_routes(
                         status=doc.status,
                         created_at=format_datetime(doc.created_at),
                         updated_at=format_datetime(doc.updated_at),
+                        workspace_id=current_rag.workspace,
                         track_id=doc.track_id,
                         chunks_count=doc.chunks_count,
                         error_msg=doc.error_msg,
@@ -3142,6 +3396,7 @@ def create_document_routes(
 
             return PaginatedDocsResponse(
                 documents=doc_responses,
+                workspace_id=resolved_workspace_id,
                 pagination=pagination,
                 status_counts=status_counts,
             )
@@ -3156,7 +3411,9 @@ def create_document_routes(
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts() -> StatusCountsResponse:
+    async def get_document_status_counts(
+        request: Request, workspace_id: Optional[str] = None
+    ) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -3170,8 +3427,13 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving status counts (500).
         """
         try:
-            status_counts = await rag.doc_status.get_all_status_counts()
-            return StatusCountsResponse(status_counts=status_counts)
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                request, workspace_id
+            )
+            status_counts = await current_rag.doc_status.get_all_status_counts()
+            return StatusCountsResponse(
+                workspace_id=resolved_workspace_id, status_counts=status_counts
+            )
 
         except Exception as e:
             logger.error(f"Error getting document status counts: {str(e)}")
@@ -3183,7 +3445,11 @@ def create_document_routes(
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def reprocess_failed_documents(background_tasks: BackgroundTasks):
+    async def reprocess_failed_documents(
+        background_tasks: BackgroundTasks,
+        request: Request,
+        workspace_id: Optional[str] = None,
+    ):
         """
         Reprocess failed and pending documents.
 
@@ -3209,9 +3475,11 @@ def create_document_routes(
             HTTPException: If an error occurs while initiating reprocessing (500).
         """
         try:
+            _, current_rag, _ = await resolve_request_context(request, workspace_id)
+
             # Start the reprocessing in the background
             # Note: Reprocessed documents retain their original track_id from initial upload
-            background_tasks.add_task(rag.apipeline_process_enqueue_documents)
+            background_tasks.add_task(current_rag.apipeline_process_enqueue_documents)
             logger.info("Reprocessing of failed documents initiated")
 
             return ReprocessResponse(
@@ -3229,7 +3497,9 @@ def create_document_routes(
         response_model=CancelPipelineResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def cancel_pipeline():
+    async def cancel_pipeline(
+        request: Request, workspace_id: Optional[str] = None
+    ):
         """
         Request cancellation of the currently running pipeline.
 
@@ -3251,16 +3521,18 @@ def create_document_routes(
             HTTPException: If an error occurs while setting cancellation flag (500).
         """
         try:
+            _, current_rag, _ = await resolve_request_context(request, workspace_id)
+
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
                 get_namespace_lock,
             )
 
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_rag.workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_rag.workspace
             )
 
             async with pipeline_status_lock:

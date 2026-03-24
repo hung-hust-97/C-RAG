@@ -371,6 +371,16 @@
       "refreshCurrentLabelTooltip": "Refresh current page graph data",
       "refreshingTooltip": "Refreshing data..."
     },
+    "kgStatus": {
+      "workspacePrefix": "Workspace",
+      "idle": "Waiting to load KG",
+      "loading": "Loading KG",
+      "ready": "KG loaded",
+      "empty": "KG is empty",
+      "error": "KG load error",
+      "switchingTheme": "Switching theme...",
+      "loadingGraphData": "Loading graph data..."
+    },
     "emptyGraph": "Empty(Try Reload Again)"
   },
   "retrievePanel": {

@@ -36,7 +36,7 @@ class NavigationService {
 
     // Reset retrieval history message only if preserveHistory is false
     if (!preserveHistory) {
-      useSettingsStore.getState().setRetrievalHistory([]);
+      useSettingsStore.getState().clearAllRetrievalHistories();
     }
 
     // Clear authentication state

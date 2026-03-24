@@ -106,10 +106,12 @@ export default function RetrievalTesting() {
   // Get current tab to determine if this tab is active (for performance optimization)
   const currentTab = useSettingsStore.use.currentTab()
   const isRetrievalTabActive = currentTab === 'retrieval'
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
 
   const [messages, setMessages] = useState<MessageWithError[]>(() => {
     try {
-      const history = useSettingsStore.getState().retrievalHistory || []
+      const history =
+        useSettingsStore.getState().getRetrievalHistoryForWorkspace(selectedWorkspaceId) || []
       // Ensure each message from history has a unique ID and mermaidRendered status
       return history.map((msg, index) => {
         try {
@@ -137,6 +139,36 @@ export default function RetrievalTesting() {
       return [] // Return an empty array if there's an error
     }
   })
+
+  useEffect(() => {
+    try {
+      const history =
+        useSettingsStore.getState().getRetrievalHistoryForWorkspace(selectedWorkspaceId) || []
+      const nextMessages = history.map((msg, index) => {
+        try {
+          const msgWithError = msg as MessageWithError
+          return {
+            ...msg,
+            id: msgWithError.id || `hist-${Date.now()}-${index}`,
+            mermaidRendered: msgWithError.mermaidRendered ?? true,
+            latexRendered: msgWithError.latexRendered ?? true
+          }
+        } catch {
+          return {
+            role: 'system',
+            content: 'Error loading message',
+            id: `error-${Date.now()}-${index}`,
+            isError: true,
+            mermaidRendered: true
+          }
+        }
+      })
+      setMessages(nextMessages)
+    } catch (error) {
+      console.error('Error loading workspace retrieval history:', error)
+      setMessages([])
+    }
+  }, [selectedWorkspaceId])
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [inputError, setInputError] = useState('') // Error message for input
@@ -357,6 +389,7 @@ export default function RetrievalTesting() {
       const queryParams = {
         ...state.querySettings,
         query: actualQuery,
+        workspace_id: selectedWorkspaceId,
         response_type: 'Multiple Paragraphs',
         conversation_history: effectiveHistoryTurns > 0
           ? prevMessages
@@ -424,13 +457,17 @@ export default function RetrievalTesting() {
         try {
           useSettingsStore
             .getState()
-            .setRetrievalHistory([...prevMessages, userMessage, assistantMessage])
+            .setRetrievalHistoryForWorkspace(selectedWorkspaceId, [
+              ...prevMessages,
+              userMessage,
+              assistantMessage
+            ])
         } catch (error) {
           console.error('Error saving retrieval history:', error)
         }
       }
     },
-    [inputValue, isLoading, messages, setMessages, t, scrollToBottom]
+    [inputValue, isLoading, messages, setMessages, t, scrollToBottom, selectedWorkspaceId]
   )
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -619,8 +656,8 @@ export default function RetrievalTesting() {
 
   const clearMessages = useCallback(() => {
     setMessages([])
-    useSettingsStore.getState().setRetrievalHistory([])
-  }, [setMessages])
+    useSettingsStore.getState().clearRetrievalHistoryForWorkspace(selectedWorkspaceId)
+  }, [setMessages, selectedWorkspaceId])
 
   // Handle copying message content with robust clipboard support
   const handleCopyMessage = useCallback(async (message: MessageWithError) => {

@@ -371,6 +371,16 @@
       "refreshCurrentLabelTooltip": "Làm mới dữ liệu đồ thị trang hiện tại",
       "refreshingTooltip": "Đang làm mới dữ liệu..."
     },
+    "kgStatus": {
+      "workspacePrefix": "Workspace",
+      "idle": "Đang chờ tải KG",
+      "loading": "Đang tải KG",
+      "ready": "KG đã tải xong",
+      "empty": "KG đang trống",
+      "error": "Lỗi tải KG",
+      "switchingTheme": "Đang chuyển giao diện...",
+      "loadingGraphData": "Đang tải dữ liệu đồ thị..."
+    },
     "emptyGraph": "Trống (Thử Tải Lại)"
   },
   "retrievePanel": {

@@ -64,7 +64,7 @@ services:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000        # kết nối nội bộ qua service name + port 9000
       MINIO_ACCESS_KEY: minioadmin     # phải khớp với MINIO_ROOT_USER bên trên
-      MINIO_SECRET_KEY: minioadmin123  # phải khớp với MINIO_ROOT_PASSWORD
+      MINIO_SECRET_KEY: minioadmin  # phải khớp với MINIO_ROOT_PASSWORD
     volumes:
       - milvus_data:/var/lib/milvus
     # healthcheck:
@@ -110,6 +110,34 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+
+  crag_lite:
+    image: crag_lite
+    build:
+      context: .
+      dockerfile: Dockerfile.lite
+      tags:
+        - crag_lite
+    ports:
+      - "${PORT:-9621}:9621"
+    volumes:
+      - ./lightrag:/app/lightrag
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./config.ini:/app/config.ini
+      - ./.env:/app/.env
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - milvus_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   postgres_data:

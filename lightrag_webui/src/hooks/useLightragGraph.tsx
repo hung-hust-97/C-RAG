@@ -104,8 +104,9 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`);
     rawData = await queryGraphs(queryLabel, maxDepth, maxNodes);
   } catch (e) {
-    useBackendState.getState().setErrorMessage(errorMessage(e), 'Query Graphs Error!');
-    return null;
+    const message = errorMessage(e)
+    useBackendState.getState().setErrorMessage(message, 'Query Graphs Error!');
+    return { rawGraph: null, is_truncated: false, error: message }
   }
 
   let rawGraph = null;
@@ -179,7 +180,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   }
 
   // console.debug({ data: JSON.parse(JSON.stringify(rawData)) })
-  return { rawGraph, is_truncated: rawData.is_truncated }
+  return { rawGraph, is_truncated: rawData.is_truncated, error: null }
 }
 
 // Create a new graph instance with the raw graph data
@@ -321,6 +322,7 @@ const useLightrangeGraph = () => {
     dataLoadedRef.current = false
     initialLoadRef.current = false
     emptyDataHandledRef.current = false
+    state.setKGWorkspaceStatus(selectedWorkspaceId, 'idle')
   }, [selectedWorkspaceId])
 
   // Graph data fetching logic
@@ -341,6 +343,7 @@ const useLightrangeGraph = () => {
       // Set flags
       fetchInProgressRef.current = true
       useGraphStore.getState().setGraphDataFetchAttempted(true)
+      useGraphStore.getState().setKGWorkspaceStatus(selectedWorkspaceId, 'loading')
 
       const state = useGraphStore.getState()
       state.setIsFetching(true)
@@ -361,7 +364,7 @@ const useLightrangeGraph = () => {
       const currentMaxNodes = maxNodes
 
       // Declare a variable to store data promise
-      let dataPromise: Promise<{ rawGraph: RawGraph | null; is_truncated: boolean | undefined } | null>;
+      let dataPromise: Promise<{ rawGraph: RawGraph | null; is_truncated: boolean | undefined; error?: string | null } | null>;
 
       // 1. If query label is not empty, use fetchGraph
       if (currentQueryLabel) {
@@ -376,6 +379,7 @@ const useLightrangeGraph = () => {
       dataPromise.then((result) => {
         const state = useGraphStore.getState()
         const data = result?.rawGraph;
+        const fetchError = result?.error || null
 
         // Assign colors based on entity_type *after* fetching
         if (data && data.nodes) {
@@ -416,6 +420,12 @@ const useLightrangeGraph = () => {
           // Still mark graph as empty for other logic
           state.setGraphIsEmpty(true);
 
+          if (fetchError) {
+            state.setKGWorkspaceStatus(selectedWorkspaceId, 'error', fetchError)
+          } else {
+            state.setKGWorkspaceStatus(selectedWorkspaceId, 'empty')
+          }
+
           // Check if the empty graph is due to 401 authentication error
           const errorMessage = useBackendState.getState().message;
           const isAuthError = errorMessage && errorMessage.includes('Authentication required');
@@ -442,6 +452,7 @@ const useLightrangeGraph = () => {
           state.setSigmaGraph(newSigmaGraph);
           state.setRawGraph(data);
           state.setGraphIsEmpty(false);
+          state.setKGWorkspaceStatus(selectedWorkspaceId, 'ready')
 
           // Update last successful query label
           state.setLastSuccessfulQueryLabel(currentQueryLabel);
@@ -470,9 +481,10 @@ const useLightrangeGraph = () => {
         fetchInProgressRef.current = false
         state.setGraphDataFetchAttempted(false)
         state.setLastSuccessfulQueryLabel('') // Clear last successful query label on error
+        state.setKGWorkspaceStatus(selectedWorkspaceId, 'error', errorMessage(error))
       })
     }
-  }, [queryLabel, maxQueryDepth, maxNodes, isFetching, t, graphDataVersion])
+  }, [queryLabel, maxQueryDepth, maxNodes, isFetching, t, graphDataVersion, selectedWorkspaceId])
 
   // Handle node expansion
   useEffect(() => {

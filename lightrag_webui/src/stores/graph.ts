@@ -31,6 +31,14 @@ export type RawEdgeType = {
   dynamicId: string
 }
 
+export type KGLoadStatus = 'idle' | 'loading' | 'ready' | 'empty' | 'error'
+
+export type KGWorkspaceStatus = {
+  status: KGLoadStatus
+  message?: string
+  updatedAt: number
+}
+
 /**
  * Interface for tracking edges that need updating when a node ID changes
  */
@@ -137,6 +145,10 @@ interface GraphState {
   graphDataVersion: number
   incrementGraphDataVersion: () => void
 
+  kgWorkspaceStatus: Record<string, KGWorkspaceStatus>
+  setKGWorkspaceStatus: (workspaceId: string, status: KGLoadStatus, message?: string) => void
+  clearKGWorkspaceStatus: (workspaceId?: string) => void
+
   // Methods for updating graph elements and UI state together
   updateNodeAndSelect: (nodeId: string, entityId: string, propertyName: string, newValue: string) => Promise<void>
   updateEdgeAndSelect: (edgeId: string, dynamicId: string, sourceId: string, targetId: string, propertyName: string, newValue: string) => Promise<void>
@@ -230,6 +242,33 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
   // Version counter implementation
   graphDataVersion: 0,
   incrementGraphDataVersion: () => set((state) => ({ graphDataVersion: state.graphDataVersion + 1 })),
+
+  kgWorkspaceStatus: {},
+  setKGWorkspaceStatus: (workspaceId: string, status: KGLoadStatus, message?: string) =>
+    set((state) => {
+      const normalizedWorkspaceId = workspaceId?.trim() || 'default'
+      return {
+        kgWorkspaceStatus: {
+          ...state.kgWorkspaceStatus,
+          [normalizedWorkspaceId]: {
+            status,
+            message,
+            updatedAt: Date.now()
+          }
+        }
+      }
+    }),
+  clearKGWorkspaceStatus: (workspaceId?: string) =>
+    set((state) => {
+      if (!workspaceId) {
+        return { kgWorkspaceStatus: {} }
+      }
+
+      const normalizedWorkspaceId = workspaceId?.trim() || 'default'
+      const nextState = { ...state.kgWorkspaceStatus }
+      delete nextState[normalizedWorkspaceId]
+      return { kgWorkspaceStatus: nextState }
+    }),
 
   // Methods for updating graph elements and UI state together
   updateNodeAndSelect: async (nodeId: string, entityId: string, propertyName: string, newValue: string) => {

@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 // import { MiniMap } from '@react-sigma/minimap'
 import { SigmaContainer, useRegisterEvents, useSigma } from '@react-sigma/core'
 import { Settings as SigmaSettings } from 'sigma/settings'
@@ -108,6 +109,7 @@ const GraphEvents = () => {
 }
 
 const GraphViewer = () => {
+  const { t } = useTranslation()
   const [isThemeSwitching, setIsThemeSwitching] = useState(false)
   const sigmaRef = useRef<any>(null)
   const prevTheme = useRef<string>('')
@@ -116,12 +118,39 @@ const GraphViewer = () => {
   const focusedNode = useGraphStore.use.focusedNode()
   const moveToSelectedNode = useGraphStore.use.moveToSelectedNode()
   const isFetching = useGraphStore.use.isFetching()
+  const kgWorkspaceStatusMap = useGraphStore.use.kgWorkspaceStatus()
 
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
   const enableNodeDrag = useSettingsStore.use.enableNodeDrag()
   const showLegend = useSettingsStore.use.showLegend()
   const theme = useSettingsStore.use.theme()
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
+
+  const activeWorkspaceId = selectedWorkspaceId?.trim() || 'default'
+  const activeKGStatus = kgWorkspaceStatusMap[activeWorkspaceId] || { status: 'idle' as const }
+
+  const statusClassName =
+    activeKGStatus.status === 'ready'
+      ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+      : activeKGStatus.status === 'loading'
+        ? 'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300'
+        : activeKGStatus.status === 'empty'
+          ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+          : activeKGStatus.status === 'error'
+            ? 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+            : 'border-muted bg-background/70 text-muted-foreground'
+
+  const statusLabel =
+    activeKGStatus.status === 'ready'
+      ? t('graphPanel.kgStatus.ready')
+      : activeKGStatus.status === 'loading'
+        ? t('graphPanel.kgStatus.loading')
+        : activeKGStatus.status === 'empty'
+          ? t('graphPanel.kgStatus.empty')
+          : activeKGStatus.status === 'error'
+            ? t('graphPanel.kgStatus.error')
+            : t('graphPanel.kgStatus.idle')
 
   // Memoize sigma settings to prevent unnecessary re-creation
   const memoizedSigmaSettings = useMemo(() => {
@@ -244,12 +273,25 @@ const GraphViewer = () => {
         <SettingsDisplay />
       </SigmaContainer>
 
+      <div className="absolute top-2 right-2 z-20 max-w-[420px]">
+        <div className={`rounded-xl border px-3 py-2 text-xs shadow-sm backdrop-blur ${statusClassName}`}>
+          <p className="font-medium">
+            {t('graphPanel.kgStatus.workspacePrefix')} {activeWorkspaceId} - {statusLabel}
+          </p>
+          {activeKGStatus.message && (
+            <p className="mt-1 line-clamp-2 opacity-90" title={activeKGStatus.message}>
+              {activeKGStatus.message}
+            </p>
+          )}
+        </div>
+      </div>
+
       {/* Loading overlay - shown when data is loading or theme is switching */}
       {(isFetching || isThemeSwitching) && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 z-10">
           <div className="text-center">
             <div className="mb-2 h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto"></div>
-            <p>{isThemeSwitching ? 'Switching Theme...' : 'Loading Graph Data...'}</p>
+            <p>{isThemeSwitching ? t('graphPanel.kgStatus.switchingTheme') : t('graphPanel.kgStatus.loadingGraphData')}</p>
           </div>
         </div>
       )}

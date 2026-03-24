@@ -23,6 +23,135 @@ config.read("config.ini", "utf-8")
 @final
 @dataclass
 class MilvusVectorDBStorage(BaseVectorStorage):
+    def _build_milvus_client(self) -> MilvusClient:
+        """Build a MilvusClient with timeout and connection settings."""
+        # Read timeout settings from environment (in seconds, default 120)
+        timeout = float(
+            os.environ.get(
+                "MILVUS_TIMEOUT",
+                config.get("milvus", "timeout", fallback="120")
+            )
+        )
+        
+        client = MilvusClient(
+            uri=os.environ.get(
+                "MILVUS_URI",
+                config.get(
+                    "milvus",
+                    "uri",
+                    fallback=os.path.join(
+                        self.global_config["working_dir"], "milvus_lite.db"
+                    ),
+                ),
+            ),
+            user=os.environ.get(
+                "MILVUS_USER", config.get("milvus", "user", fallback=None)
+            ),
+            password=os.environ.get(
+                "MILVUS_PASSWORD",
+                config.get("milvus", "password", fallback=None),
+            ),
+            token=os.environ.get(
+                "MILVUS_TOKEN", config.get("milvus", "token", fallback=None)
+            ),
+            db_name=os.environ.get(
+                "MILVUS_DB_NAME",
+                config.get("milvus", "db_name", fallback=None),
+            ),
+            timeout=timeout,
+        )
+        return client
+
+    @staticmethod
+    def _is_closed_channel_error(error: Exception) -> bool:
+        msg = str(error).lower()
+        return "closed channel" in msg or "cannot invoke rpc on closed channel" in msg
+
+    def _reconnect_client(self, reason: str = "closed channel") -> None:
+        """Reconnect to Milvus server.
+        
+        Args:
+            reason: Description of why reconnection is needed
+        """
+        logger.warning(
+            f"[{self.workspace}] Reconnecting Milvus client for {self.namespace} (reason: {reason})..."
+        )
+        # Close the old client if it exists
+        if self._client is not None:
+            try:
+                # Try to close gracefully (if method exists)
+                if hasattr(self._client, "close"):
+                    self._client.close()
+            except Exception as e:
+                logger.debug(f"[{self.workspace}] Error closing old Milvus client: {e}")
+        
+        # Create new client
+        self._client = self._build_milvus_client()
+        self._collection_loaded = False
+        
+        # Verify collection exists (create if needed)
+        try:
+            self._create_collection_if_not_exist()
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Failed to verify collection after reconnect: {e}"
+            )
+            raise
+
+    def _milvus_call(self, operation: str, action, max_retries: int = 3):
+        """Execute Milvus operation with exponential backoff retry on closed-channel errors.
+        
+        Args:
+            operation: Name of the operation (for logging)
+            action: Callable that takes MilvusClient and performs the operation
+            max_retries: Maximum number of retries (default: 3)
+        
+        Returns:
+            Result from the action
+        
+        Raises:
+            Exception if all retries fail
+        """
+        import time
+        
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                return action(self._client)
+            except Exception as e:
+                last_error = e
+                
+                # Only retry on closed channel errors
+                if not self._is_closed_channel_error(e):
+                    raise
+                
+                # If this was the last attempt, raise the error
+                if attempt == max_retries - 1:
+                    logger.error(
+                        f"[{self.workspace}] {operation} failed after {max_retries} attempts: {e}"
+                    )
+                    raise
+                
+                # Exponential backoff: 0.1s, 0.2s, 0.4s, etc.
+                backoff_seconds = 0.1 * (2 ** attempt)
+                logger.warning(
+                    f"[{self.workspace}] Closed channel during {operation} "
+                    f"(attempt {attempt + 1}/{max_retries}). "
+                    f"Reconnecting in {backoff_seconds:.1f}s..."
+                )
+                
+                # Wait before reconnecting
+                time.sleep(backoff_seconds)
+                
+                # Reconnect
+                self._reconnect_client(f"{operation} closed channel, attempt {attempt + 1}")
+        
+        # Should not reach here, but just in case
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"[{self.workspace}] {operation} failed unexpectedly")
+
     def _sanitize_workspace_for_collection(self, workspace: str) -> str:
         """Normalize workspace prefix so Milvus collection names remain valid.
 
@@ -831,18 +960,25 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
     def _ensure_collection_loaded(self):
         """Ensure the collection is loaded into memory for search operations"""
+        if self._collection_loaded:
+            return
+
         try:
-            # Check if collection exists first
-            if not self._client.has_collection(self.final_namespace):
+            if not self._milvus_call(
+                "has_collection",
+                lambda client: client.has_collection(self.final_namespace),
+            ):
                 logger.error(
                     f"[{self.workspace}] Collection {self.namespace} does not exist"
                 )
                 raise ValueError(f"Collection {self.final_namespace} does not exist")
 
-            # Load the collection if it's not already loaded
-            # In Milvus, collections need to be loaded before they can be searched
-            self._client.load_collection(self.final_namespace)
-            # logger.debug(f"[{self.workspace}] Collection {self.namespace} loaded successfully")
+            self._milvus_call(
+                "load_collection",
+                lambda client: client.load_collection(self.final_namespace),
+            )
+            self._collection_loaded = True
+            return
 
         except Exception as e:
             logger.error(
@@ -855,7 +991,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         try:
             # Check if our specific collection exists
-            collection_exists = self._client.has_collection(self.final_namespace)
+            collection_exists = self._milvus_call(
+                "has_collection",
+                lambda client: client.has_collection(self.final_namespace),
+            )
             logger.info(
                 f"[{self.workspace}] VectorDB collection '{self.namespace}' exists check: {collection_exists}"
             )
@@ -941,11 +1080,17 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             try:
                 # Try to drop the collection first if it exists in a bad state
                 try:
-                    if self._client.has_collection(self.final_namespace):
+                    if self._milvus_call(
+                        "has_collection",
+                        lambda client: client.has_collection(self.final_namespace),
+                    ):
                         logger.info(
                             f"[{self.workspace}] Dropping potentially corrupted collection {self.namespace}"
                         )
-                        self._client.drop_collection(self.final_namespace)
+                        self._milvus_call(
+                            "drop_collection",
+                            lambda client: client.drop_collection(self.final_namespace),
+                        )
                 except Exception as drop_error:
                     logger.warning(
                         f"[{self.workspace}] Could not drop collection {self.namespace}: {drop_error}"
@@ -1027,6 +1172,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         # Initialize client as None - will be created in initialize() method
         self._client = None
+        self._collection_loaded = False
         self._max_batch_size = self.global_config["embedding_batch_num"]
         self._initialized = False
 
@@ -1039,32 +1185,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             try:
                 # Create MilvusClient if not already created
                 if self._client is None:
-                    self._client = MilvusClient(
-                        uri=os.environ.get(
-                            "MILVUS_URI",
-                            config.get(
-                                "milvus",
-                                "uri",
-                                fallback=os.path.join(
-                                    self.global_config["working_dir"], "milvus_lite.db"
-                                ),
-                            ),
-                        ),
-                        user=os.environ.get(
-                            "MILVUS_USER", config.get("milvus", "user", fallback=None)
-                        ),
-                        password=os.environ.get(
-                            "MILVUS_PASSWORD",
-                            config.get("milvus", "password", fallback=None),
-                        ),
-                        token=os.environ.get(
-                            "MILVUS_TOKEN", config.get("milvus", "token", fallback=None)
-                        ),
-                        db_name=os.environ.get(
-                            "MILVUS_DB_NAME",
-                            config.get("milvus", "db_name", fallback=None),
-                        ),
-                    )
+                    self._client = self._build_milvus_client()
                     logger.debug(
                         f"[{self.workspace}] MilvusClient created successfully"
                     )
@@ -1114,8 +1235,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeddings = np.concatenate(embeddings_list)
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i]
-        results = self._client.upsert(
-            collection_name=self.final_namespace, data=list_data
+        results = self._milvus_call(
+            "upsert",
+            lambda client: client.upsert(
+                collection_name=self.final_namespace, data=list_data
+            ),
         )
         return results
 
@@ -1141,16 +1265,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             f'workspace_id == "{self.workspace}"' if self.workspace else None
         )
 
-        results = self._client.search(
-            collection_name=self.final_namespace,
-            data=embedding,
-            limit=top_k,
-            output_fields=output_fields,
-            filter=workspace_filter,
-            search_params={
-                "metric_type": "COSINE",
-                "params": {"radius": self.cosine_better_than_threshold},
-            },
+        results = self._milvus_call(
+            "search",
+            lambda client: client.search(
+                collection_name=self.final_namespace,
+                data=embedding,
+                limit=top_k,
+                output_fields=output_fields,
+                filter=workspace_filter,
+                search_params={
+                    "metric_type": "COSINE",
+                    "params": {"radius": self.cosine_better_than_threshold},
+                },
+            ),
         )
         return [
             {
@@ -1180,8 +1307,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
 
             # Delete the entity from Milvus collection
-            result = self._client.delete(
-                collection_name=self.final_namespace, pks=[entity_id]
+            result = self._milvus_call(
+                "delete",
+                lambda client: client.delete(
+                    collection_name=self.final_namespace, pks=[entity_id]
+                ),
             )
 
             if result and result.get("delete_count", 0) > 0:
@@ -1210,8 +1340,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
 
             # Find all relations involving this entity
-            results = self._client.query(
-                collection_name=self.final_namespace, filter=expr, output_fields=["id"]
+            results = self._milvus_call(
+                "query",
+                lambda client: client.query(
+                    collection_name=self.final_namespace,
+                    filter=expr,
+                    output_fields=["id"],
+                ),
             )
 
             if not results or len(results) == 0:
@@ -1228,8 +1363,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
             # Delete the relations
             if relation_ids:
-                delete_result = self._client.delete(
-                    collection_name=self.final_namespace, pks=relation_ids
+                delete_result = self._milvus_call(
+                    "delete",
+                    lambda client: client.delete(
+                        collection_name=self.final_namespace, pks=relation_ids
+                    ),
                 )
 
                 logger.debug(
@@ -1252,7 +1390,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             self._ensure_collection_loaded()
 
             # Delete vectors by IDs
-            result = self._client.delete(collection_name=self.final_namespace, pks=ids)
+            result = self._milvus_call(
+                "delete",
+                lambda client: client.delete(
+                    collection_name=self.final_namespace, pks=ids
+                ),
+            )
 
             if result and result.get("delete_count", 0) > 0:
                 logger.debug(
@@ -1285,10 +1428,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             output_fields = list(self.meta_fields) + ["id"]
 
             # Query Milvus for a specific ID
-            result = self._client.query(
-                collection_name=self.final_namespace,
-                filter=f'id == "{id}"',
-                output_fields=output_fields,
+            result = self._milvus_call(
+                "query",
+                lambda client: client.query(
+                    collection_name=self.final_namespace,
+                    filter=f'id == "{id}"',
+                    output_fields=output_fields,
+                ),
             )
 
             if not result or len(result) == 0:
@@ -1325,10 +1471,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             filter_expr = f'id in ["{id_list}"]'
 
             # Query Milvus with the filter
-            result = self._client.query(
-                collection_name=self.final_namespace,
-                filter=filter_expr,
-                output_fields=output_fields,
+            result = self._milvus_call(
+                "query",
+                lambda client: client.query(
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    output_fields=output_fields,
+                ),
             )
 
             if not result:
@@ -1375,10 +1524,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             filter_expr = f'id in ["{id_list}"]'
 
             # Query Milvus with the filter, requesting only vector field
-            result = self._client.query(
-                collection_name=self.final_namespace,
-                filter=filter_expr,
-                output_fields=["vector"],
+            result = self._milvus_call(
+                "query",
+                lambda client: client.query(
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    output_fields=["vector"],
+                ),
             )
 
             vectors_dict = {}
@@ -1409,8 +1561,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         """
         try:
             # Drop the collection and recreate it
-            if self._client.has_collection(self.final_namespace):
-                self._client.drop_collection(self.final_namespace)
+            if self._milvus_call(
+                "has_collection",
+                lambda client: client.has_collection(self.final_namespace),
+            ):
+                self._milvus_call(
+                    "drop_collection",
+                    lambda client: client.drop_collection(self.final_namespace),
+                )
+            self._collection_loaded = False
 
             # Recreate the collection
             self._create_collection_if_not_exist()

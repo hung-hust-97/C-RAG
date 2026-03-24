@@ -63,6 +63,11 @@ interface SettingsState {
 
   retrievalHistory: Message[]
   setRetrievalHistory: (history: Message[]) => void
+  retrievalHistoryByWorkspace: Record<string, Message[]>
+  setRetrievalHistoryForWorkspace: (workspaceId: string, history: Message[]) => void
+  getRetrievalHistoryForWorkspace: (workspaceId: string) => Message[]
+  clearRetrievalHistoryForWorkspace: (workspaceId: string) => void
+  clearAllRetrievalHistories: () => void
 
   querySettings: Omit<QueryRequest, 'query'>
   updateQuerySettings: (settings: Partial<QueryRequest>) => void
@@ -91,7 +96,7 @@ interface SettingsState {
 
 const useSettingsStoreBase = create<SettingsState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       theme: 'system',
       language: 'en',
       selectedWorkspaceId: 'default',
@@ -126,6 +131,7 @@ const useSettingsStoreBase = create<SettingsState>()(
       documentsPageSize: 10,
 
       retrievalHistory: [],
+      retrievalHistoryByWorkspace: { default: [] },
       userPromptHistory: [],
 
       querySettings: {
@@ -149,9 +155,11 @@ const useSettingsStoreBase = create<SettingsState>()(
         const normalized = workspaceId.trim() || 'default'
         set((state) => {
           const nextHistory = [normalized, ...state.workspaceHistory.filter((id) => id !== normalized)].slice(0, 20)
+          const nextRetrievalHistory = state.retrievalHistoryByWorkspace[normalized] || []
           return {
             selectedWorkspaceId: normalized,
-            workspaceHistory: nextHistory
+            workspaceHistory: nextHistory,
+            retrievalHistory: nextRetrievalHistory
           }
         })
       },
@@ -212,7 +220,46 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
-      setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
+      setRetrievalHistory: (history: Message[]) => {
+        const currentWorkspace = get().selectedWorkspaceId?.trim() || 'default'
+        set((state) => ({
+          retrievalHistory: history,
+          retrievalHistoryByWorkspace: {
+            ...state.retrievalHistoryByWorkspace,
+            [currentWorkspace]: history
+          }
+        }))
+      },
+
+      setRetrievalHistoryForWorkspace: (workspaceId: string, history: Message[]) => {
+        const normalized = workspaceId.trim() || 'default'
+        set((state) => ({
+          retrievalHistory: state.selectedWorkspaceId === normalized ? history : state.retrievalHistory,
+          retrievalHistoryByWorkspace: {
+            ...state.retrievalHistoryByWorkspace,
+            [normalized]: history
+          }
+        }))
+      },
+
+      getRetrievalHistoryForWorkspace: (workspaceId: string) => {
+        const normalized = workspaceId.trim() || 'default'
+        return get().retrievalHistoryByWorkspace[normalized] || []
+      },
+
+      clearRetrievalHistoryForWorkspace: (workspaceId: string) => {
+        const normalized = workspaceId.trim() || 'default'
+        set((state) => {
+          const nextMap = { ...state.retrievalHistoryByWorkspace }
+          delete nextMap[normalized]
+          return {
+            retrievalHistory: state.selectedWorkspaceId === normalized ? [] : state.retrievalHistory,
+            retrievalHistoryByWorkspace: nextMap
+          }
+        })
+      },
+
+      clearAllRetrievalHistories: () => set({ retrievalHistory: [], retrievalHistoryByWorkspace: {} }),
 
       updateQuerySettings: (settings: Partial<QueryRequest>) => {
         // Filter out history_turns to prevent changes, always keep it as 0
@@ -264,8 +311,23 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 20,
+      version: 21,
       migrate: (state: any, version: number) => {
+        if (version < 21) {
+          const selectedWorkspaceId = state.selectedWorkspaceId || 'default'
+          const legacyHistory = Array.isArray(state.retrievalHistory) ? state.retrievalHistory : []
+          const existingMap =
+            state.retrievalHistoryByWorkspace && typeof state.retrievalHistoryByWorkspace === 'object'
+              ? state.retrievalHistoryByWorkspace
+              : {}
+
+          if (!existingMap[selectedWorkspaceId] && legacyHistory.length > 0) {
+            existingMap[selectedWorkspaceId] = legacyHistory
+          }
+
+          state.retrievalHistoryByWorkspace = existingMap
+          state.retrievalHistory = existingMap[selectedWorkspaceId] || []
+        }
         if (version < 20) {
           state.selectedWorkspaceId = state.selectedWorkspaceId || 'default'
           if (!Array.isArray(state.workspaceHistory) || state.workspaceHistory.length === 0) {

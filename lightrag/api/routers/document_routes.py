@@ -30,6 +30,7 @@ from lightrag.utils import (
     compute_mdhash_id,
     sanitize_text_for_encoding,
 )
+from lightrag.api.reembed import reembed_workspace_vectors
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -427,6 +428,10 @@ Attributes:
 
 
 class DeleteDocRequest(BaseModel):
+    workspace_id: str | None = Field(
+        default=None,
+        description="Workspace ID that owns the documents. Optional for backward compatibility.",
+    )
     doc_ids: List[str] = Field(..., description="The IDs of the documents to delete.")
     delete_file: bool = Field(
         default=False,
@@ -455,6 +460,24 @@ class DeleteDocRequest(BaseModel):
 
         return validated_ids
 
+    @field_validator("workspace_id", mode="after")
+    @classmethod
+    def validate_workspace_id(cls, workspace_id: str | None) -> str | None:
+        if workspace_id is None:
+            return None
+        normalized_workspace_id = workspace_id.strip()
+        return normalized_workspace_id or None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "workspace_id": "default",
+                "doc_ids": ["doc_123", "doc_456"],
+                "delete_file": False,
+                "delete_llm_cache": False,
+            }
+        }
+
 
 class DeleteEntityRequest(BaseModel):
     entity_name: str = Field(..., description="The name of the entity to delete.")
@@ -477,6 +500,38 @@ class DeleteRelationRequest(BaseModel):
         if not entity_name or not entity_name.strip():
             raise ValueError("Entity name cannot be empty")
         return entity_name.strip()
+
+
+class ReembedRequest(BaseModel):
+    workspace_id: str = Field(
+        ..., description="Workspace ID for re-embedding existing vectors."
+    )
+    batch_size: int = Field(
+        default=256,
+        ge=1,
+        le=5000,
+        description="Batch size for re-embedding vectors.",
+    )
+
+    @field_validator("workspace_id", mode="after")
+    @classmethod
+    def validate_workspace_id(cls, workspace_id: str) -> str:
+        normalized_workspace_id = workspace_id.strip() if workspace_id else ""
+        if not normalized_workspace_id:
+            raise ValueError("workspace_id cannot be empty")
+        return normalized_workspace_id
+
+
+class ReembedResponse(BaseModel):
+    status: Literal["success", "busy", "fail"] = Field(
+        description="Status of re-embedding operation"
+    )
+    message: str = Field(description="Operation result message")
+    workspace_id: str = Field(description="Workspace where re-embedding was executed")
+    documents: int = Field(default=0, description="Number of processed documents")
+    chunks: int = Field(default=0, description="Number of re-embedded chunks")
+    entities: int = Field(default=0, description="Number of re-embedded entities")
+    relations: int = Field(default=0, description="Number of re-embedded relations")
 
 
 class DocStatusResponse(BaseModel):
@@ -2159,6 +2214,9 @@ def create_document_routes(
             else rag
         )
 
+        # Use canonical workspace_id resolved by backend context.
+        resolved_workspace_id = current_rag.workspace
+
         if get_doc_manager_for_workspace is not None:
             current_doc_manager = get_doc_manager_for_workspace(resolved_workspace_id)
         elif resolved_workspace_id == doc_manager.workspace:
@@ -2359,12 +2417,57 @@ def create_document_routes(
                             ),
                         )
                 else:
-                    return InsertResponse(
-                        status="duplicated",
-                        message=f"File '{safe_filename}' already exists in the input directory.",
-                        workspace_id=resolved_workspace_id,
-                        track_id="",
-                    )
+                    # If no doc_status record exists but file remains in input dir,
+                    # treat it as orphan cache and auto-clean when pipeline is idle.
+                    if existing_doc_data is None:
+                        from lightrag.kg.shared_storage import (
+                            get_namespace_data,
+                            get_namespace_lock,
+                        )
+
+                        pipeline_status = await get_namespace_data(
+                            "pipeline_status", workspace=current_rag.workspace
+                        )
+                        pipeline_status_lock = get_namespace_lock(
+                            "pipeline_status", workspace=current_rag.workspace
+                        )
+
+                        async with pipeline_status_lock:
+                            pipeline_busy = pipeline_status.get("busy", False)
+
+                        if not pipeline_busy:
+                            try:
+                                file_path.unlink()
+                                logger.warning(
+                                    f"[File Extraction]Removed orphan input file without doc_status record: {safe_filename}"
+                                )
+                            except Exception as cleanup_error:
+                                logger.error(
+                                    f"[File Extraction]Failed to remove orphan file {safe_filename}: {cleanup_error}"
+                                )
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=(
+                                        f"Failed to clean up orphan input file '{safe_filename}' before retry upload"
+                                    ),
+                                )
+                        else:
+                            return InsertResponse(
+                                status="duplicated",
+                                message=(
+                                    f"File '{safe_filename}' is already cached in input directory and pipeline is busy. "
+                                    "Please wait for processing to finish or cancel the pipeline."
+                                ),
+                                workspace_id=resolved_workspace_id,
+                                track_id="",
+                            )
+                    else:
+                        return InsertResponse(
+                            status="duplicated",
+                            message=f"File '{safe_filename}' already exists in the input directory.",
+                            workspace_id=resolved_workspace_id,
+                            track_id="",
+                        )
 
             # Async streaming write with size check
             bytes_written = 0
@@ -3046,10 +3149,11 @@ def create_document_routes(
         "/delete_document",
         response_model=DeleteDocByIdResponse,
         dependencies=[Depends(combined_auth)],
-        summary="Delete a document and all its associated data by its ID.",
+        summary="Delete documents by IDs within a workspace.",
     )
     async def delete_document(
         delete_request: DeleteDocRequest,
+        request: Request,
         background_tasks: BackgroundTasks,
     ) -> DeleteDocByIdResponse:
         """
@@ -3063,7 +3167,7 @@ def create_document_routes(
         This operation is irreversible and will interact with the pipeline status.
 
         Args:
-            delete_request (DeleteDocRequest): The request containing the document IDs and deletion options.
+            delete_request (DeleteDocRequest): The request containing workspace_id, document IDs, and deletion options.
             background_tasks: FastAPI BackgroundTasks for async processing
 
         Returns:
@@ -3076,18 +3180,44 @@ def create_document_routes(
               - 500: If an unexpected internal error occurs during initialization.
         """
         doc_ids = delete_request.doc_ids
+        workspace_id = (
+            delete_request.workspace_id
+            or request.query_params.get("workspace_id")
+            or "default"
+        )
 
         try:
+            _, current_rag, current_doc_manager = await resolve_request_context(
+                request, workspace_id
+            )
+
+            # Validate all documents belong to the resolved workspace before enqueueing deletion.
+            existing_docs = await asyncio.gather(
+                *(current_rag.doc_status.get_by_id(doc_id) for doc_id in doc_ids)
+            )
+            missing_doc_ids = [
+                doc_id for doc_id, doc_data in zip(doc_ids, existing_docs) if not doc_data
+            ]
+            if missing_doc_ids:
+                return DeleteDocByIdResponse(
+                    status="not_allowed",
+                    message=(
+                        "The following document IDs do not belong to workspace "
+                        f"'{current_rag.workspace}': {', '.join(missing_doc_ids)}"
+                    ),
+                    doc_id=", ".join(missing_doc_ids),
+                )
+
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
                 get_namespace_lock,
             )
 
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_rag.workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_rag.workspace
             )
 
             # Check if pipeline is busy with proper lock
@@ -3102,8 +3232,8 @@ def create_document_routes(
             # Add deletion task to background tasks
             background_tasks.add_task(
                 background_delete_documents,
-                rag,
-                doc_manager,
+                current_rag,
+                current_doc_manager,
                 doc_ids,
                 delete_request.delete_file,
                 delete_request.delete_llm_cache,
@@ -3120,6 +3250,87 @@ def create_document_routes(
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.post(
+        "/reembed",
+        response_model=ReembedResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Rebuild chunk/entity/relation vectors for a workspace.",
+    )
+    async def reembed_documents(
+        reembed_request: ReembedRequest,
+        request: Request,
+    ) -> ReembedResponse:
+        """Rebuild vector storages from existing documents and KG data in workspace."""
+        try:
+            _, current_rag, _ = await resolve_request_context(
+                request, reembed_request.workspace_id
+            )
+
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=current_rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=current_rag.workspace
+            )
+
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    return ReembedResponse(
+                        status="busy",
+                        message="Cannot re-embed while pipeline is busy",
+                        workspace_id=current_rag.workspace,
+                    )
+
+                pipeline_status["busy"] = True
+                pipeline_status["job_name"] = "reembed_vectors"
+                pipeline_status["latest_message"] = "Re-embedding vectors started"
+                pipeline_status.setdefault("history_messages", []).append(
+                    "Re-embedding vectors started"
+                )
+
+            try:
+                stats = await reembed_workspace_vectors(
+                    current_rag, batch_size=reembed_request.batch_size
+                )
+            finally:
+                async with pipeline_status_lock:
+                    pipeline_status["busy"] = False
+                    pipeline_status["job_name"] = ""
+
+            success_message = (
+                "Re-embedding completed: "
+                f"documents={stats['documents']}, chunks={stats['chunks']}, "
+                f"entities={stats['entities']}, relations={stats['relations']}"
+            )
+
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = success_message
+                pipeline_status.setdefault("history_messages", []).append(success_message)
+
+            return ReembedResponse(
+                status="success",
+                message=success_message,
+                workspace_id=current_rag.workspace,
+                documents=stats["documents"],
+                chunks=stats["chunks"],
+                entities=stats["entities"],
+                relations=stats["relations"],
+            )
+        except Exception as e:
+            error_msg = f"Error re-embedding workspace vectors: {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            return ReembedResponse(
+                status="fail",
+                message=error_msg,
+                workspace_id=reembed_request.workspace_id,
+            )
 
     @router.post(
         "/clear_cache",

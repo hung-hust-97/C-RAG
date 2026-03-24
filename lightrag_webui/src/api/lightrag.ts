@@ -894,8 +894,14 @@ export const deleteDocuments = async (
   deleteFile: boolean = false,
   deleteLLMCache: boolean = false
 ): Promise<DeleteDocResponse> => {
+  const workspaceId = getSelectedWorkspaceId()
   const response = await axiosInstance.delete('/documents/delete_document', {
-    data: { doc_ids: docIds, delete_file: deleteFile, delete_llm_cache: deleteLLMCache }
+    data: {
+      workspace_id: workspaceId,
+      doc_ids: docIds,
+      delete_file: deleteFile,
+      delete_llm_cache: deleteLLMCache
+    }
   })
   return response.data
 }

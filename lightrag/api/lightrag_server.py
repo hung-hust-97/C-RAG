@@ -2,7 +2,7 @@
 LightRAG FastAPI Server
 """
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.openapi.docs import (
@@ -10,7 +10,10 @@ from fastapi.openapi.docs import (
     get_swagger_ui_oauth2_redirect_html,
 )
 import os
+import json
 import asyncio
+import re
+import shutil
 import logging
 import logging.config
 import sys
@@ -53,6 +56,7 @@ from lightrag.api.routers.document_routes import (
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.reembed import reembed_workspace_vectors
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -346,6 +350,168 @@ def create_app(args):
 
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    auto_reembed_on_embedding_change = (
+        os.getenv("AUTO_REEMBED_ON_EMBEDDING_CHANGE", "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    embedding_profile_lock = asyncio.Lock()
+
+    def _is_milvus_dimension_mismatch_error(error: Exception) -> bool:
+        message = str(error)
+        return (
+            "Vector dimension mismatch for collection" in message
+            and "Collection validation failed" in message
+        )
+
+    def _sanitize_workspace_for_milvus_collection(workspace: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", workspace.strip())
+        if not sanitized:
+            return "ws"
+        if not (sanitized[0].isalpha() or sanitized[0] == "_"):
+            sanitized = f"ws_{sanitized}"
+        return sanitized[:200]
+
+    async def _drop_workspace_milvus_collections(workspace_id: str) -> bool:
+        if args.vector_storage != "MilvusVectorDBStorage":
+            return False
+
+        try:
+            from pymilvus import MilvusClient  # type: ignore
+        except Exception as e:
+            logger.error(
+                f"[{workspace_id}] Cannot auto-heal Milvus mismatch because pymilvus import failed: {e}"
+            )
+            return False
+
+        milvus_uri = os.getenv("MILVUS_URI", "http://127.0.0.1:19530")
+        milvus_db_name = os.getenv("MILVUS_DB_NAME", None)
+
+        workspace = (workspace_id or "").strip()
+        if workspace:
+            prefix = _sanitize_workspace_for_milvus_collection(workspace)
+            target_collections = {
+                f"{prefix}_entities",
+                f"{prefix}_relationships",
+                f"{prefix}_chunks",
+            }
+        else:
+            target_collections = {"entities", "relationships", "chunks"}
+
+        client = MilvusClient(uri=milvus_uri, db_name=milvus_db_name)
+        existing_collections = set(client.list_collections())
+        to_drop = sorted(target_collections.intersection(existing_collections))
+
+        if not to_drop:
+            logger.warning(
+                f"[{workspace_id}] No matching Milvus collections found to drop for auto-heal: {sorted(target_collections)}"
+            )
+            return False
+
+        for collection_name in to_drop:
+            logger.warning(
+                f"[{workspace_id}] Dropping incompatible Milvus collection: {collection_name}"
+            )
+            client.drop_collection(collection_name)
+
+        logger.warning(
+            f"[{workspace_id}] Dropped {len(to_drop)} incompatible Milvus collections for dimension migration"
+        )
+        return True
+
+    def _embedding_profile_dir() -> Path:
+        profile_dir = Path(args.working_dir) / ".embedding_profiles"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return profile_dir
+
+    def _embedding_profile_path(workspace_id: str) -> Path:
+        safe_workspace_id = workspace_id or "default"
+        return _embedding_profile_dir() / f"{safe_workspace_id}.json"
+
+    def _current_embedding_profile() -> dict[str, object]:
+        return {
+            "binding": args.embedding_binding,
+            "model": args.embedding_model,
+            "host": args.embedding_binding_host,
+            "dim": int(args.embedding_dim),
+            "send_dim": bool(args.embedding_send_dim),
+            "token_limit": int(args.embedding_token_limit),
+        }
+
+    async def maybe_reembed_on_embedding_change(workspace_rag: LightRAG) -> None:
+        profile_path = _embedding_profile_path(workspace_rag.workspace)
+        current_profile = _current_embedding_profile()
+
+        async with embedding_profile_lock:
+            previous_profile = None
+            if profile_path.exists():
+                try:
+                    previous_profile = json.loads(profile_path.read_text())
+                except Exception as e:
+                    logger.warning(
+                        f"[{workspace_rag.workspace}] Failed to parse embedding profile file: {e}"
+                    )
+
+            if previous_profile is None:
+                profile_path.write_text(json.dumps(current_profile, indent=2))
+                return
+
+            if previous_profile == current_profile:
+                return
+
+            logger.warning(
+                f"[{workspace_rag.workspace}] Embedding configuration changed. "
+                f"Previous: {previous_profile} | Current: {current_profile}"
+            )
+
+            if not auto_reembed_on_embedding_change:
+                logger.warning(
+                    f"[{workspace_rag.workspace}] AUTO_REEMBED_ON_EMBEDDING_CHANGE is disabled. "
+                    "Run POST /documents/reembed to rebuild vectors manually."
+                )
+                return
+
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=workspace_rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=workspace_rag.workspace
+            )
+
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    logger.warning(
+                        f"[{workspace_rag.workspace}] Skip auto re-embedding because pipeline is busy"
+                    )
+                    return
+                pipeline_status["busy"] = True
+                pipeline_status["job_name"] = "auto_reembed_vectors"
+                pipeline_status["latest_message"] = "Auto re-embedding vectors started"
+                pipeline_status.setdefault("history_messages", []).append(
+                    "Auto re-embedding vectors started"
+                )
+
+            try:
+                stats = await reembed_workspace_vectors(workspace_rag)
+                success_message = (
+                    "Auto re-embedding completed: "
+                    f"documents={stats['documents']}, chunks={stats['chunks']}, "
+                    f"entities={stats['entities']}, relations={stats['relations']}"
+                )
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = success_message
+                    pipeline_status.setdefault("history_messages", []).append(
+                        success_message
+                    )
+                profile_path.write_text(json.dumps(current_profile, indent=2))
+            finally:
+                async with pipeline_status_lock:
+                    pipeline_status["busy"] = False
+                    pipeline_status["job_name"] = ""
 
     def build_rag_instance(workspace_id: str) -> LightRAG:
         return LightRAG(
@@ -386,27 +552,124 @@ def create_app(args):
     rag_instances: dict[str, LightRAG] = {}
     doc_manager_instances: dict[str, DocumentManager] = {}
     rag_instances_lock = asyncio.Lock()
+    workspace_alias_cache: dict[str, str] = {}
 
     def normalize_workspace_id(workspace_id: str | None) -> str:
+        default_workspace = (args.workspace or "").strip()
+        if not default_workspace:
+            default_workspace = get_default_workspace() or "default"
+
         if workspace_id is None:
-            return args.workspace
+            return default_workspace
 
         normalized_workspace_id = workspace_id.strip()
         if not normalized_workspace_id:
-            return args.workspace
+            return default_workspace
 
+        return normalized_workspace_id
+
+    async def resolve_workspace_id_alias(workspace_id: str | None) -> str:
+        """Resolve workspace identifier aliases (name/id/legacy workspace) to canonical workspace_id."""
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        if not normalized_workspace_id:
+            return normalized_workspace_id
+
+        cached_workspace_id = workspace_alias_cache.get(normalized_workspace_id)
+        if cached_workspace_id:
+            return cached_workspace_id
+
+        # First-pass resolution from current workspace id/name map.
+        try:
+            workspace_items, _ = await get_all_workspace_items()
+            normalized_workspace_name = normalized_workspace_id.lower()
+            for item in workspace_items:
+                workspace_id_item = (item.get("workspace_id") or "").strip()
+                workspace_name_item = (item.get("workspace_name") or "").strip()
+                if not workspace_id_item:
+                    continue
+
+                if normalized_workspace_id == workspace_id_item or (
+                    workspace_name_item
+                    and normalized_workspace_name == workspace_name_item.lower()
+                ):
+                    workspace_alias_cache[normalized_workspace_id] = workspace_id_item
+                    if workspace_name_item:
+                        workspace_alias_cache[workspace_name_item] = workspace_id_item
+                    workspace_alias_cache[workspace_id_item] = workspace_id_item
+
+                    if workspace_id_item != normalized_workspace_id:
+                        logger.info(
+                            f"Resolved workspace alias '{normalized_workspace_id}' -> '{workspace_id_item}'"
+                        )
+
+                    return workspace_id_item
+        except Exception as e:
+            logger.debug(
+                f"Workspace alias map resolution skipped for '{normalized_workspace_id}': {e}"
+            )
+
+        try:
+            db = getattr(getattr(rag.doc_status, "db", None), "query", None)
+            if db is not None:
+                rows = await rag.doc_status.db.query(
+                    """
+                    SELECT workspace_id, name, id, workspace
+                    FROM LIGHTRAG_WORKSPACES
+                    WHERE workspace_id = $1
+                       OR id = $1
+                       OR workspace = $1
+                       OR LOWER(name) = LOWER($1)
+                    ORDER BY
+                        CASE
+                            WHEN workspace_id = $1 THEN 0
+                            WHEN id = $1 THEN 1
+                            WHEN workspace = $1 THEN 2
+                            ELSE 3
+                        END
+                    LIMIT 1
+                    """,
+                    [normalized_workspace_id],
+                    multirows=True,
+                )
+
+                if rows:
+                    row = rows[0]
+                    canonical_workspace_id = (row.get("workspace_id") or "").strip()
+                    if canonical_workspace_id:
+                        # Cache known aliases to avoid repeated DB lookups.
+                        workspace_alias_cache[normalized_workspace_id] = canonical_workspace_id
+                        for alias_key in ("workspace_id", "name", "id", "workspace"):
+                            alias_val = (row.get(alias_key) or "").strip()
+                            if alias_val:
+                                workspace_alias_cache[alias_val] = canonical_workspace_id
+
+                        if canonical_workspace_id != normalized_workspace_id:
+                            logger.info(
+                                f"Resolved workspace alias '{normalized_workspace_id}' -> '{canonical_workspace_id}'"
+                            )
+
+                        return canonical_workspace_id
+        except Exception as e:
+            logger.debug(
+                f"Workspace alias resolution skipped for '{normalized_workspace_id}': {e}"
+            )
+
+        workspace_alias_cache[normalized_workspace_id] = normalized_workspace_id
         return normalized_workspace_id
 
     def get_doc_manager_for_workspace(workspace_id: str) -> DocumentManager:
         normalized_workspace_id = normalize_workspace_id(workspace_id)
-        if normalized_workspace_id not in doc_manager_instances:
-            doc_manager_instances[normalized_workspace_id] = DocumentManager(
-                args.input_dir, workspace=normalized_workspace_id
+        canonical_workspace_id = workspace_alias_cache.get(
+            normalized_workspace_id, normalized_workspace_id
+        )
+        if canonical_workspace_id not in doc_manager_instances:
+            doc_manager_instances[canonical_workspace_id] = DocumentManager(
+                args.input_dir, workspace=canonical_workspace_id
             )
-        return doc_manager_instances[normalized_workspace_id]
+        return doc_manager_instances[canonical_workspace_id]
 
     async def get_rag_for_workspace(workspace_id: str) -> LightRAG:
-        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        normalized_workspace_id = await resolve_workspace_id_alias(workspace_id)
 
         if normalized_workspace_id in rag_instances:
             return rag_instances[normalized_workspace_id]
@@ -416,8 +679,27 @@ def create_app(args):
                 return rag_instances[normalized_workspace_id]
 
             workspace_rag = build_rag_instance(normalized_workspace_id)
-            await workspace_rag.initialize_storages()
+
+            try:
+                await workspace_rag.initialize_storages()
+            except RuntimeError as e:
+                if not _is_milvus_dimension_mismatch_error(e):
+                    raise
+
+                logger.warning(
+                    f"[{normalized_workspace_id}] Detected Milvus dimension mismatch during workspace initialization: {e}"
+                )
+
+                healed = await _drop_workspace_milvus_collections(normalized_workspace_id)
+                if not healed:
+                    raise
+
+                # Recreate rag instance to ensure clean storage clients after drop.
+                workspace_rag = build_rag_instance(normalized_workspace_id)
+                await workspace_rag.initialize_storages()
+
             await workspace_rag.check_and_migrate_data()
+            await maybe_reembed_on_embedding_change(workspace_rag)
             rag_instances[normalized_workspace_id] = workspace_rag
             return workspace_rag
 
@@ -436,6 +718,7 @@ def create_app(args):
 
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
+            await maybe_reembed_on_embedding_change(rag)
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
@@ -618,8 +901,11 @@ def create_app(args):
                     continue
                 if item.name.startswith("__"):
                     continue
-                data_workspace_ids.add(item.name)
-                workspace_map.setdefault(item.name, item.name)
+                # Only treat a directory as an active workspace if it contains files.
+                has_workspace_files = any(sub_item.is_file() for sub_item in item.iterdir())
+                if has_workspace_files:
+                    data_workspace_ids.add(item.name)
+                    workspace_map.setdefault(item.name, item.name)
 
         all_workspace_ids = sorted(ws for ws in workspace_map.keys() if ws)
         data_first_ids = [
@@ -647,6 +933,27 @@ def create_app(args):
         ]
 
         return workspace_items, effective_default_workspace
+
+    async def _delete_workspace_metadata_row(workspace_id: str) -> bool:
+        """Delete workspace metadata row when PostgreSQL metadata table is available."""
+        db_obj = getattr(rag.doc_status, "db", None)
+        db_execute = getattr(db_obj, "execute", None)
+        if db_execute is None:
+            return False
+
+        await db_obj.execute(
+            """
+            DELETE FROM LIGHTRAG_WORKSPACES
+            WHERE workspace_id = $1 OR id = $1 OR workspace = $1
+            """,
+            {"workspace_id": workspace_id},
+        )
+
+        registered_workspaces = getattr(db_obj, "_registered_workspaces", None)
+        if isinstance(registered_workspaces, dict):
+            registered_workspaces.pop(workspace_id, None)
+
+        return True
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -1483,6 +1790,23 @@ def create_app(args):
         if not workspace_name:
             workspace_name = normalized_workspace_id
 
+        # Prevent ambiguous aliasing: workspace_name must not match another workspace_id.
+        workspace_items, _ = await get_all_workspace_items()
+        for item in workspace_items:
+            existing_workspace_id = (item.get("workspace_id") or "").strip()
+            if (
+                existing_workspace_id
+                and existing_workspace_id != normalized_workspace_id
+                and existing_workspace_id.lower() == workspace_name.lower()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"workspace_name '{workspace_name}' conflicts with existing workspace_id "
+                        f"'{existing_workspace_id}'. Please choose a different workspace_name."
+                    ),
+                )
+
         db = getattr(getattr(rag.doc_status, "db", None), "ensure_workspace_metadata", None)
         if db is None:
             raise HTTPException(
@@ -1499,6 +1823,140 @@ def create_app(args):
             "workspace_id": normalized_workspace_id,
             "workspace_name": workspace_name,
             "status": "ok",
+        }
+
+    @app.delete(
+        "/workspaces/{workspace_id}",
+        dependencies=[Depends(combined_auth)],
+        summary="Delete workspace and all workspace data",
+        description=(
+            "Delete all data for a workspace, including documents, chunks, KG, vectors, "
+            "workspace files, and workspace metadata."
+        ),
+    )
+    async def delete_workspace(
+        workspace_id: str,
+        force: bool = Query(False, description="Force deletion of default workspace if true"),
+        delete_input_files: bool = Query(True, description="Delete workspace input files"),
+    ):
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        if not normalized_workspace_id:
+            raise HTTPException(status_code=400, detail="workspace_id cannot be empty")
+
+        canonical_workspace_id = await resolve_workspace_id_alias(normalized_workspace_id)
+
+        default_workspace = normalize_workspace_id(args.workspace)
+        if canonical_workspace_id == default_workspace and not force:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Refusing to delete default workspace '{canonical_workspace_id}'. "
+                    "Set force=true to confirm destructive deletion."
+                ),
+            )
+
+        # If the workspace pipeline is busy, block deletion to avoid data races.
+        try:
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=canonical_workspace_id
+            )
+            if pipeline_status.get("busy", False):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Workspace '{canonical_workspace_id}' is busy. "
+                        "Wait for the pipeline to finish before deleting."
+                    ),
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            # pipeline_status namespace may not exist for unused workspaces.
+            pass
+
+        workspace_rag = rag_instances.get(canonical_workspace_id)
+        created_temp_rag = False
+
+        if workspace_rag is None:
+            workspace_rag = build_rag_instance(canonical_workspace_id)
+            await workspace_rag.initialize_storages()
+            created_temp_rag = True
+
+        storages = [
+            workspace_rag.text_chunks,
+            workspace_rag.full_docs,
+            workspace_rag.full_entities,
+            workspace_rag.full_relations,
+            workspace_rag.entity_chunks,
+            workspace_rag.relation_chunks,
+            workspace_rag.entities_vdb,
+            workspace_rag.relationships_vdb,
+            workspace_rag.chunks_vdb,
+            workspace_rag.chunk_entity_relation_graph,
+            workspace_rag.doc_status,
+        ]
+
+        drop_tasks = [storage.drop() for storage in storages if storage is not None]
+        drop_results = await asyncio.gather(*drop_tasks, return_exceptions=True)
+
+        dropped_components = 0
+        drop_errors: list[str] = []
+
+        for idx, result in enumerate(drop_results):
+            storage_obj = [storage for storage in storages if storage is not None][idx]
+            storage_name = storage_obj.__class__.__name__
+
+            if isinstance(result, Exception):
+                drop_errors.append(f"{storage_name}: {result}")
+            else:
+                dropped_components += 1
+
+        deleted_input_dir = False
+        if delete_input_files:
+            workspace_input_dir = Path(args.input_dir) / canonical_workspace_id
+            if workspace_input_dir.exists() and workspace_input_dir.is_dir():
+                shutil.rmtree(workspace_input_dir, ignore_errors=True)
+                deleted_input_dir = True
+
+        metadata_deleted = False
+        try:
+            metadata_deleted = await _delete_workspace_metadata_row(canonical_workspace_id)
+        except Exception as e:
+            drop_errors.append(f"workspace_metadata: {e}")
+
+        profile_deleted = False
+        try:
+            profile_path = _embedding_profile_path(canonical_workspace_id)
+            if profile_path.exists():
+                profile_path.unlink()
+                profile_deleted = True
+        except Exception as e:
+            drop_errors.append(f"embedding_profile: {e}")
+
+        # Remove in-memory instances and aliases after storage cleanup.
+        async with rag_instances_lock:
+            cached_rag = rag_instances.pop(canonical_workspace_id, None)
+            if cached_rag is not None and cached_rag is not workspace_rag:
+                await cached_rag.finalize_storages()
+
+            for alias_key in list(workspace_alias_cache.keys()):
+                alias_value = workspace_alias_cache.get(alias_key)
+                if alias_key == canonical_workspace_id or alias_value == canonical_workspace_id:
+                    workspace_alias_cache.pop(alias_key, None)
+
+        doc_manager_instances.pop(canonical_workspace_id, None)
+
+        if created_temp_rag or workspace_rag is not rag:
+            await workspace_rag.finalize_storages()
+
+        return {
+            "workspace_id": canonical_workspace_id,
+            "status": "success" if not drop_errors else "partial_success",
+            "dropped_components": dropped_components,
+            "drop_errors": drop_errors,
+            "deleted_input_dir": deleted_input_dir,
+            "metadata_deleted": metadata_deleted,
+            "embedding_profile_deleted": profile_deleted,
         }
 
     # Custom StaticFiles class for smart caching

@@ -107,7 +107,7 @@ const LoginPage = () => {
       } else {
         console.log('Different user logging in, clearing chat history')
         // Directly clear chat history instead of setting a flag
-        useSettingsStore.getState().setRetrievalHistory([])
+        useSettingsStore.getState().clearAllRetrievalHistories()
       }
 
       // Update previous username

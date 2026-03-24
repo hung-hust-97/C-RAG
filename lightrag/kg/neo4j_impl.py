@@ -254,6 +254,9 @@ class Neo4JStorage(BaseGraphStorage):
 
                 if connected:
                     workspace_label = self._get_workspace_label()
+                    await self._migrate_legacy_default_workspace_label(
+                        self._driver, self._DATABASE, workspace_label
+                    )
                     # Create B-Tree index for entity_id for faster lookups
                     try:
                         async with self._driver.session(database=database) as session:
@@ -273,6 +276,55 @@ class Neo4JStorage(BaseGraphStorage):
                         self._driver, self._DATABASE, workspace_label
                     )
                     break
+
+    async def _migrate_legacy_default_workspace_label(
+        self, driver: AsyncDriver, database: str | None, workspace_label: str
+    ) -> None:
+        """Migrate legacy default workspace label from `base` to `default`.
+
+        Historically, empty workspace values were mapped to `base` in Neo4j. Newer
+        code paths use explicit `default`. This one-time migration prevents KG
+        queries on workspace `default` from returning empty results.
+        """
+        if workspace_label != "default":
+            return
+
+        try:
+            async with driver.session(database=database) as session:
+                default_count_result = await session.run(
+                    "MATCH (n:`default`) RETURN count(n) AS cnt"
+                )
+                default_count_record = await default_count_result.single()
+                await default_count_result.consume()
+                default_count = int(default_count_record["cnt"] or 0)
+
+                if default_count > 0:
+                    return
+
+                legacy_count_result = await session.run(
+                    "MATCH (n:`base`) RETURN count(n) AS cnt"
+                )
+                legacy_count_record = await legacy_count_result.single()
+                await legacy_count_result.consume()
+                legacy_count = int(legacy_count_record["cnt"] or 0)
+
+                if legacy_count <= 0:
+                    return
+
+                migrate_result = await session.run(
+                    "MATCH (n:`base`) WHERE NOT n:`default` SET n:`default` RETURN count(n) AS migrated"
+                )
+                migrate_record = await migrate_result.single()
+                await migrate_result.consume()
+                migrated_count = int(migrate_record["migrated"] or 0)
+
+                logger.warning(
+                    f"[{self.workspace}] Migrated legacy Neo4j workspace label: base -> default (nodes: {migrated_count})"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[{self.workspace}] Failed to migrate legacy Neo4j base label to default: {e}"
+            )
 
     async def _create_fulltext_index(
         self, driver: AsyncDriver, database: str, workspace_label: str

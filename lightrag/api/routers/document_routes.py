@@ -21,7 +21,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
@@ -125,6 +125,20 @@ router = APIRouter(
 
 # Temporary file prefix
 temp_prefix = "__tmp__"
+UNKNOWN_FILE_SOURCE = "unknown_source"
+LEGACY_EMPTY_FILE_PATH_SENTINELS = {"", "no-file-path"}
+
+
+def normalize_file_path(file_path: str | None) -> str:
+    """Normalize missing document sources to a single non-null sentinel."""
+    if file_path is None:
+        return UNKNOWN_FILE_SOURCE
+
+    normalized = file_path.strip()
+    if normalized in LEGACY_EMPTY_FILE_PATH_SENTINELS:
+        return UNKNOWN_FILE_SOURCE
+
+    return normalized
 
 
 def sanitize_filename(filename: str, input_dir: Path) -> str:
@@ -190,14 +204,15 @@ class ScanResponse(BaseModel):
     workspace_id: str = Field(description="Workspace identifier for this scan request")
     track_id: str = Field(description="Tracking ID for monitoring scanning progress")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "scanning_started",
                 "message": "Scanning process has been initiated in the background",
                 "track_id": "scan_20250729_170612_abc123",
             }
         }
+    )
 
 
 class ReprocessResponse(BaseModel):
@@ -218,14 +233,15 @@ class ReprocessResponse(BaseModel):
         description="Always empty string. Reprocessed documents retain their original track_id from initial upload.",
     )
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "reprocessing_started",
                 "message": "Reprocessing of failed documents has been initiated in background",
                 "track_id": "",
             }
         }
+    )
 
 
 class CancelPipelineResponse(BaseModel):
@@ -241,13 +257,14 @@ class CancelPipelineResponse(BaseModel):
     )
     message: str = Field(description="Human-readable message describing the operation")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "cancellation_requested",
                 "message": "Pipeline cancellation has been requested. Documents will be marked as FAILED.",
             }
         }
+    )
 
 
 class InsertTextRequest(BaseModel):
@@ -262,7 +279,9 @@ class InsertTextRequest(BaseModel):
         min_length=1,
         description="The text to insert",
     )
-    file_source: str = Field(default=None, min_length=0, description="File Source")
+    file_source: Optional[str] = Field(
+        default=None, min_length=0, description="File Source"
+    )
     workspace_id: Optional[str] = Field(
         default=None, description="Workspace identifier for this request"
     )
@@ -272,18 +291,19 @@ class InsertTextRequest(BaseModel):
     def strip_text_after(cls, text: str) -> str:
         return text.strip()
 
-    @field_validator("file_source", mode="after")
+    @field_validator("file_source", mode="before")
     @classmethod
-    def strip_source_after(cls, file_source: str) -> str:
-        return file_source.strip()
+    def normalize_source_before(cls, file_source: Optional[str]) -> str:
+        return normalize_file_path(file_source)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "file_source": "Source of the text (optional)",
             }
         }
+    )
 
 
 class InsertTextsRequest(BaseModel):
@@ -298,7 +318,7 @@ class InsertTextsRequest(BaseModel):
         min_length=1,
         description="The texts to insert",
     )
-    file_sources: list[str] = Field(
+    file_sources: Optional[list[str]] = Field(
         default=None, min_length=0, description="Sources of the texts"
     )
     workspace_id: Optional[str] = Field(
@@ -310,13 +330,18 @@ class InsertTextsRequest(BaseModel):
     def strip_texts_after(cls, texts: list[str]) -> list[str]:
         return [text.strip() for text in texts]
 
-    @field_validator("file_sources", mode="after")
+    @field_validator("file_sources", mode="before")
     @classmethod
-    def strip_sources_after(cls, file_sources: list[str]) -> list[str]:
-        return [file_source.strip() for file_source in file_sources]
+    def normalize_sources_before(
+        cls, file_sources: Optional[list[str]]
+    ) -> Optional[list[str]]:
+        if file_sources is None:
+            return None
 
-    class Config:
-        json_schema_extra = {
+        return [normalize_file_path(file_source) for file_source in file_sources]
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "texts": [
                     "This is the first text to be inserted.",
@@ -327,6 +352,7 @@ class InsertTextsRequest(BaseModel):
                 ],
             }
         }
+    )
 
 
 class InsertResponse(BaseModel):
@@ -345,14 +371,15 @@ class InsertResponse(BaseModel):
     workspace_id: str = Field(description="Workspace identifier for this operation")
     track_id: str = Field(description="Tracking ID for monitoring processing status")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "success",
                 "message": "File 'document.pdf' uploaded successfully. Processing will continue in background.",
                 "track_id": "upload_20250729_170612_abc123",
             }
         }
+    )
 
 
 class ClearDocumentsResponse(BaseModel):
@@ -369,13 +396,14 @@ class ClearDocumentsResponse(BaseModel):
     workspace_id: str = Field(description="Workspace identifier for this operation")
     message: str = Field(description="Message describing the operation result")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "success",
                 "message": "All documents cleared successfully. Deleted 15 files.",
             }
         }
+    )
 
 
 class ClearCacheRequest(BaseModel):
@@ -385,8 +413,7 @@ class ClearCacheRequest(BaseModel):
     All cache will be cleared regardless of the request content.
     """
 
-    class Config:
-        json_schema_extra = {"example": {}}
+    model_config = ConfigDict(json_schema_extra={"example": {}})
 
 
 class ClearCacheResponse(BaseModel):
@@ -402,13 +429,14 @@ class ClearCacheResponse(BaseModel):
     )
     message: str = Field(description="Message describing the operation result")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "success",
                 "message": "Successfully cleared cache for modes: ['default', 'naive']",
             }
         }
+    )
 
 
 """Response model for document status
@@ -556,8 +584,8 @@ class DocStatusResponse(BaseModel):
     )
     file_path: str = Field(description="Path to the document file")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "doc_123456",
                 "content_summary": "Research paper on machine learning",
@@ -572,6 +600,7 @@ class DocStatusResponse(BaseModel):
                 "file_path": "research_paper.pdf",
             }
         }
+    )
 
 
 class DocsStatusesResponse(BaseModel):
@@ -586,8 +615,8 @@ class DocsStatusesResponse(BaseModel):
         description="Dictionary mapping document status to lists of document status responses",
     )
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "statuses": {
                     "PENDING": [
@@ -638,6 +667,7 @@ class DocsStatusesResponse(BaseModel):
                 }
             }
         }
+    )
 
 
 class TrackStatusResponse(BaseModel):
@@ -658,8 +688,8 @@ class TrackStatusResponse(BaseModel):
     total_count: int = Field(description="Total number of documents for this track_id")
     status_summary: Dict[str, int] = Field(description="Count of documents by status")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "track_id": "upload_20250729_170612_abc123",
                 "documents": [
@@ -681,6 +711,7 @@ class TrackStatusResponse(BaseModel):
                 "status_summary": {"PROCESSED": 1},
             }
         }
+    )
 
 
 class DocumentsRequest(BaseModel):
@@ -711,8 +742,8 @@ class DocumentsRequest(BaseModel):
         default=None, description="Workspace identifier for this request"
     )
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status_filter": "PROCESSED",
                 "page": 1,
@@ -721,6 +752,7 @@ class DocumentsRequest(BaseModel):
                 "sort_direction": "desc",
             }
         }
+    )
 
 
 class PaginationInfo(BaseModel):
@@ -742,8 +774,8 @@ class PaginationInfo(BaseModel):
     has_next: bool = Field(description="Whether there is a next page")
     has_prev: bool = Field(description="Whether there is a previous page")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "page": 1,
                 "page_size": 50,
@@ -753,6 +785,7 @@ class PaginationInfo(BaseModel):
                 "has_prev": False,
             }
         }
+    )
 
 
 class PaginatedDocsResponse(BaseModel):
@@ -773,8 +806,8 @@ class PaginatedDocsResponse(BaseModel):
         description="Count of documents by status for all documents"
     )
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "documents": [
                     {
@@ -808,6 +841,7 @@ class PaginatedDocsResponse(BaseModel):
                 },
             }
         }
+    )
 
 
 class StatusCountsResponse(BaseModel):
@@ -820,8 +854,8 @@ class StatusCountsResponse(BaseModel):
     workspace_id: str = Field(description="Workspace identifier for this request")
     status_counts: Dict[str, int] = Field(description="Count of documents by status")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status_counts": {
                     "PENDING": 10,
@@ -832,6 +866,7 @@ class StatusCountsResponse(BaseModel):
                 }
             }
         }
+    )
 
 
 class PipelineStatusResponse(BaseModel):
@@ -870,8 +905,7 @@ class PipelineStatusResponse(BaseModel):
         """Process datetime and return as ISO format string with timezone"""
         return format_datetime(value)
 
-    class Config:
-        extra = "allow"  # Allow additional fields from the pipeline status
+    model_config = ConfigDict(extra="allow")
 
 
 class DocumentManager:
@@ -1851,14 +1885,21 @@ async def pipeline_index_texts(
     """
     if not texts:
         return
-    if file_sources is not None:
-        if len(file_sources) != 0 and len(file_sources) != len(texts):
-            [
-                file_sources.append("unknown_source")
-                for _ in range(len(file_sources), len(texts))
-            ]
+
+    normalized_file_sources: list[str] | None = None
+    if file_sources:
+        normalized_file_sources = [
+            normalize_file_path(source) for source in file_sources
+        ]
+        if len(normalized_file_sources) > len(texts):
+            raise ValueError("Number of file sources must not exceed number of texts")
+        if len(normalized_file_sources) < len(texts):
+            normalized_file_sources.extend(
+                [UNKNOWN_FILE_SOURCE] * (len(texts) - len(normalized_file_sources))
+            )
+
     await rag.apipeline_enqueue_documents(
-        input=texts, file_paths=file_sources, track_id=track_id
+        input=texts, file_paths=normalized_file_sources, track_id=track_id
     )
     await rag.apipeline_process_enqueue_documents()
 
@@ -3120,7 +3161,7 @@ def create_document_routes(
                             chunks_count=doc_status.chunks_count,
                             error_msg=doc_status.error_msg,
                             metadata=doc_status.metadata,
-                            file_path=doc_status.file_path,
+                            file_path=normalize_file_path(doc_status.file_path),
                         )
                     )
 
@@ -3499,7 +3540,7 @@ def create_document_routes(
                         chunks_count=doc_status.chunks_count,
                         error_msg=doc_status.error_msg,
                         metadata=doc_status.metadata,
-                        file_path=doc_status.file_path,
+                        file_path=normalize_file_path(doc_status.file_path),
                     )
                 )
 
@@ -3587,7 +3628,7 @@ def create_document_routes(
                         chunks_count=doc.chunks_count,
                         error_msg=doc.error_msg,
                         metadata=doc.metadata,
-                        file_path=doc.file_path,
+                        file_path=normalize_file_path(doc.file_path),
                     )
                 )
 

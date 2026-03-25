@@ -843,6 +843,14 @@ def create_app(args):
 
         if not workspace:
             workspace = None
+        else:
+            sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", workspace)
+            if sanitized != workspace:
+                logger.warning(
+                    f"Workspace header '{workspace}' contains invalid characters. "
+                    f"Sanitized to '{sanitized}'."
+                )
+                workspace = sanitized
 
         return workspace
 

@@ -755,6 +755,23 @@ class DocumentsRequest(BaseModel):
     )
 
 
+class DocumentSearchByNameRequest(BaseModel):
+    """Request model for searching documents by name substring."""
+
+    workspace_id: Optional[str] = Field(
+        default=None, description="Workspace identifier for this request"
+    )
+    keyword: str = Field(
+        ...,
+        min_length=1,
+        description="Substring to search within document name (stored as file_path in doc status).",
+    )
+    page: int = Field(default=1, ge=1, description="Page number (1-based)")
+    page_size: int = Field(
+        default=50, ge=10, le=200, description="Number of results per page (10-200)"
+    )
+
+
 class PaginationInfo(BaseModel):
     """Pagination information
 
@@ -785,6 +802,18 @@ class PaginationInfo(BaseModel):
                 "has_prev": False,
             }
         }
+    )
+
+
+class DocumentSearchByNameResponse(BaseModel):
+    """Response model for searching documents by name substring."""
+
+    workspace_id: str = Field(description="Resolved workspace identifier")
+    keyword: str = Field(description="Searched keyword (trimmed)")
+    total_matches: int = Field(description="Total number of matched documents")
+    pagination: PaginationInfo = Field(description="Pagination info over matches")
+    documents: List[DocStatusResponse] = Field(
+        description="List of matched documents for the requested page"
     )
 
 
@@ -3655,6 +3684,109 @@ def create_document_routes(
 
         except Exception as e:
             logger.error(f"Error getting paginated documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/search_by_name",
+        response_model=DocumentSearchByNameResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Search documents by file name substring within a workspace",
+    )
+    async def search_documents_by_name(
+        request: DocumentSearchByNameRequest,
+        http_request: Request,
+    ) -> DocumentSearchByNameResponse:
+        """
+        Search documents in a workspace where `doc_name` (stored as `file_path` in doc status)
+        contains the given keyword (case-insensitive substring match).
+        """
+        try:
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                http_request, request.workspace_id
+            )
+
+            keyword = (request.keyword or "").strip()
+            keyword_lower = keyword.lower()
+
+            # Scan all documents in workspace using doc_status pagination, then filter in-memory.
+            # NOTE: For large workspaces, this can be expensive.
+            scan_page_size = 200
+            scan_page = 1
+            total_docs = None
+            matched_docs: List[DocStatusResponse] = []
+
+            while True:
+                (docs_with_ids, total_count) = await current_rag.doc_status.get_docs_paginated(
+                    status_filter=None,
+                    page=scan_page,
+                    page_size=scan_page_size,
+                    sort_field="updated_at",
+                    sort_direction="desc",
+                )
+
+                if total_docs is None:
+                    total_docs = total_count
+
+                if not docs_with_ids:
+                    break
+
+                for doc_id, doc in docs_with_ids:
+                    file_path = normalize_file_path(getattr(doc, "file_path", None))
+                    if keyword_lower in (file_path or "").lower():
+                        matched_docs.append(
+                            DocStatusResponse(
+                                id=doc_id,
+                                content_summary=doc.content_summary,
+                                content_length=doc.content_length,
+                                status=doc.status,
+                                created_at=format_datetime(doc.created_at),
+                                updated_at=format_datetime(doc.updated_at),
+                                workspace_id=current_rag.workspace,
+                                track_id=doc.track_id,
+                                chunks_count=doc.chunks_count,
+                                error_msg=doc.error_msg,
+                                metadata=doc.metadata,
+                                file_path=file_path,
+                            )
+                        )
+
+                if total_docs is not None and scan_page * scan_page_size >= total_docs:
+                    break
+
+                scan_page += 1
+
+            total_matches = len(matched_docs)
+
+            # Paginate results over matches
+            start_idx = (request.page - 1) * request.page_size
+            end_idx = start_idx + request.page_size
+            page_docs = matched_docs[start_idx:end_idx]
+
+            total_pages = (
+                (total_matches + request.page_size - 1) // request.page_size
+                if request.page_size > 0
+                else 0
+            )
+            has_next = request.page < total_pages
+            has_prev = request.page > 1
+
+            return DocumentSearchByNameResponse(
+                workspace_id=resolved_workspace_id,
+                keyword=keyword,
+                total_matches=total_matches,
+                pagination=PaginationInfo(
+                    page=request.page,
+                    page_size=request.page_size,
+                    total_count=total_matches,
+                    total_pages=total_pages,
+                    has_next=has_next,
+                    has_prev=has_prev,
+                ),
+                documents=page_docs,
+            )
+        except Exception as e:
+            logger.error(f"Error searching documents by name: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

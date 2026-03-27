@@ -1210,7 +1210,9 @@ def create_app(args):
 
         # Step 3: Create optimized embedding function (calls underlying function directly)
         # Note: When model is None, each binding will use its own default model
-        async def optimized_embedding_function(texts, embedding_dim=None):
+        async def optimized_embedding_function(
+            texts, embedding_dim=None, max_token_size=None
+        ):
             try:
                 if binding == "lollms":
                     from lightrag.llm.lollms import lollms_embed
@@ -1248,6 +1250,7 @@ def create_app(args):
                         "host": host,
                         "api_key": api_key,
                         "options": ollama_options,
+                        "max_token_size": max_token_size,
                     }
                     if model:
                         kwargs["embed_model"] = model
@@ -1265,6 +1268,7 @@ def create_app(args):
                         "texts": texts,
                         "api_key": api_key,
                         "embedding_dim": embedding_dim,
+                        "max_token_size": max_token_size,
                     }
                     if model:
                         kwargs["model"] = model
@@ -1296,6 +1300,7 @@ def create_app(args):
                         "embedding_dim": embedding_dim,
                         "base_url": host,
                         "api_key": api_key,
+                        "max_token_size": max_token_size,
                     }
                     if model:
                         kwargs["model"] = model
@@ -1326,6 +1331,7 @@ def create_app(args):
                         "task_type": gemini_options.get(
                             "task_type", "RETRIEVAL_DOCUMENT"
                         ),
+                        "max_token_size": max_token_size,
                     }
                     if model:
                         kwargs["model"] = model
@@ -1344,6 +1350,7 @@ def create_app(args):
                         "base_url": host,
                         "api_key": api_key,
                         "embedding_dim": embedding_dim,
+                        "max_token_size": max_token_size,
                     }
                     if model:
                         kwargs["model"] = model
@@ -1369,9 +1376,20 @@ def create_app(args):
         return embedding_func_instance
 
     llm_timeout = get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
+
     embedding_timeout = get_env_value(
         "EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT, int
     )
+    embedding_http_timeout_raw = os.getenv("EMBEDDING_HTTP_TIMEOUT")
+    if embedding_http_timeout_raw is not None and str(embedding_http_timeout_raw).strip():
+        try:
+            embedding_http_timeout = int(float(embedding_http_timeout_raw))
+            if embedding_http_timeout > embedding_timeout:
+                embedding_timeout = embedding_http_timeout
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid EMBEDDING_HTTP_TIMEOUT='{embedding_http_timeout_raw}', ignoring it for embedding timeout resolution"
+            )
 
     async def bedrock_model_complete(
         prompt,

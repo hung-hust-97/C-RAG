@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from typing import Any, final, Optional, Dict
+from typing import Any, final, Optional, Dict, Callable
 from dataclasses import dataclass, fields
 import numpy as np
 from lightrag.utils import logger, compute_mdhash_id
@@ -376,6 +376,30 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         normalized_name = str(db_name).strip()
         return normalized_name or None
 
+    def _sanitize_workspace_for_collection(self, workspace: str) -> str:
+        """Sanitize workspace name for use as Milvus collection name prefix.
+        
+        Replaces special characters with underscores to ensure the name is valid
+        for Milvus collection naming conventions. Adds "ws_" prefix if the 
+        sanitized name starts with a digit (Milvus requires first char to be 
+        letter or underscore). Returns "base" if workspace is empty.
+        """
+        workspace = workspace.strip()
+        if not workspace:
+            return "base"
+        
+        # Replace non-alphanumeric characters (except underscore) with underscore
+        sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", workspace).strip("_")
+        if not sanitized:
+            # If sanitization results in empty string, use "base"
+            return "base"
+        
+        # Ensure first character is letter or underscore (Milvus requirement)
+        if sanitized[0].isdigit():
+            sanitized = f"ws_{sanitized}"
+        
+        return sanitized
+
     def _create_milvus_client(self) -> MilvusClient:
         """Create a Milvus client and ensure the configured database exists."""
         client = MilvusClient(
@@ -404,6 +428,80 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return client
 
         return MilvusClient(**self._get_milvus_connection_kwargs(include_db_name=True))
+
+    @staticmethod
+    def _is_closed_channel_error(error: Exception) -> bool:
+        """Return True if the error indicates the Milvus gRPC channel is closed."""
+        message = str(error).lower()
+        return (
+            "closed channel" in message
+            or "cannot invoke rpc on closed channel" in message
+        )
+
+    def _reconnect_client(self, reason: str = "closed channel") -> None:
+        """Recreate Milvus client after a recoverable connection failure."""
+        logger.warning(
+            f"[{self.workspace}] Reconnecting Milvus client for {self.namespace} (reason: {reason})"
+        )
+
+        if self._client is not None:
+            try:
+                close = getattr(self._client, "close", None)
+                if callable(close):
+                    close()
+            except Exception as close_error:
+                logger.debug(
+                    f"[{self.workspace}] Error while closing stale Milvus client: {close_error}"
+                )
+
+        self._client = self._create_milvus_client()
+        self._collection_loaded = False
+
+    def _milvus_call(
+        self,
+        operation: str,
+        action: Callable[[MilvusClient], Any],
+        max_retries: int = 3,
+    ) -> Any:
+        """Execute a Milvus operation with retry on closed-channel failures."""
+        import time
+
+        if self._client is None:
+            self._client = self._create_milvus_client()
+
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_retries):
+            try:
+                return action(self._client)
+            except Exception as error:
+                last_error = error
+
+                if not self._is_closed_channel_error(error):
+                    raise
+
+                if attempt == max_retries - 1:
+                    logger.error(
+                        f"[{self.workspace}] {operation} failed after {max_retries} attempts: {error}"
+                    )
+                    raise
+
+                backoff_seconds = 0.1 * (2**attempt)
+                logger.warning(
+                    f"[{self.workspace}] Closed channel during {operation} "
+                    f"(attempt {attempt + 1}/{max_retries}). "
+                    f"Reconnecting in {backoff_seconds:.1f}s"
+                )
+
+                time.sleep(backoff_seconds)
+                self._reconnect_client(
+                    f"{operation} closed channel (attempt {attempt + 1})"
+                )
+
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError(f"[{self.workspace}] {operation} failed unexpectedly")
 
     def _create_schema_for_namespace(self) -> CollectionSchema:
         """Create schema based on the current instance's namespace"""

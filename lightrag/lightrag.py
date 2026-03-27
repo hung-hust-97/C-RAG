@@ -121,6 +121,31 @@ from dotenv import load_dotenv
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
 
+
+def _resolve_default_embedding_timeout() -> int:
+    """Resolve embedding timeout from env, honoring both logical and HTTP timeout knobs.
+
+    Uses the larger valid value between EMBEDDING_TIMEOUT and EMBEDDING_HTTP_TIMEOUT
+    to reduce mismatches where network timeout is raised but worker timeout remains low.
+    """
+    candidates: list[int] = []
+    for env_key in ("EMBEDDING_TIMEOUT", "EMBEDDING_HTTP_TIMEOUT"):
+        raw = os.getenv(env_key)
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            value = int(float(raw))
+            if value > 0:
+                candidates.append(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid {env_key}='{raw}', ignoring it when resolving embedding timeout"
+            )
+
+    if candidates:
+        return max(candidates)
+    return DEFAULT_EMBEDDING_TIMEOUT
+
 # TODO: TO REMOVE @Yannick
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
@@ -334,7 +359,7 @@ class LightRAG:
     """
 
     default_embedding_timeout: int = field(
-        default=int(os.getenv("EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT))
+        default_factory=_resolve_default_embedding_timeout
     )
 
     # LLM Configuration

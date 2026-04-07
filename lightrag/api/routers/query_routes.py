@@ -12,22 +12,30 @@ from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
 
-async def _classify_query_intent(query: str, current_rag) -> bool:
-    """Classifies if a query is a general conversation/greeting that doesn't need RAG."""
-    system_prompt = "You are a strict query intent classifier."
-    prompt = f"""Given the user's message, determine if it is a general greeting, a pleasantry, or a question about your capabilities (e.g., 'Hello', 'Xin chào', 'What can you do?', 'Bạn làm được gì?').
-If it IS a greeting or capability question that doesn't require searching a knowledge base, reply EXACTLY with the word 'BYPASS'.
-If it is a question that requires searching for specific facts, documents, or external knowledge, reply EXACTLY with the word 'SEARCH'.
+async def _classify_query_intent(query: str, current_rag) -> str:
+    """Classifies the query into 'bypass', 'global', or 'search'."""
+    system_prompt = "You are an intelligent query router for a Retrieval-Augmented Generation (RAG) system."
+    prompt = f"""Analyze the user's query and determine the most appropriate processing mode from the following options:
 
-User message: "{query}"
-Your classification (reply with either 'BYPASS' or 'SEARCH' only):"""
+1. 'BYPASS': Use this if the query is a general conversation, greeting, pleasantry, or a question about your capabilities (e.g., 'Hello', 'Xin chào', 'What can you do?', 'Bạn làm được gì?'). These don't require searching the knowledge base.
+2. 'GLOBAL': Use this if the query asks for a high-level summary, overview, or broad conceptual understanding of the documents/knowledge base as a whole, without focusing on specific entities (e.g., 'Tóm tắt các tài liệu', 'What are the main themes of the documents?', 'Tổng quan về dữ liệu', 'Danh sách các văn bản').
+3. 'SEARCH': Use this for all other queries that ask for specific facts, details, entities, or relationships that require searching the knowledge base (e.g., 'Who is John Doe?', 'Khi nào dự án A bắt đầu?', 'So sánh X và Y').
+
+User query: "{query}"
+
+Reply STRICTLY with exactly ONE word: 'BYPASS', 'GLOBAL', or 'SEARCH'."""
     try:
         response = await current_rag.llm_model_func(prompt, system_prompt=system_prompt)
         content = response.strip().upper() if isinstance(response, str) else ""
-        return "BYPASS" in content
+        if "BYPASS" in content:
+            return "bypass"
+        elif "GLOBAL" in content:
+            return "global"
+        else:
+            return "search"
     except Exception as e:
         logger.warning(f"Intent classification failed, defaulting to SEARCH mode: {e}")
-        return False
+        return "search"
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -455,10 +463,13 @@ def create_query_routes(
             param.stream = False
 
             if request.mode != "bypass":
-                is_conversational = await _classify_query_intent(request.query, current_rag)
-                if is_conversational:
+                intent_mode = await _classify_query_intent(request.query, current_rag)
+                if intent_mode == "bypass":
                     request.mode = "bypass"
                     param.mode = "bypass"
+                elif intent_mode == "global":
+                    request.mode = "global"
+                    param.mode = "global"
 
             # Unified approach: always use aquery_llm for both cases
             result = await current_rag.aquery_llm(request.query, param=param)
@@ -728,10 +739,13 @@ def create_query_routes(
             from fastapi.responses import StreamingResponse
 
             if request.mode != "bypass":
-                is_conversational = await _classify_query_intent(request.query, current_rag)
-                if is_conversational:
+                intent_mode = await _classify_query_intent(request.query, current_rag)
+                if intent_mode == "bypass":
                     request.mode = "bypass"
                     param.mode = "bypass"
+                elif intent_mode == "global":
+                    request.mode = "global"
+                    param.mode = "global"
 
             # Unified approach: always use aquery_llm for all cases
             result = await current_rag.aquery_llm(request.query, param=param)

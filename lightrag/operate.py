@@ -3380,9 +3380,9 @@ async def get_keywords_from_query(
     if query_param.hl_keywords or query_param.ll_keywords:
         return query_param.hl_keywords, query_param.ll_keywords
 
-    # Extract keywords using extract_keywords_only function which already supports conversation history
+    # Extract keywords using extract_keywords_only function with conversation history support
     hl_keywords, ll_keywords = await extract_keywords_only(
-        query, query_param, global_config, hashing_kv
+        query, query_param, global_config, hashing_kv, query_param.conversation_history
     )
     return hl_keywords, ll_keywords
 
@@ -3392,6 +3392,7 @@ async def extract_keywords_only(
     param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Extract high-level and low-level keywords from the given 'text' using the LLM.
@@ -3412,10 +3413,21 @@ async def extract_keywords_only(
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
 
     # 2. Handle cache if needed - add cache type for keywords
+    history_str = ""
+    if conversation_history:
+        # Use last 5 turns for context to avoid token bloat
+        history_str = "\n".join(
+            [
+                f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}"
+                for m in conversation_history[-5:]
+            ]
+        )
+
     args_hash = compute_args_hash(
         param.mode,
         text,
         language,
+        history_str,
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, text, param.mode, cache_type="keywords"
@@ -3434,10 +3446,10 @@ async def extract_keywords_only(
 
     # 3. Build the keyword-extraction prompt using PromptManager
     kw_prompt = prompt_manager.get_prompt(
-        "keywords_extraction",
-        auto_detect_text=text
+        "keywords_extraction", auto_detect_text=text
     ).format(
         query=text,
+        history=history_str,
         examples=examples,
         language=language,
     )
@@ -3456,7 +3468,11 @@ async def extract_keywords_only(
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    result = await use_model_func(kw_prompt, keyword_extraction=True)
+    result = await use_model_func(
+        kw_prompt,
+        keyword_extraction=True,
+        history_messages=conversation_history,
+    )
 
     # 5. Parse out JSON from the LLM response
     result = remove_think_tags(result)
@@ -5000,7 +5016,21 @@ async def naive_query(
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
-    chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
+    # Use history-aware keywords for retrieval if conversation history is present
+    search_query = query
+    if query_param.conversation_history:
+        hl_keywords, ll_keywords = await extract_keywords_only(
+            query,
+            query_param,
+            global_config,
+            hashing_kv,
+            query_param.conversation_history,
+        )
+        if hl_keywords or ll_keywords:
+            search_query = f"{' '.join(hl_keywords)} {' '.join(ll_keywords)}".strip()
+            logger.debug(f"[naive_query] Expanded search query: {search_query}")
+
+    chunks = await _get_vector_context(search_query, chunks_vdb, query_param, None)
 
     if chunks is None or len(chunks) == 0:
         logger.info(

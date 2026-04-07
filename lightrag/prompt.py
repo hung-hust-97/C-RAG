@@ -707,21 +707,25 @@ PROMPTS["keywords_extraction"] = """---Role---
 You are an expert keyword extractor, specializing in analyzing user queries for a Retrieval-Augmented Generation (RAG) system. Your purpose is to identify both high-level and low-level keywords in the user's query that will be used for effective document retrieval.
 
 ---Goal---
-Given a user query, your task is to extract two distinct types of keywords:
+Given a user query and its conversation history, your task is to extract two distinct types of keywords:
 1. **high_level_keywords**: for overarching concepts or themes, capturing user's core intent, the subject area, or the type of question being asked.
 2. **low_level_keywords**: for specific entities or details, identifying the specific entities, proper nouns, technical jargon, product names, or concrete items.
 
 ---Instructions & Constraints---
 1. **Output Format**: Your output MUST be a valid JSON object and nothing else. Do not include any explanatory text, markdown code fences (like ```json), or any other text before or after the JSON. It will be parsed directly by a JSON parser.
-2. **Source of Truth**: All keywords must be explicitly derived from the user query, with both high-level and low-level keyword categories are required to contain content.
-3. **Concise & Meaningful**: Keywords should be concise words or meaningful phrases. Prioritize multi-word phrases when they represent a single concept. For example, from "latest financial report of Apple Inc.", you should extract "latest financial report" and "Apple Inc." rather than "latest", "financial", "report", and "Apple".
-4. **Handle Edge Cases**: For queries that are too simple, vague, or nonsensical (e.g., "hello", "ok", "asdfghjkl"), you must return a JSON object with empty lists for both keyword types.
-5. **Language**: All extracted keywords MUST be in {language}. Proper nouns (e.g., personal names, place names, organization names) should be kept in their original language.
+2. **Context Awareness**: Use the provided `Conversation History` to resolve any pronouns (e.g., "it", "they", "he", "she") or implicit references in the `User Query`. The extracted keywords should reflect the disambiguated intent.
+3. **Source of Truth**: All keywords must be explicitly derived from the user query (considering history), with both high-level and low-level keyword categories are required to contain content.
+4. **Concise & Meaningful**: Keywords should be concise words or meaningful phrases. Prioritize multi-word phrases when they represent a single concept.
+5. **Handle Edge Cases**: For queries that are too simple, vague, or nonsensical (e.g., "hello", "ok", "asdfghjkl"), you must return a JSON object with empty lists for both keyword types.
+6. **Language**: All extracted keywords MUST be in {language}. Proper nouns (e.g., personal names, place names, organization names) should be kept in their original language.
 
 ---Examples---
 {examples}
 
 ---Real Data---
+Conversation History:
+{history}
+
 User Query: {query}
 
 ---Output---
@@ -731,22 +735,26 @@ PROMPTS["keywords_extraction_vi"] = """---Vai trò---
 Bạn là một chuyên gia trích xuất từ khóa, chuyên về phân tích các truy vấn của người dùng cho hệ thống Tạo sinh Tăng cường Truy xuất (RAG). Mục đích của bạn là xác định cả từ khóa cấp cao và cấp thấp trong truy vấn của người dùng sẽ được sử dụng để truy xuất tài liệu hiệu quả.
 
 ---Mục tiêu---
-Với một truy vấn của người dùng, nhiệm vụ của bạn là trích xuất hai loại từ khóa riêng biệt:
+Với một truy vấn của người dùng và lịch sử cuộc trò chuyện kèm theo, nhiệm vụ của bạn là trích xuất hai loại từ khóa riêng biệt:
 1. **high_level_keywords**: cho các khái niệm hoặc chủ đề tổng thể, nắm bắt ý định cốt lõi của người dùng, lĩnh vực chủ đề hoặc loại câu hỏi được hỏi.
 2. **low_level_keywords**: cho các thực thể hoặc chi tiết cụ thể, xác định các thực thể cụ thể, danh từ riêng, thuật ngữ kỹ thuật, tên sản phẩm hoặc các mục cụ thể.
 
 ---Hướng dẫn & Ràng buộc---
 1. **Định dạng Đầu ra**: Đầu ra của bạn PHẢI là một đối tượng JSON hợp lệ và không có gì khác. Không bao gồm bất kỳ văn bản giải thích, hàng rào mã markdown (như ```json), hoặc bất kỳ văn bản nào khác trước hoặc sau JSON. Nó sẽ được phân tích trực tiếp bởi một trình phân tích JSON.
-2. **Nguồn Sự thật**: Tất cả các từ khóa phải được rút ra rõ ràng từ truy vấn của người dùng, với cả hai danh mục từ khóa cấp cao và cấp thấp đều được yêu cầu chứa nội dung.
-3. **Ngắn gọn & Có ý nghĩa**: Từ khóa nên là các từ ngắn gọn hoặc cụm từ có ý nghĩa. Ưu tiên các cụm từ nhiều từ khi chúng đại diện cho một khái niệm duy nhất. Ví dụ, từ "báo cáo tài chính mới nhất của Apple Inc.", bạn nên trích xuất "báo cáo tài chính mới nhất" và "Apple Inc." thay vì "mới nhất", "tài chính", "báo cáo" và "Apple".
-4. **Xử lý Trường hợp Đặc biệt**: Đối với các truy vấn quá đơn giản, mơ hồ hoặc vô nghĩa (ví dụ: "xin chào", "ok", "asdfghjkl"), bạn phải trả về một đối tượng JSON với danh sách trống cho cả hai loại từ khóa.
-5. **Ngôn ngữ**: Tất cả các từ khóa được trích xuất PHẢI bằng {language}. Danh từ riêng (ví dụ: tên người, tên địa điểm, tên tổ chức) nên được giữ nguyên ngôn ngữ gốc.
-6. **Trích xuất Từ viết tắt**: Khi truy vấn chứa cả thuật ngữ đầy đủ và từ viết tắt trong ngoặc đơn (ví dụ: "Hệ thống quản lý tri thức (KMS)"), hãy trích xuất CẢ HAI như các từ khóa riêng biệt để cải thiện độ chính xác truy xuất.
+2. **Nhận thức Ngữ cảnh**: Sử dụng `Lịch sử Cuộc trò chuyện` được cung cấp để giải quyết bất kỳ đại từ nào (ví dụ: "nó", "họ", "anh ấy", "cô ấy") hoặc các tham chiếu ngầm định trong `Truy vấn Người dùng`. Các từ khóa được trích xuất phải phản ánh ý định thực sự sau khi đã giải quyết ngữ cảnh.
+3. **Nguồn Sự thật**: Tất cả các từ khóa phải được rút ra rõ ràng từ truy vấn của người dùng (có cân nhắc lịch sử), với cả hai danh mục từ khóa cấp cao và cấp thấp đều được yêu cầu chứa nội dung.
+4. **Ngắn gọn & Có ý nghĩa**: Từ khóa nên là các từ ngắn gọn hoặc cụm từ có ý nghĩa. Ưu tiên các cụm từ nhiều từ khi chúng đại diện cho một khái niệm duy nhất.
+5. **Xử lý Trường hợp Đặc biệt**: Đối với các truy vấn quá đơn giản, mơ hồ hoặc vô nghĩa (ví dụ: "xin chào", "ok", "asdfghjkl"), bạn phải trả về một đối tượng JSON với danh sách trống cho cả hai loại từ khóa.
+6. **Ngôn ngữ**: Tất cả các từ khóa được trích xuất PHẢI bằng {language}. Danh từ riêng (ví dụ: tên người, tên địa điểm, tên tổ chức) nên được giữ nguyên ngôn ngữ gốc.
+7. **Trích xuất Từ viết tắt**: Khi truy vấn chứa cả thuật ngữ đầy đủ và từ viết tắt trong ngoặc đơn (ví dụ: "Hệ thống quản lý tri thức (KMS)"), hãy trích xuất CẢ HAI như các từ khóa riêng biệt.
 
 ---Ví dụ---
 {examples}
 
 ---Dữ liệu Thực---
+Lịch sử Cuộc trò chuyện:
+{history}
+
 Truy vấn Người dùng: {query}
 
 ---Đầu ra---

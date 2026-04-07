@@ -93,3 +93,4 @@ test/
 TASK_*.md
 *WALKTHROUGH*.md
 *IMPLEMENTATION*.md
+test*

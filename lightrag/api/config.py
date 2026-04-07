@@ -75,6 +75,50 @@ def get_default_host(binding_type: str) -> str:
     )  # fallback to ollama if unknown
 
 
+def _validate_ocr_config(args: argparse.Namespace) -> None:
+    """Validate OCR configuration parameters
+
+    Args:
+        args: Parsed arguments containing OCR configuration
+
+    Validates:
+        - ocr_engine is one of: auto, deepseek, tesseract, none
+        - deepseek_api_url format (http:// or https://)
+        - deepseek_ocr_timeout is positive integer
+
+    Logs warnings for invalid configurations but does not raise exceptions
+    to maintain backward compatibility.
+    """
+    # Validate OCR engine
+    valid_engines = ["auto", "deepseek", "tesseract", "none"]
+    if args.deepseek_ocr_engine not in valid_engines:
+        logging.warning(
+            f"Invalid DEEPSEEK_OCR_ENGINE value '{args.deepseek_ocr_engine}'. "
+            f"Must be one of: {', '.join(valid_engines)}. "
+            f"Defaulting to 'auto'."
+        )
+        args.deepseek_ocr_engine = "auto"
+
+    # Validate API URL format
+    if args.deepseek_api_url:
+        if not (args.deepseek_api_url.startswith("http://") or
+                args.deepseek_api_url.startswith("https://")):
+            logging.warning(
+                f"Invalid DEEPSEEK_API_URL format '{args.deepseek_api_url}'. "
+                f"URL must start with 'http://' or 'https://'. "
+                f"OCR functionality may not work correctly."
+            )
+
+    # Validate timeout is positive integer
+    if args.deepseek_ocr_timeout <= 0:
+        logging.warning(
+            f"Invalid DEEPSEEK_OCR_TIMEOUT value '{args.deepseek_ocr_timeout}'. "
+            f"Timeout must be a positive integer. "
+            f"Defaulting to 300 seconds."
+        )
+        args.deepseek_ocr_timeout = 300
+
+
 def parse_args() -> argparse.Namespace:
     """
     Parse command line arguments with environment variable fallback
@@ -458,6 +502,20 @@ def parse_args() -> argparse.Namespace:
     args.max_upload_size = get_env_value(
         "MAX_UPLOAD_SIZE", 104857600, int, special_none=True
     )
+
+    # OCR configuration
+    args.deepseek_ocr_engine = get_env_value("DEEPSEEK_OCR_ENGINE", "auto")
+    args.deepseek_api_url = get_env_value(
+        "DEEPSEEK_API_URL", "http://10.1.6.52:8006/ocr/pdf"
+    )
+    args.deepseek_ocr_timeout = get_env_value("DEEPSEEK_OCR_TIMEOUT", 300, int)
+    args.deepseek_ocr_fallback = get_env_value("DEEPSEEK_OCR_FALLBACK", True, bool)
+    args.ocr_preserve_markdown_structure = get_env_value(
+        "OCR_PRESERVE_MARKDOWN_STRUCTURE", True, bool
+    )
+
+    # Validate OCR configuration
+    _validate_ocr_config(args)
 
     ollama_server_infos.LIGHTRAG_NAME = args.simulated_model_name
     ollama_server_infos.LIGHTRAG_TAG = args.simulated_model_tag

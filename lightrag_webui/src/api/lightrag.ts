@@ -860,6 +860,27 @@ export const uploadDocument = async (
   return response.data
 }
 
+export const previewDocument = async (filePath: string): Promise<void> => {
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get('/documents/preview', {
+    params: {
+      workspace_id: workspaceId,
+      file_path: filePath
+    },
+    responseType: 'blob'
+  })
+
+  const blobUrl = window.URL.createObjectURL(response.data)
+  const previewWindow = window.open(blobUrl, '_blank', 'noopener,noreferrer')
+  if (!previewWindow) {
+    window.URL.revokeObjectURL(blobUrl)
+    throw new Error('Popup blocked. Please allow popups to preview document.')
+  }
+
+  // Revoke after delay to keep preview stable while tab loads.
+  window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 60_000)
+}
+
 export const batchUploadDocuments = async (
   files: File[],
   onUploadProgress?: (fileName: string, percentCompleted: number) => void

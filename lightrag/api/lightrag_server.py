@@ -94,6 +94,8 @@ class LLMConfigCache:
 
         # Initialize configurations based on binding conditions
         self.openai_llm_options = None
+        self.openai_llm_options_query = None
+        self.openai_llm_options_extract = None
         self.gemini_llm_options = None
         self.gemini_embedding_options = None
         self.ollama_llm_options = None
@@ -105,6 +107,58 @@ class LLMConfigCache:
 
             self.openai_llm_options = OpenAILLMOptions.options_dict(args)
             logger.info(f"OpenAI LLM Options: {self.openai_llm_options}")
+            self.openai_llm_options_query = dict(self.openai_llm_options)
+            self.openai_llm_options_extract = dict(self.openai_llm_options)
+
+            # Allow independent output limits for query-answering and KG extraction.
+            query_max_tokens = os.getenv("OPENAI_LLM_MAX_TOKENS_QUERY")
+            if query_max_tokens and query_max_tokens.strip():
+                self.openai_llm_options_query["max_tokens"] = int(query_max_tokens)
+
+            query_max_completion_tokens = os.getenv(
+                "OPENAI_LLM_MAX_COMPLETION_TOKENS_QUERY"
+            )
+            if query_max_completion_tokens and query_max_completion_tokens.strip():
+                self.openai_llm_options_query["max_completion_tokens"] = int(
+                    query_max_completion_tokens
+                )
+
+            extract_max_tokens = os.getenv("OPENAI_LLM_MAX_TOKENS_EXTRACT")
+            if extract_max_tokens and extract_max_tokens.strip():
+                self.openai_llm_options_extract["max_tokens"] = int(extract_max_tokens)
+
+            extract_max_completion_tokens = os.getenv(
+                "OPENAI_LLM_MAX_COMPLETION_TOKENS_EXTRACT"
+            )
+            if extract_max_completion_tokens and extract_max_completion_tokens.strip():
+                self.openai_llm_options_extract["max_completion_tokens"] = int(
+                    extract_max_completion_tokens
+                )
+
+            if (
+                self.openai_llm_options_query != self.openai_llm_options
+                or self.openai_llm_options_extract != self.openai_llm_options
+            ):
+                logger.info(
+                    "OpenAI LLM split options enabled: "
+                    f"query={self.openai_llm_options_query}, "
+                    f"extract={self.openai_llm_options_extract}"
+                )
+
+    def get_openai_llm_options(self, cache_type: str | None) -> dict | None:
+        """Resolve OpenAI options by task type.
+
+        cache_type comes from downstream LLM calls (e.g. query, extract, summary, keywords).
+        """
+        if self.openai_llm_options is None:
+            return None
+
+        kind = (cache_type or "query").lower()
+        if kind in {"extract", "summary"} and self.openai_llm_options_extract is not None:
+            return dict(self.openai_llm_options_extract)
+        if self.openai_llm_options_query is not None:
+            return dict(self.openai_llm_options_query)
+        return dict(self.openai_llm_options)
 
         if args.llm_binding == "gemini":
             from lightrag.llm.binding_options import GeminiLLMOptions
@@ -981,6 +1035,7 @@ def create_app(args):
             from lightrag.llm.openai import openai_complete_if_cache
 
             keyword_extraction = kwargs.pop("keyword_extraction", None)
+            request_cache_type = kwargs.pop("cache_type", "query")
             if keyword_extraction:
                 kwargs["response_format"] = GPTKeywordExtractionFormat
             if history_messages is None:
@@ -988,8 +1043,9 @@ def create_app(args):
 
             # Use pre-processed configuration to avoid repeated parsing
             kwargs["timeout"] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
+            openai_options = config_cache.get_openai_llm_options(request_cache_type)
+            if openai_options:
+                kwargs.update(openai_options)
 
             return await openai_complete_if_cache(
                 args.llm_model,
@@ -1018,6 +1074,7 @@ def create_app(args):
             from lightrag.llm.azure_openai import azure_openai_complete_if_cache
 
             keyword_extraction = kwargs.pop("keyword_extraction", None)
+            request_cache_type = kwargs.pop("cache_type", "query")
             if keyword_extraction:
                 kwargs["response_format"] = GPTKeywordExtractionFormat
             if history_messages is None:
@@ -1025,8 +1082,9 @@ def create_app(args):
 
             # Use pre-processed configuration to avoid repeated parsing
             kwargs["timeout"] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
+            openai_options = config_cache.get_openai_llm_options(request_cache_type)
+            if openai_options:
+                kwargs.update(openai_options)
 
             return await azure_openai_complete_if_cache(
                 args.llm_model,

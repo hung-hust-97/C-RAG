@@ -81,3 +81,15 @@ memory-bank
 
 # Claude Code
 CLAUDE.md
+
+# Kiro
+.kiro
+.kiro/
+
+# Test
+test/
+
+# Agent generated files
+TASK_*.md
+*WALKTHROUGH*.md
+*IMPLEMENTATION*.md

@@ -25,6 +25,7 @@ from typing import (
     Union,
 )
 from lightrag.prompt import PROMPTS
+from lightrag.prompt_manager import PromptManager
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,

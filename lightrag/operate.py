@@ -50,6 +50,8 @@ from lightrag.base import (
     QueryContextResult,
 )
 from lightrag.prompt import PROMPTS
+from lightrag.prompt_manager import PromptManager
+from lightrag.language_detector import SupportedLanguage
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -73,6 +75,26 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
+
+
+def _detect_query_language(query: str) -> str:
+    """Best-effort language detection for query response locking."""
+    lower = query.lower()
+    # Vietnamese diacritics and common Vietnamese-only letters.
+    if any(ch in lower for ch in "ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ"):
+        return "Vietnamese"
+    # Fallback default for Latin-script queries.
+    return "English"
+
+
+def _build_language_lock_instruction(query: str) -> str:
+    """Build strict language lock instruction from current user query."""
+    lang = _detect_query_language(query)
+    return (
+        "\n\nLanguage lock (highest priority): "
+        f"Respond entirely in {lang}, matching the current user query language. "
+        "Do not switch to another language because of source documents or prior turns."
+    )
 
 
 def _truncate_entity_identifier(
@@ -320,7 +342,20 @@ async def _summarize_descriptions(
 
     summary_length_recommended = global_config["summary_length_recommended"]
 
-    prompt_template = PROMPTS["summarize_entity_descriptions"]
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # Determine language for prompts based on language setting
+    prompt_language = (
+        SupportedLanguage.VIETNAMESE if language == "Vietnamese" 
+        else SupportedLanguage.ENGLISH
+    )
+    
+    # Get prompt template using PromptManager
+    prompt_template = prompt_manager.get_prompt(
+        "summarize_entity_descriptions",
+        language=prompt_language
+    )
 
     # Convert descriptions to JSONL format and apply token-based truncation
     tokenizer = global_config["tokenizer"]
@@ -2836,7 +2871,19 @@ async def extract_entities(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
 
-    examples = "\n".join(PROMPTS["entity_extraction_examples"])
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # Determine language for prompts based on language setting
+    prompt_language = (
+        SupportedLanguage.VIETNAMESE if language == "Vietnamese" 
+        else SupportedLanguage.ENGLISH
+    )
+    
+    # Get examples using PromptManager
+    examples_key = "entity_extraction_examples"
+    examples_prompt = prompt_manager.get_prompt(examples_key, language=prompt_language)
+    examples = "\n".join(examples_prompt) if isinstance(examples_prompt, list) else examples_prompt
 
     example_context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
@@ -2878,16 +2925,19 @@ async def extract_entities(
 
         # Get initial extraction
         # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_system_prompt"
-        ].format(**context_base)
+        entity_extraction_system_prompt = prompt_manager.get_prompt(
+            "entity_extraction_system_prompt",
+            language=prompt_language
+        ).format(**context_base)
         # Format user prompts with input_text for each chunk
-        entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
-            **{**context_base, "input_text": content}
-        )
-        entity_continue_extraction_user_prompt = PROMPTS[
-            "entity_continue_extraction_user_prompt"
-        ].format(**{**context_base, "input_text": content})
+        entity_extraction_user_prompt = prompt_manager.get_prompt(
+            "entity_extraction_user_prompt",
+            language=prompt_language
+        ).format(**{**context_base, "input_text": content})
+        entity_continue_extraction_user_prompt = prompt_manager.get_prompt(
+            "entity_continue_extraction_user_prompt",
+            language=prompt_language
+        ).format(**{**context_base, "input_text": content})
 
         final_result, timestamp = await use_llm_func_with_cache(
             entity_extraction_user_prompt,
@@ -3178,15 +3228,27 @@ async def kg_query(
             content=context_result.context, raw_data=context_result.raw_data
         )
 
-    user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
+    language_lock = _build_language_lock_instruction(query)
+    user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else ""
+    user_prompt = f"{user_prompt}{language_lock}" if user_prompt else language_lock
     response_type = (
         query_param.response_type
         if query_param.response_type
         else "Multiple Paragraphs"
     )
 
-    # Build system prompt
-    sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # Auto-detect language from query or use system prompt
+    if system_prompt:
+        sys_prompt_temp = system_prompt
+    else:
+        sys_prompt_temp = prompt_manager.get_prompt(
+            "rag_response",
+            auto_detect_text=query
+        )
+    
     sys_prompt = sys_prompt_temp.format(
         response_type=response_type,
         user_prompt=user_prompt,
@@ -3220,6 +3282,7 @@ async def kg_query(
         ll_keywords_str,
         query_param.user_prompt or "",
         query_param.enable_rerank,
+        "lang_lock_v1",
     )
 
     cached_result = await handle_cache(
@@ -3239,6 +3302,7 @@ async def kg_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            cache_type="query",
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
@@ -3335,8 +3399,15 @@ async def extract_keywords_only(
     It ONLY extracts keywords (hl_keywords, ll_keywords).
     """
 
-    # 1. Build the examples
-    examples = "\n".join(PROMPTS["keywords_extraction_examples"])
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # 1. Build the examples - auto-detect language from query text
+    examples_prompt = prompt_manager.get_prompt(
+        "keywords_extraction_examples",
+        auto_detect_text=text
+    )
+    examples = "\n".join(examples_prompt) if isinstance(examples_prompt, list) else examples_prompt
 
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
 
@@ -3361,8 +3432,11 @@ async def extract_keywords_only(
                 "Invalid cache format for keywords, proceeding with extraction"
             )
 
-    # 3. Build the keyword-extraction prompt
-    kw_prompt = PROMPTS["keywords_extraction"].format(
+    # 3. Build the keyword-extraction prompt using PromptManager
+    kw_prompt = prompt_manager.get_prompt(
+        "keywords_extraction",
+        auto_detect_text=text
+    ).format(
         query=text,
         examples=examples,
         language=language,
@@ -4010,12 +4084,24 @@ async def _build_context_str(
         global_config.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
     )
 
-    # Get the system prompt template from PROMPTS or global_config
-    sys_prompt_template = global_config.get(
-        "system_prompt_template", PROMPTS["rag_response"]
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # Get the system prompt template from global_config or use PromptManager with auto-detection
+    if "system_prompt_template" in global_config:
+        sys_prompt_template = global_config["system_prompt_template"]
+    else:
+        sys_prompt_template = prompt_manager.get_prompt(
+            "rag_response",
+            auto_detect_text=query
+        )
+    
+    # Get kg_query_context template with auto-detection from query
+    kg_context_template = prompt_manager.get_prompt(
+        "kg_query_context",
+        auto_detect_text=query
     )
-
-    kg_context_template = PROMPTS["kg_query_context"]
+    
     user_prompt = query_param.user_prompt if query_param.user_prompt else ""
     response_type = (
         query_param.response_type
@@ -4930,7 +5016,9 @@ async def naive_query(
     )
 
     # Calculate system prompt template tokens (excluding content_data)
-    user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
+    language_lock = _build_language_lock_instruction(query)
+    user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else ""
+    user_prompt = f"{user_prompt}{language_lock}" if user_prompt else language_lock
     response_type = (
         query_param.response_type
         if query_param.response_type
@@ -4938,9 +5026,17 @@ async def naive_query(
     )
 
     # Use the provided system prompt or default
-    sys_prompt_template = (
-        system_prompt if system_prompt else PROMPTS["naive_rag_response"]
-    )
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # Auto-detect language from query or use system prompt
+    if system_prompt:
+        sys_prompt_template = system_prompt
+    else:
+        sys_prompt_template = prompt_manager.get_prompt(
+            "naive_rag_response",
+            auto_detect_text=query
+        )
 
     # Create a preliminary system prompt with empty content_data to calculate overhead
     pre_sys_prompt = sys_prompt_template.format(
@@ -5018,7 +5114,10 @@ async def naive_query(
         if ref["reference_id"]
     )
 
-    naive_context_template = PROMPTS["naive_query_context"]
+    naive_context_template = prompt_manager.get_prompt(
+        "naive_query_context",
+        auto_detect_text=query
+    )
     context_content = naive_context_template.format(
         text_chunks_str=text_units_str,
         reference_list_str=reference_list_str,
@@ -5051,6 +5150,7 @@ async def naive_query(
         query_param.max_total_tokens,
         query_param.user_prompt or "",
         query_param.enable_rerank,
+        "lang_lock_v1",
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
@@ -5068,6 +5168,7 @@ async def naive_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            cache_type="query",
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):

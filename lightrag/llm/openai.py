@@ -15,6 +15,7 @@ from openai import (
     APIConnectionError,
     RateLimitError,
     APITimeoutError,
+    BadRequestError,
 )
 from tenacity import (
     retry,
@@ -77,6 +78,68 @@ class InvalidResponseError(Exception):
 
 # Module-level cache for tiktoken encodings
 _TIKTOKEN_ENCODING_CACHE: dict[str, Any] = {}
+
+
+def _content_to_text(content: Any) -> str:
+    """Convert OpenAI-style content payload to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
+def _normalize_messages_for_alternating_roles(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Normalize messages for backends that strictly require user/assistant alternation."""
+    system_texts: list[str] = []
+    normalized: list[dict[str, str]] = []
+
+    for message in messages:
+        role = str(message.get("role", "user")).lower()
+        content = _content_to_text(message.get("content")).strip()
+
+        if not content:
+            continue
+
+        if role == "system":
+            system_texts.append(content)
+            continue
+
+        if role not in {"user", "assistant"}:
+            # Tool/function roles are folded to assistant text for strict chat templates.
+            role = "assistant"
+
+        if normalized and normalized[-1]["role"] == role:
+            normalized[-1]["content"] = f"{normalized[-1]['content']}\n\n{content}"
+        else:
+            normalized.append({"role": role, "content": content})
+
+    system_prefix = "\n\n".join(system_texts).strip()
+
+    if not normalized:
+        fallback = system_prefix or "Please help with this request."
+        return [{"role": "user", "content": fallback}]
+
+    if system_prefix:
+        if normalized[0]["role"] == "user":
+            normalized[0]["content"] = f"{system_prefix}\n\n{normalized[0]['content']}"
+        else:
+            normalized.insert(0, {"role": "user", "content": system_prefix})
+
+    if normalized[0]["role"] != "user":
+        normalized.insert(0, {"role": "user", "content": "Please continue."})
+
+    return normalized
 
 
 def _get_tiktoken_encoding_for_model(model: str) -> Any:
@@ -334,6 +397,27 @@ async def openai_complete_if_cache(
             response = await openai_async_client.chat.completions.create(
                 model=api_model, messages=messages, **kwargs
             )
+    except BadRequestError as e:
+        error_text = str(e)
+        if "Conversation roles must alternate user/assistant" in error_text:
+            logger.warning(
+                "OpenAI-compatible backend requires alternating roles; retrying with normalized messages"
+            )
+            normalized_messages = _normalize_messages_for_alternating_roles(messages)
+            if "response_format" in kwargs:
+                response = await openai_async_client.chat.completions.parse(
+                    model=api_model, messages=normalized_messages, **kwargs
+                )
+            else:
+                response = await openai_async_client.chat.completions.create(
+                    model=api_model, messages=normalized_messages, **kwargs
+                )
+        else:
+            logger.error(
+                f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}"
+            )
+            await openai_async_client.close()
+            raise
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
         await openai_async_client.close()  # Ensure client is closed

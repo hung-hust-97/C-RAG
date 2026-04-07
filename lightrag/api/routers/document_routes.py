@@ -3,6 +3,8 @@ This module contains all document-related routes for the LightRAG API.
 """
 
 import asyncio
+import base64
+import textwrap
 from functools import lru_cache
 from lightrag.utils import logger, get_pinyin_sort_key
 import aiofiles
@@ -33,6 +35,8 @@ from lightrag.utils import (
 from lightrag.api.reembed import reembed_workspace_vectors
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
+from lightrag.ocr import OCRConfig, process_pdf_with_ocr
+from lightrag.ocr.markdown import MarkdownPreprocessor
 
 
 @lru_cache(maxsize=1)
@@ -380,6 +384,18 @@ class InsertResponse(BaseModel):
             }
         }
     )
+
+
+class PreviewPdfResponse(BaseModel):
+    """Response model for document preview as PDF base64."""
+
+    workspace_id: str = Field(description="Workspace identifier for this request")
+    file_path: str = Field(description="Original file path")
+    file_name: str = Field(description="Rendered PDF file name")
+    mime_type: Literal["application/pdf"] = Field(
+        default="application/pdf", description="Always application/pdf"
+    )
+    data_base64: str = Field(description="PDF data encoded as base64")
 
 
 class ClearDocumentsResponse(BaseModel):
@@ -1368,6 +1384,169 @@ def _extract_xlsx(file_bytes: bytes) -> str:
     return "\n".join(content_parts)
 
 
+def _to_pdf_hex_text(value: str) -> str:
+    """Encode text for PDF text operator using UTF-16BE hex string."""
+    return ("feff" + value.encode("utf-16-be").hex()).upper()
+
+
+def _render_text_to_pdf_bytes(content: str) -> bytes:
+    """Render plain text content to a simple multi-page PDF."""
+    page_width = 612
+    page_height = 792
+    margin = 48
+    font_size = 11
+    line_height = 14
+    chars_per_line = 92
+
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    wrapped_lines: list[str] = []
+    for raw_line in normalized.split("\n"):
+        if not raw_line:
+            wrapped_lines.append(" ")
+            continue
+        wrapped_lines.extend(textwrap.wrap(raw_line, width=chars_per_line) or [" "])
+
+    lines_per_page = max(1, (page_height - margin * 2) // line_height)
+    pages = [
+        wrapped_lines[i : i + lines_per_page]
+        for i in range(0, len(wrapped_lines), lines_per_page)
+    ] or [[" "]]
+
+    objects: list[bytes] = []
+
+    # 1: Catalog, 2: Pages, 3: Font
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+
+    page_object_ids: list[int] = []
+    content_object_ids: list[int] = []
+    next_id = 4
+    for _ in pages:
+        page_object_ids.append(next_id)
+        content_object_ids.append(next_id + 1)
+        next_id += 2
+
+    kids = " ".join(f"{pid} 0 R" for pid in page_object_ids)
+    objects.append(
+        f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_ids)} >>".encode(
+            "ascii"
+        )
+    )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    for page_id, content_id, page_lines in zip(page_object_ids, content_object_ids, pages):
+        y = page_height - margin - font_size
+        stream_cmds = ["BT", f"/F1 {font_size} Tf", f"{margin} {y} Td"]
+        first = True
+        for line in page_lines:
+            text_hex = _to_pdf_hex_text(line)
+            if not first:
+                stream_cmds.append(f"0 -{line_height} Td")
+            stream_cmds.append(f"<{text_hex}> Tj")
+            first = False
+        stream_cmds.append("ET")
+
+        stream_bytes = "\n".join(stream_cmds).encode("ascii")
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
+                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+            ).encode("ascii")
+        )
+        objects.append(
+            (
+                f"<< /Length {len(stream_bytes)} >>\nstream\n".encode("ascii")
+                + stream_bytes
+                + b"\nendstream"
+            )
+        )
+
+    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+
+    for obj_id, obj_data in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output.extend(f"{obj_id} 0 obj\n".encode("ascii"))
+        output.extend(obj_data)
+        output.extend(b"\nendobj\n")
+
+    xref_pos = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        output.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+
+    output.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_pos}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(output)
+
+
+async def _extract_text_for_preview(file_path: Path) -> str:
+    """Extract text content from a supported file for PDF preview rendering."""
+    ext = file_path.suffix.lower()
+    async with aiofiles.open(file_path, "rb") as f:
+        file_bytes = await f.read()
+
+    match ext:
+        case (
+            ".txt"
+            | ".md"
+            | ".mdx"
+            | ".html"
+            | ".htm"
+            | ".tex"
+            | ".json"
+            | ".xml"
+            | ".yaml"
+            | ".yml"
+            | ".rtf"
+            | ".odt"
+            | ".epub"
+            | ".csv"
+            | ".log"
+            | ".conf"
+            | ".ini"
+            | ".properties"
+            | ".sql"
+            | ".bat"
+            | ".sh"
+            | ".c"
+            | ".h"
+            | ".cpp"
+            | ".hpp"
+            | ".py"
+            | ".java"
+            | ".js"
+            | ".ts"
+            | ".swift"
+            | ".go"
+            | ".rb"
+            | ".php"
+            | ".css"
+            | ".scss"
+            | ".less"
+        ):
+            return file_bytes.decode("utf-8", errors="replace")
+        case ".pdf":
+            return await asyncio.to_thread(
+                _extract_pdf_pypdf, file_bytes, global_args.pdf_decrypt_password
+            )
+        case ".docx":
+            return await asyncio.to_thread(_extract_docx, file_bytes)
+        case ".pptx":
+            return await asyncio.to_thread(_extract_pptx, file_bytes)
+        case ".xlsx":
+            return await asyncio.to_thread(_extract_xlsx, file_bytes)
+        case _:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type for preview conversion: {ext}",
+            )
+
+
 async def pipeline_enqueue_file(
     rag: LightRAG, file_path: Path, track_id: str = None
 ) -> tuple[bool, str]:
@@ -1541,47 +1720,70 @@ async def pipeline_enqueue_file(
 
                 case ".pdf":
                     try:
-                        # Try DOCLING first if configured and available
-                        if (
-                            global_args.document_loading_engine == "DOCLING"
-                            and _is_docling_available()
-                        ):
-                            content = await asyncio.to_thread(
-                                _convert_with_docling, file_path
+                        # Create OCR config from global_args
+                        ocr_config = OCRConfig.from_global_args(global_args)
+                        
+                        # Call process_pdf_with_ocr() instead of direct pypdf extraction
+                        ocr_result = await process_pdf_with_ocr(
+                            file_bytes=file,
+                            password=global_args.pdf_decrypt_password,
+                            ocr_config=ocr_config
+                        )
+                        
+                        # Log OCR engine used and processing time
+                        logger.info(
+                            f"[File Extraction]PDF processed with {ocr_result.engine_used} OCR: "
+                            f"{file_path.name} ({ocr_result.page_count} pages, "
+                            f"{ocr_result.processing_time:.2f}s)"
+                        )
+                        
+                        # Handle OCRResult with markdown format
+                        if ocr_result.format == "markdown":
+                            # Use MarkdownPreprocessor for markdown output
+                            preprocessor = MarkdownPreprocessor(
+                                preserve_structure=ocr_config.preserve_markdown_structure
                             )
+                            content = preprocessor.preprocess(ocr_result.text)
+                            
+                            # Extract structure hints to pass to RAG pipeline
+                            structure_hints = preprocessor.extract_structure_hints(ocr_result.text)
+                            
+                            logger.debug(
+                                f"[File Extraction]Markdown preprocessing complete: "
+                                f"{len(structure_hints['headers'])} headers, "
+                                f"{len(structure_hints['tables'])} table rows, "
+                                f"{len(structure_hints['lists'])} list items"
+                            )
+                            
+                            # Note: structure_hints will be passed to RAG pipeline via metadata
+                            # This is handled in the enqueue step below
                         else:
-                            if (
-                                global_args.document_loading_engine == "DOCLING"
-                                and not _is_docling_available()
-                            ):
-                                logger.warning(
-                                    f"DOCLING engine configured but not available for {file_path.name}. Falling back to pypdf."
-                                )
-                            # Use pypdf (non-blocking via to_thread)
-                            content = await asyncio.to_thread(
-                                _extract_pdf_pypdf,
-                                file,
-                                global_args.pdf_decrypt_password,
-                            )
-
-                        # If pypdf/docling returned only whitespace (scanned PDF),
-                        # try OCR as a last resort fallback.
-                        if not content.strip() and _is_ocr_available():
-                            logger.warning(
-                                f"[File Extraction]PDF text extraction returned no content for {file_path.name}. "
-                                "Attempting OCR fallback (this may take a moment)."
-                            )
-                            content = await asyncio.to_thread(
-                                _extract_pdf_ocr, file
-                            )
-                            if content.strip():
-                                logger.info(
-                                    f"[File Extraction]OCR fallback succeeded for {file_path.name}"
-                                )
+                            # Handle plain text format directly
+                            content = ocr_result.text
+                        
+                        # Check if extraction failed
+                        if not content.strip():
+                            if ocr_result.error:
+                                error_msg = f"PDF extraction failed: {ocr_result.error}"
                             else:
-                                logger.warning(
-                                    f"[File Extraction]OCR fallback also returned no content for {file_path.name}"
-                                )
+                                error_msg = "PDF extraction returned no content"
+                            
+                            error_files = [
+                                {
+                                    "file_path": str(file_path.name),
+                                    "error_description": "[File Extraction]PDF extraction failed",
+                                    "original_error": error_msg,
+                                    "file_size": file_size,
+                                }
+                            ]
+                            await rag.apipeline_enqueue_error_documents(
+                                error_files, track_id
+                            )
+                            logger.error(
+                                f"[File Extraction]{error_msg} for {file_path.name}"
+                            )
+                            return False, track_id
+                            
                     except Exception as e:
                         error_files = [
                             {
@@ -2597,6 +2799,87 @@ def create_document_routes(
             raise
         except Exception as e:
             logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/preview",
+        dependencies=[Depends(combined_auth)],
+        response_model=PreviewPdfResponse,
+        summary="Preview an uploaded document file",
+    )
+    async def preview_document(
+        request: Request,
+        file_path: str,
+        workspace_id: Optional[str] = None,
+        download: bool = False,
+    ):
+        """Return an uploaded source document as PDF base64.
+
+        Security notes:
+        - Path traversal is blocked by `validate_file_path_security`.
+        - File access is scoped to the resolved workspace input directory.
+        """
+        try:
+            resolved_workspace_id, current_rag, current_doc_manager = await resolve_request_context(
+                request, workspace_id
+            )
+
+            normalized_file_path = normalize_file_path(file_path)
+            if normalized_file_path == UNKNOWN_FILE_SOURCE:
+                raise HTTPException(
+                    status_code=400, detail="Invalid file_path for preview"
+                )
+
+            # Files are moved to __enqueued__ after successful enqueue; search both locations.
+            search_dirs = [
+                current_doc_manager.input_dir,
+                current_doc_manager.input_dir / "__enqueued__",
+            ]
+
+            safe_file_path = None
+            for base_dir in search_dirs:
+                candidate = validate_file_path_security(normalized_file_path, base_dir)
+                if candidate is not None and candidate.exists() and candidate.is_file():
+                    safe_file_path = candidate
+                    break
+
+            if safe_file_path is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"File '{normalized_file_path}' not found in workspace "
+                        f"'{resolved_workspace_id or current_rag.workspace or 'default'}'"
+                    ),
+                )
+
+            pdf_bytes: bytes
+            if safe_file_path.suffix.lower() == ".pdf":
+                async with aiofiles.open(safe_file_path, "rb") as f:
+                    pdf_bytes = await f.read()
+            else:
+                preview_text = await _extract_text_for_preview(safe_file_path)
+                if not preview_text.strip():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"File '{normalized_file_path}' has no extractable content",
+                    )
+                pdf_bytes = _render_text_to_pdf_bytes(preview_text)
+
+            pdf_base64 = base64.b64encode(pdf_bytes).decode("ascii")
+            output_name = f"{safe_file_path.stem}.pdf"
+
+            return PreviewPdfResponse(
+                workspace_id=resolved_workspace_id,
+                file_path=normalized_file_path,
+                file_name=output_name,
+                mime_type="application/pdf",
+                data_base64=pdf_base64,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error previewing document '{file_path}': {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

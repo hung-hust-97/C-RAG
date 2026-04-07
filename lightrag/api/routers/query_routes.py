@@ -12,6 +12,22 @@ from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
 
+async def _classify_query_intent(query: str, current_rag) -> bool:
+    """Classifies if a query is a general conversation/greeting that doesn't need RAG."""
+    system_prompt = "You are a strict query intent classifier."
+    prompt = f"""Given the user's message, determine if it is a general greeting, a pleasantry, or a question about your capabilities (e.g., 'Hello', 'Xin chào', 'What can you do?', 'Bạn làm được gì?').
+If it IS a greeting or capability question that doesn't require searching a knowledge base, reply EXACTLY with the word 'BYPASS'.
+If it is a question that requires searching for specific facts, documents, or external knowledge, reply EXACTLY with the word 'SEARCH'.
+
+User message: "{query}"
+Your classification (reply with either 'BYPASS' or 'SEARCH' only):"""
+    try:
+        response = await current_rag.llm_model_func(prompt, system_prompt=system_prompt)
+        content = response.strip().upper() if isinstance(response, str) else ""
+        return "BYPASS" in content
+    except Exception as e:
+        logger.warning(f"Intent classification failed, defaulting to SEARCH mode: {e}")
+        return False
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -438,6 +454,12 @@ def create_query_routes(
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
 
+            if request.mode != "bypass":
+                is_conversational = await _classify_query_intent(request.query, current_rag)
+                if is_conversational:
+                    request.mode = "bypass"
+                    param.mode = "bypass"
+
             # Unified approach: always use aquery_llm for both cases
             result = await current_rag.aquery_llm(request.query, param=param)
 
@@ -449,7 +471,15 @@ def create_query_routes(
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
             if not response_content:
-                response_content = "No relevant context found for the query."
+                lang = current_rag.addon_params.get("language", "English") if hasattr(current_rag, "addon_params") else "English"
+                mapping = {
+                    "Vietnamese": "Không tìm thấy dữ liệu ngữ cảnh nào phù hợp cho câu hỏi của bạn.",
+                    "French": "Aucun contexte pertinent trouvé pour la requête.",
+                    "Chinese": "未找到与查询相关的上下文。",
+                    "Japanese": "関連するコンテキストが見つかりませんでした。"
+                }
+                default_msg = mapping.get(lang, "No relevant context found for the query.")
+                response_content = default_msg
 
             # Enrich references with chunk content if requested
             if request.include_references and request.include_chunk_content:
@@ -697,6 +727,12 @@ def create_query_routes(
 
             from fastapi.responses import StreamingResponse
 
+            if request.mode != "bypass":
+                is_conversational = await _classify_query_intent(request.query, current_rag)
+                if is_conversational:
+                    request.mode = "bypass"
+                    param.mode = "bypass"
+
             # Unified approach: always use aquery_llm for all cases
             result = await current_rag.aquery_llm(request.query, param=param)
 
@@ -747,7 +783,15 @@ def create_query_routes(
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")
                     if not response_content:
-                        response_content = "No relevant context found for the query."
+                        lang = current_rag.addon_params.get("language", "English") if hasattr(current_rag, "addon_params") else "English"
+                        mapping = {
+                            "Vietnamese": "Không tìm thấy dữ liệu ngữ cảnh nào phù hợp cho câu hỏi của bạn.",
+                            "French": "Aucun contexte pertinent trouvé pour la requête.",
+                            "Chinese": "未找到与查询相关的上下文。",
+                            "Japanese": "関連するコンテキストが見つかりませんでした。"
+                        }
+                        default_msg = mapping.get(lang, "No relevant context found for the query.")
+                        response_content = default_msg
 
                     # Create complete response object
                     complete_response = {"response": response_content}

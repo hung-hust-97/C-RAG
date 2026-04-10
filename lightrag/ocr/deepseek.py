@@ -7,7 +7,7 @@ extraction of text from PDF documents using the DeepSeek OCR service.
 
 import logging
 import httpx
-from typing import Dict
+from typing import Dict, Optional
 
 from lightrag.ocr.exceptions import (
     DeepSeekOCRError,
@@ -31,11 +31,12 @@ class DeepSeekOCRExtractor:
         client: Async HTTP client with connection pooling
     """
     
-    def __init__(self, api_url: str, timeout: int = 300):
+    def __init__(self, api_url: str, image_api_url: Optional[str] = None, timeout: int = 1200):
         """Initialize DeepSeek OCR API client.
         
         Args:
-            api_url: DeepSeek OCR API endpoint (loaded from DEEPSEEK_API_URL env var)
+            api_url: DeepSeek OCR PDF API endpoint (loaded from DEEPSEEK_API_URL env var)
+            image_api_url: DeepSeek OCR Image API endpoint (loaded from DEEPSEEK_IMAGE_API_URL env var)
             timeout: Request timeout in seconds (loaded from DEEPSEEK_OCR_TIMEOUT env var)
             
         Raises:
@@ -47,6 +48,7 @@ class DeepSeekOCRExtractor:
             raise ValueError("timeout must be a positive integer")
         
         self.api_url = api_url
+        self.image_api_url = image_api_url or api_url.replace("/pdf", "/image")
         self.timeout = timeout
         
         # Configure retry logic with exponential backoff (max 3 retries)
@@ -119,10 +121,16 @@ class DeepSeekOCRExtractor:
             text = response_data.get("text", "")
             page_count = response_data.get("page_count", 0)
             
-            logger.info(
-                f"DeepSeek OCR extraction successful: {page_count} pages, "
-                f"{len(text)} characters"
-            )
+            if not text.strip() or page_count == 0:
+                logger.warning(
+                    f"DeepSeek OCR returned empty result despite HTTP 200. "
+                    f"Response data: {response_data}"
+                )
+            else:
+                logger.info(
+                    f"DeepSeek OCR extraction successful: {page_count} pages, "
+                    f"{len(text)} characters"
+                )
             
             return {
                 "text": text,
@@ -136,6 +144,82 @@ class DeepSeekOCRExtractor:
         
         except (httpx.ConnectError, httpx.NetworkError) as e:
             error_msg = f"Failed to connect to DeepSeek OCR API: {self.api_url}"
+            logger.error(error_msg)
+            raise DeepSeekAPIConnectionError(error_msg) from e
+        
+        except Exception as e:
+            error_msg = f"DeepSeek OCR API call failed: {str(e)}"
+            logger.error(error_msg)
+            raise DeepSeekOCRError(error_msg) from e
+    
+    async def extract_text_from_image(self, image_bytes: bytes) -> Dict[str, any]:
+        """Extract text from Image using DeepSeek OCR API.
+        
+        Sends an image file to the DeepSeek OCR API endpoint via multipart/form-data
+        POST request and returns the extracted text.
+        
+        Args:
+            image_bytes: Image file content as bytes
+            
+        Returns:
+            dict: Response containing 'text' (str)
+            
+        Raises:
+            DeepSeekOCRError: If OCR processing fails
+            OCRTimeoutError: If request exceeds timeout
+            DeepSeekAPIConnectionError: If API endpoint is unreachable
+        """
+        if not image_bytes:
+            raise ValueError("image_bytes cannot be empty")
+        
+        logger.info(f"Sending Image to DeepSeek OCR API: {self.image_api_url}")
+        
+        try:
+            # Send multipart/form-data POST request to /ocr/image endpoint
+            files = {"file": ("image.png", image_bytes, "image/png")}
+            
+            response = await self.client.post(
+                self.image_api_url,
+                files=files,
+            )
+            
+            # Check for error status codes
+            if response.status_code >= 500:
+                error_msg = f"DeepSeek OCR API server error: {response.status_code}"
+                logger.error(error_msg)
+                raise DeepSeekOCRError(error_msg)
+            
+            if response.status_code >= 400:
+                error_msg = f"DeepSeek OCR API client error: {response.status_code}"
+                logger.error(error_msg)
+                raise DeepSeekOCRError(error_msg)
+            
+            # Parse response to extract text
+            response_data = response.json()
+            
+            text = response_data.get("text", "")
+            
+            if not text.strip():
+                logger.warning(
+                    f"DeepSeek OCR returned empty image result despite HTTP 200. "
+                    f"Response data: {response_data}"
+                )
+            else:
+                logger.info(
+                    f"DeepSeek OCR image extraction successful: {len(text)} characters"
+                )
+            
+            return {
+                "text": text,
+            }
+            
+        except httpx.TimeoutException as e:
+            error_msg = f"DeepSeek OCR API request timeout after {self.timeout}s"
+            logger.error(error_msg)
+            raise OCRTimeoutError(error_msg) from e
+        
+        except (httpx.ConnectError, httpx.NetworkError) as e:
+            error_msg = f"Failed to connect to DeepSeek OCR API: {self.image_api_url}"
             logger.error(error_msg)
             raise DeepSeekAPIConnectionError(error_msg) from e
         

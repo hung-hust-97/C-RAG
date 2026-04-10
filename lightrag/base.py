@@ -810,6 +810,14 @@ class DocStatusStorage(BaseKVStorage, ABC):
         """
 
     @abstractmethod
+    async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of documents in each status across all workspaces
+
+        Returns:
+            Dictionary mapping workspace IDs to status count dictionaries
+        """
+
+    @abstractmethod
     async def get_doc_by_file_path(self, file_path: str) -> dict[str, Any] | None:
         """Get document by file path
 

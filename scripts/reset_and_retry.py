@@ -21,17 +21,18 @@ async def clear_cache_and_db(client):
     workspaces = [os.path.basename(d) for d in input_dirs if os.path.isdir(d) and not os.path.basename(d).startswith("__")]
 
     for ws in workspaces:
-        print(f"\n--- Đang xử lý Workspace: {ws} ---")
+        api_ws = "" if ws == "default" else ws
+        print(f"\n--- Đang xử lý Workspace: {ws} (API_WS: '{api_ws}') ---")
         try:
-            # Query tất cả documents cũ để xóa (cơ chế xóa này sẽ dọn dẹp VectorDB, Neon4j, Chunks tự động qua API của C-RAG)
-            resp = await client.post(f"{API_URL}/documents/paginated", json={"workspace_id": ws, "page": 1, "page_size": 100})
+            # Query tất cả documents cũ để xóa
+            resp = await client.post(f"{API_URL}/documents/paginated", json={"workspace_id": api_ws, "page": 1, "page_size": 100})
             if resp.status_code == 200:
                 docs = resp.json().get("documents", [])
                 doc_ids = [d["id"] for d in docs]
                 if doc_ids:
                     print(f"   [{ws}] Đang gửi lệnh xóa {len(doc_ids)} tài liệu (Xóa Neo4j, Vector, SQLite)...")
                     del_payload = {
-                        "workspace_id": ws,
+                        "workspace_id": api_ws,
                         "doc_ids": doc_ids,
                         "delete_file": True,
                         "delete_llm_cache": True
@@ -47,25 +48,47 @@ async def clear_cache_and_db(client):
             print(f"   [{ws}] Không gọi được API xóa: {e}")
 
 async def restore_md_and_retry(client):
-    print("\n2. Tiến hành đẩy lại các file .md vào Queue và gọi API retry...")
-    # Vì file .md nằm trong __enqueued__, ta cần đem nó ngược ra thư mục input để retry
-    md_files = glob.glob("data/inputs/*/__enqueued__/*.md")
-    if not md_files:
-         print("   Không tìm thấy file .md nào trong __enqueued__! Hệ thống chưa có dữ liệu nào chờ retry.")
+    print("\n2. Tiến hành đẩy lại các file tài liệu vào Queue và gọi API retry...")
+    
+    # Lấy danh sách workspace có dữ liệu
+    input_dirs = glob.glob("data/inputs/*")
+    workspaces_paths = [d for d in input_dirs if os.path.isdir(d) and not os.path.basename(d).startswith("__")]
+    
+    all_files_to_process = []
+    
+    # Tìm kiếm tất cả file trong mỗi workspace directory
+    for ws_path in workspaces_paths:
+        workspace_id = os.path.basename(ws_path)
+        # Tìm tất cả file, bao gồm cả trong subfolders như __enqueued__
+        for root, dirs, files in os.walk(ws_path):
+            for file in files:
+                if not file.startswith("."): # Skip hidden files
+                    all_files_to_process.append((workspace_id, os.path.join(root, file)))
+
+    # Thêm các file ở root data/inputs (default workspace)
+    root_files = [f for f in glob.glob("data/inputs/*") if os.path.isfile(f) and not os.path.basename(f).startswith(".")]
+    for rf in root_files:
+        all_files_to_process.append(("default", rf))
+
+    if not all_files_to_process:
+         print("   Không tìm thấy file nào để xử lý! Hệ thống chưa có dữ liệu.")
          return
          
-    for pf in md_files:
-        workspace_id = pf.split('/')[-3]
+    for workspace_id, pf in all_files_to_process:
         filename = os.path.basename(pf)
         
+        # Determine mime type rudimentarily
+        mime_type = "application/octet-stream"
+        if filename.endswith(".md"): mime_type = "text/markdown"
+        elif filename.endswith(".pdf"): mime_type = "application/pdf"
+        
         print(f"   [{workspace_id}] Nạp file '{filename}' để chạy lại Flow nhúng...")
-        # Sử dụng đúng API upload mà hệ thống đã dùng Docling/Deepseek
         try:
             with open(pf, "rb") as f:
                 r = await client.post(
                     f"{API_URL}/documents/upload",
                     headers={"LIGHTRAG-WORKSPACE-ID": workspace_id},
-                    files={"file": (filename, f, "text/markdown")}
+                    files={"file": (filename, f, mime_type)}
                 )
                 print(f"   [{workspace_id}] Trạng thái đẩy file API: {r.status_code}")
         except Exception as e:

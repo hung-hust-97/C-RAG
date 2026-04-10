@@ -6,6 +6,7 @@ STORAGE_IMPLEMENTATIONS = {
             "PGKVStorage",
             "MongoKVStorage",
             "OpenSearchKVStorage",
+            "S3KVStorage",
         ],
         "required_methods": ["get_by_id", "upsert"],
     },
@@ -55,6 +56,7 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     ],
     "RedisKVStorage": ["REDIS_URI"],
     "PGKVStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "S3KVStorage": ["S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY"],
     # Graph Storage Implementations
     "NetworkXStorage": [],
     "Neo4JStorage": ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"],
@@ -137,6 +139,7 @@ STORAGES = {
     "OpenSearchDocStatusStorage": ".kg.opensearch_impl",
     "OpenSearchGraphStorage": ".kg.opensearch_impl",
     "OpenSearchVectorDBStorage": ".kg.opensearch_impl",
+    "S3KVStorage": ".kg.s3_impl",
 }
 
 

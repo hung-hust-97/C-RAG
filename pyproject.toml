@@ -87,15 +87,12 @@ api = [
     "pytz",
     "uvicorn",
     "gunicorn",
+    "celery[redis]>=5.3.0",
     # Document processing dependencies (required for API document upload functionality)
     "openpyxl>=3.0.0,<4.0.0",      # XLSX processing
     "pycryptodome>=3.0.0,<4.0.0",  # PDF encryption support
-    "pypdf>=6.1.0",                 # PDF processing
     "python-docx>=0.8.11,<2.0.0",  # DOCX processing
     "python-pptx>=0.6.21,<2.0.0",  # PPTX processing
-    # OCR fallback for scanned/image-based PDFs (requires system tesseract-ocr)
-    "pytesseract>=0.3.10",          # OCR wrapper for tesseract
-    "pdf2image>=1.16.0",            # PDF-to-image conversion (requires poppler-utils)
 ]
 
 # Advanced document processing engine (optional)
@@ -103,6 +100,8 @@ docling = [
     # On macOS, pytorch and frameworks use Objective-C are not fork-safe,
     # and not compatible to gunicorn multi-worker mode
     "docling>=2.0.0,<3.0.0; sys_platform != 'darwin'",
+    "pymupdf>=1.24.0",
+    "pillow>=10.0.0",
 ]
 
 # Offline deployment dependencies (layered design for flexibility)

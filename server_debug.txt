@@ -58,20 +58,6 @@ from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.reembed import reembed_workspace_vectors
 
-from .celery_app import celery_app
-
-def monkeypatch_apipeline_process_enqueue_documents(self, reprocess_failed=False):
-    """
-    Monkeypatch for LightRAG.apipeline_process_enqueue_documents to use Celery.
-    """
-    celery_app.send_task(
-        "lightrag.api.lightrag_server.apipeline_process_enqueue_documents_task",
-        args=[self.workspace, reprocess_failed]
-    )
-    return True
-
-LightRAG.apipeline_process_enqueue_documents = monkeypatch_apipeline_process_enqueue_documents
-
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
     get_namespace_data,
@@ -1708,7 +1694,6 @@ def main():
         f"Starting Uvicorn server in single-process mode on {global_args.host}:{global_args.port}"
     )
     uvicorn.run(**uvicorn_config)
-
 
 
 if __name__ == "__main__":

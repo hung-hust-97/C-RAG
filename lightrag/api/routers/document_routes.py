@@ -35,7 +35,7 @@ from lightrag.utils import (
 from lightrag.api.reembed import reembed_workspace_vectors
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
-from lightrag.ocr import OCRConfig, process_pdf_with_ocr
+from lightrag.ocr import OCRConfig, process_document_with_ocr
 from lightrag.ocr.markdown import MarkdownPreprocessor
 
 
@@ -386,16 +386,15 @@ class InsertResponse(BaseModel):
     )
 
 
-class PreviewPdfResponse(BaseModel):
-    """Response model for document preview as PDF base64."""
+class PreviewDocumentResponse(BaseModel):
+    """Response model for document preview."""
 
     workspace_id: str = Field(description="Workspace identifier for this request")
     file_path: str = Field(description="Original file path")
-    file_name: str = Field(description="Rendered PDF file name")
-    mime_type: Literal["application/pdf"] = Field(
-        default="application/pdf", description="Always application/pdf"
-    )
-    data_base64: str = Field(description="PDF data encoded as base64")
+    file_name: str = Field(description="Rendered file name")
+    mime_type: str = Field(description="MIME type (e.g. application/pdf, text/markdown)")
+    data_base64: Optional[str] = Field(default=None, description="Binary data encoded as base64")
+    data_text: Optional[str] = Field(default=None, description="Plain text data (for markdown/text)")
 
 
 class ClearDocumentsResponse(BaseModel):
@@ -893,11 +892,16 @@ class StatusCountsResponse(BaseModel):
     """Response model for document status counts
 
     Attributes:
+        workspace_id: Workspace identifier for this request
         status_counts: Count of documents by status
+        workspaces: Aggregated stats for all workspaces (only if workspace_id was not specified)
     """
 
     workspace_id: str = Field(description="Workspace identifier for this request")
     status_counts: Dict[str, int] = Field(description="Count of documents by status")
+    workspaces: Optional[Dict[str, Dict[str, int]]] = Field(
+        default=None, description="Aggregated stats for all workspaces"
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -1139,40 +1143,6 @@ def _convert_with_docling(file_path: Path) -> str:
     result = converter.convert(file_path)
     return result.document.export_to_markdown()
 
-
-def _extract_pdf_pypdf(file_bytes: bytes, password: str = None) -> str:
-    """Extract PDF content using pypdf (synchronous).
-
-    Args:
-        file_bytes: PDF file content as bytes
-        password: Optional password for encrypted PDFs
-
-    Returns:
-        str: Extracted text content
-
-    Raises:
-        Exception: If PDF is encrypted and password is incorrect or missing
-    """
-    from pypdf import PdfReader  # type: ignore
-
-    pdf_file = BytesIO(file_bytes)
-    reader = PdfReader(pdf_file)
-
-    # Check if PDF is encrypted
-    if reader.is_encrypted:
-        if not password:
-            raise Exception("PDF is encrypted but no password provided")
-
-        decrypt_result = reader.decrypt(password)
-        if decrypt_result == 0:
-            raise Exception("Incorrect PDF password")
-
-    # Extract text from all pages
-    content = ""
-    for page in reader.pages:
-        content += page.extract_text() + "\n"
-
-    return content
 
 
 def _extract_docx(file_bytes: bytes) -> str:
@@ -1531,9 +1501,8 @@ async def _extract_text_for_preview(file_path: Path) -> str:
         ):
             return file_bytes.decode("utf-8", errors="replace")
         case ".pdf":
-            return await asyncio.to_thread(
-                _extract_pdf_pypdf, file_bytes, global_args.pdf_decrypt_password
-            )
+            # Disabled direct PDF extraction without full processing framework
+            return "PDF previews are supported through MinIO markdown conversions only."
         case ".docx":
             return await asyncio.to_thread(_extract_docx, file_bytes)
         case ".pptx":
@@ -1660,71 +1629,14 @@ async def pipeline_enqueue_file(
                     | ".css"
                     | ".scss"
                     | ".less"
+                    | ".pdf"
                 ):
-                    try:
-                        # Try to decode as UTF-8
-                        content = file.decode("utf-8")
-
-                        # Validate content
-                        if not content or len(content.strip()) == 0:
-                            error_files = [
-                                {
-                                    "file_path": str(file_path.name),
-                                    "error_description": "[File Extraction]Empty file content",
-                                    "original_error": "File contains no content or only whitespace",
-                                    "file_size": file_size,
-                                }
-                            ]
-                            await rag.apipeline_enqueue_error_documents(
-                                error_files, track_id
-                            )
-                            logger.error(
-                                f"[File Extraction]Empty content in file: {file_path.name}"
-                            )
-                            return False, track_id
-
-                        # Check if content looks like binary data string representation
-                        if content.startswith("b'") or content.startswith('b"'):
-                            error_files = [
-                                {
-                                    "file_path": str(file_path.name),
-                                    "error_description": "[File Extraction]Binary data in text file",
-                                    "original_error": "File appears to contain binary data representation instead of text",
-                                    "file_size": file_size,
-                                }
-                            ]
-                            await rag.apipeline_enqueue_error_documents(
-                                error_files, track_id
-                            )
-                            logger.error(
-                                f"[File Extraction]File {file_path.name} appears to contain binary data representation instead of text"
-                            )
-                            return False, track_id
-
-                    except UnicodeDecodeError as e:
-                        error_files = [
-                            {
-                                "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]UTF-8 encoding error, please convert it to UTF-8 before processing",
-                                "original_error": f"File is not valid UTF-8 encoded text: {str(e)}",
-                                "file_size": file_size,
-                            }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
-                        logger.error(
-                            f"[File Extraction]File {file_path.name} is not valid UTF-8 encoded text. Please convert it to UTF-8 before processing."
-                        )
-                        return False, track_id
-
-                case ".pdf":
                     try:
                         # Create OCR config from global_args
                         ocr_config = OCRConfig.from_global_args(global_args)
                         
-                        # Call process_pdf_with_ocr() instead of direct pypdf extraction
-                        ocr_result = await process_pdf_with_ocr(
+                        # Call process_document_with_ocr() for document extraction (Hybrid/OCR)
+                        ocr_result = await process_document_with_ocr(
                             file_bytes=file,
                             password=global_args.pdf_decrypt_password,
                             ocr_config=ocr_config
@@ -1732,7 +1644,7 @@ async def pipeline_enqueue_file(
                         
                         # Log OCR engine used and processing time
                         logger.info(
-                            f"[File Extraction]PDF processed with {ocr_result.engine_used} OCR: "
+                            f"[File Extraction]Document processed with {ocr_result.engine_used} engine: "
                             f"{file_path.name} ({ocr_result.page_count} pages, "
                             f"{ocr_result.processing_time:.2f}s)"
                         )
@@ -1763,15 +1675,23 @@ async def pipeline_enqueue_file(
                         
                         # Check if extraction failed
                         if not content.strip():
-                            if ocr_result.error:
-                                error_msg = f"PDF extraction failed: {ocr_result.error}"
+                            if _is_docling_available():
+                                logger.info(f"[File Extraction] Fallback to Docling for {file_path.name}")
+                                try:
+                                    content = await asyncio.to_thread(_convert_with_docling, file_path)
+                                except Exception as e:
+                                    logger.error(f"[File Extraction] Docling fallback failed: {e}")
+                                    
+                        if not content.strip():
+                            if ocr_result and ocr_result.error:
+                                error_msg = f"Document extraction failed: {ocr_result.error}"
                             else:
-                                error_msg = "PDF extraction returned no content"
+                                error_msg = "Document extraction returned no content"
                             
                             error_files = [
                                 {
                                     "file_path": str(file_path.name),
-                                    "error_description": "[File Extraction]PDF extraction failed",
+                                    "error_description": "[File Extraction]Document extraction failed",
                                     "original_error": error_msg,
                                     "file_size": file_size,
                                 }
@@ -1788,8 +1708,8 @@ async def pipeline_enqueue_file(
                         error_files = [
                             {
                                 "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]PDF processing error",
-                                "original_error": f"Failed to extract text from PDF: {str(e)}",
+                                "error_description": "[File Extraction]Document processing error",
+                                "original_error": f"Failed to extract text from Document: {str(e)}",
                                 "file_size": file_size,
                             }
                         ]
@@ -1797,7 +1717,7 @@ async def pipeline_enqueue_file(
                             error_files, track_id
                         )
                         logger.error(
-                            f"[File Extraction]Error processing PDF {file_path.name}: {str(e)}"
+                            f"[File Extraction]Error processing Document {file_path.name}: {str(e)}"
                         )
                         return False, track_id
 
@@ -2055,11 +1975,9 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = No
         track_id: Optional tracking ID
     """
     try:
-        success, returned_track_id = await pipeline_enqueue_file(
-            rag, file_path, track_id
-        )
-        if success:
-            await rag.apipeline_process_enqueue_documents()
+        from lightrag.api.celery_tasks import task_extract_and_enqueue
+        workspace_id = rag.workspace
+        task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
 
     except Exception as e:
         logger.error(f"Error indexing file {file_path.name}: {str(e)}")
@@ -2079,22 +1997,17 @@ async def pipeline_index_files(
     if not file_paths:
         return
     try:
-        enqueued = False
-
+        from lightrag.api.celery_tasks import task_extract_and_enqueue
+        workspace_id = rag.workspace
+        
         # Use get_pinyin_sort_key for Chinese pinyin sorting
         sorted_file_paths = sorted(
             file_paths, key=lambda p: get_pinyin_sort_key(str(p))
         )
 
-        # Process files sequentially with track_id
+        # Process files sequentially with track_id through Celery
         for file_path in sorted_file_paths:
-            success, _ = await pipeline_enqueue_file(rag, file_path, track_id)
-            if success:
-                enqueued = True
-
-        # Process the queue only if at least one file was successfully enqueued
-        if enqueued:
-            await rag.apipeline_process_enqueue_documents()
+            task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
     except Exception as e:
         logger.error(f"Error indexing files: {str(e)}")
         logger.error(traceback.format_exc())
@@ -2132,7 +2045,8 @@ async def pipeline_index_texts(
     await rag.apipeline_enqueue_documents(
         input=texts, file_paths=normalized_file_sources, track_id=track_id
     )
-    await rag.apipeline_process_enqueue_documents()
+    from lightrag.api.celery_tasks import task_chunk_and_graph
+    task_chunk_and_graph.delay(rag.workspace)
 
 
 async def run_scanning_process(
@@ -2805,7 +2719,7 @@ def create_document_routes(
     @router.get(
         "/preview",
         dependencies=[Depends(combined_auth)],
-        response_model=PreviewPdfResponse,
+        response_model=PreviewDocumentResponse,
         summary="Preview an uploaded document file",
     )
     async def preview_document(
@@ -2853,28 +2767,87 @@ def create_document_routes(
                     ),
                 )
 
-            pdf_bytes: bytes
-            if safe_file_path.suffix.lower() == ".pdf":
-                async with aiofiles.open(safe_file_path, "rb") as f:
-                    pdf_bytes = await f.read()
+            # We want to return Markdown format instead of rendering to PDF
+            content_bytes: bytes | None = None
+            is_markdown = False
+            
+            # --- DB-FIRST PREVIEW STRATEGY (S3/MINIO FULL_DOCS SUPPORT) ---
+            # Attempt to find the document in DocStatusStorage to get its ID and status
+            found_doc_id = None
+            found_status = None
+            try:
+                for status in DocStatus:
+                    docs_dict = await current_rag.doc_status.get_docs_by_status(status)
+                    if hasattr(docs_dict, "items"):
+                        for d_id, d_info in docs_dict.items():
+                            # d_info might be a dict or a dataclass DocProcessingStatus
+                            f_path = d_info.get("file_path", "") if isinstance(d_info, dict) else getattr(d_info, "file_path", "")
+                            # Also check basename because sometimes paths are stored relatively
+                            if f_path == normalized_file_path or Path(f_path).name == Path(normalized_file_path).name:
+                                found_doc_id = d_id
+                                found_status = status
+                                break
+                    if found_doc_id:
+                        break
+            except Exception as e:
+                logger.warning(f"Could not scan doc status for file_path: {e}")
+
+            if found_status in [DocStatus.PENDING, DocStatus.PROCESSING]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Tài liệu đang được xử lý (Processing/Pending). Vui lòng chờ cho đến khi hoàn thành để xem nội dung."
+                )
+
+            if found_doc_id:
+                # Try fetching from full_docs (which will hit MinIO S3KVStorage if configured)
+                raw_full_doc = await current_rag.full_docs.get_by_id(found_doc_id)
+                if raw_full_doc and "content" in raw_full_doc:
+                    content_bytes = raw_full_doc["content"].encode("utf-8")
+                    is_markdown = True
+                    logger.info(f"Loaded Markdown preview from full_docs (S3/DB) for doc_id: {found_doc_id}")
+
+            # --- FALLBACK STRATEGY (DISK) ---
+            if content_bytes is None:
+                # If it's a PDF, attempt to load the OCR/Docling generated .md file if it exists on disk
+                if safe_file_path.suffix.lower() == ".pdf":
+                    md_candidate = safe_file_path.with_suffix(".md")
+                    if md_candidate.exists() and md_candidate.is_file():
+                        safe_file_path = md_candidate
+                        is_markdown = True
+                    
+                if safe_file_path.suffix.lower() in [".md", ".txt", ".json", ".csv"]:
+                    is_markdown = True
+                    async with aiofiles.open(safe_file_path, "rb") as f:
+                        content_bytes = await f.read()
+                elif not is_markdown and safe_file_path.suffix.lower() == ".pdf":
+                    # Directly return the raw PDF if no text markdown was found.
+                    async with aiofiles.open(safe_file_path, "rb") as f:
+                        content_bytes = await f.read()
+                else:
+                    async with aiofiles.open(safe_file_path, "rb") as f:
+                        content_bytes = await f.read()
+
+            if content_bytes is None:
+                 raise HTTPException(status_code=500, detail="Failed to load document content")
+
+            if is_markdown:
+                output_name = f"{safe_file_path.stem}.md"
+                mime_type = "text/markdown"
+                data_text = content_bytes.decode("utf-8")
+                data_base64 = None
             else:
-                preview_text = await _extract_text_for_preview(safe_file_path)
-                if not preview_text.strip():
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"File '{normalized_file_path}' has no extractable content",
-                    )
-                pdf_bytes = _render_text_to_pdf_bytes(preview_text)
+                output_name = f"{safe_file_path.stem}.pdf"
+                mime_type = "application/pdf"
+                data_text = None
+                data_base64 = base64.b64encode(content_bytes).decode("ascii")
 
-            pdf_base64 = base64.b64encode(pdf_bytes).decode("ascii")
-            output_name = f"{safe_file_path.stem}.pdf"
-
-            return PreviewPdfResponse(
+            return PreviewDocumentResponse(
                 workspace_id=resolved_workspace_id,
                 file_path=normalized_file_path,
                 file_name=output_name,
-                mime_type="application/pdf",
-                data_base64=pdf_base64,
+                mime_type=mime_type,
+                data_base64=data_base64,
+                data_text=data_text
             )
         except HTTPException:
             raise
@@ -4085,7 +4058,8 @@ def create_document_routes(
         Get counts of documents by status.
 
         This endpoint retrieves the count of documents in each processing status
-        (PENDING, PROCESSING, PROCESSED, FAILED) for all documents in the system.
+        (PENDING, PROCESSING, PROCESSED, FAILED) for documents in the specified workspace,
+        or all workspaces if no workspace_id is provided.
 
         Returns:
             StatusCountsResponse: A response object containing status counts
@@ -4094,12 +4068,35 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving status counts (500).
         """
         try:
+            # Check if workspace was explicitly provided
+            is_explicit = (workspace_id is not None) or bool(
+                request.headers.get("LIGHTRAG-WORKSPACE-ID")
+            ) or bool(request.headers.get("LIGHTRAG-WORKSPACE"))
+
             resolved_workspace_id, current_rag, _ = await resolve_request_context(
                 request, workspace_id
             )
-            status_counts = await current_rag.doc_status.get_all_status_counts()
+
+            workspaces_stats = None
+            if not is_explicit:
+                # Get aggregated stats across all workspaces
+                workspaces_stats = (
+                    await current_rag.doc_status.get_status_counts_across_workspaces()
+                )
+
+                # Combine all stats for the top-level status_counts
+                total_counts = {"all": 0}
+                for ws_stats in workspaces_stats.values():
+                    for status, count in ws_stats.items():
+                        total_counts[status] = total_counts.get(status, 0) + count
+                status_counts = total_counts
+            else:
+                status_counts = await current_rag.doc_status.get_all_status_counts()
+
             return StatusCountsResponse(
-                workspace_id=resolved_workspace_id, status_counts=status_counts
+                workspace_id=resolved_workspace_id,
+                status_counts=status_counts,
+                workspaces=workspaces_stats,
             )
 
         except Exception as e:
@@ -4146,7 +4143,9 @@ def create_document_routes(
 
             # Start the reprocessing in the background
             # Note: Reprocessed documents retain their original track_id from initial upload
-            background_tasks.add_task(current_rag.apipeline_process_enqueue_documents)
+            background_tasks.add_task(
+                current_rag.apipeline_process_enqueue_documents, reprocess_failed=True
+            )
             logger.info("Reprocessing of failed documents initiated")
 
             return ReprocessResponse(

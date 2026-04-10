@@ -642,11 +642,23 @@ class LightRAG:
             embedding_func=self.embedding_func,
         )
 
-        self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_FULL_DOCS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-        )
+        full_docs_storage_type = os.getenv("FULL_DOCS_STORAGE")
+        if full_docs_storage_type:
+            full_docs_storage_cls = self._get_storage_class(full_docs_storage_type)
+            full_docs_storage_cls = partial(  # type: ignore
+                full_docs_storage_cls, global_config=global_config
+            )
+            self.full_docs: BaseKVStorage = full_docs_storage_cls(
+                namespace=NameSpace.KV_STORE_FULL_DOCS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+            )
+        else:
+            self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+                namespace=NameSpace.KV_STORE_FULL_DOCS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+            )
 
         self.full_entities: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_ENTITIES,
@@ -1574,6 +1586,7 @@ class LightRAG:
         to_process_docs: dict[str, DocProcessingStatus],
         pipeline_status: dict,
         pipeline_status_lock: asyncio.Lock,
+        reprocess_failed: bool = False,
     ) -> dict[str, DocProcessingStatus]:
         """Validate and fix document data consistency by deleting inconsistent entries, but preserve failed documents"""
         inconsistent_docs = []
@@ -1596,15 +1609,22 @@ class LightRAG:
 
         # Log information about failed documents that will be preserved
         if failed_docs_to_preserve:
-            async with pipeline_status_lock:
-                preserve_message = f"Preserving {len(failed_docs_to_preserve)} failed document entries for manual review"
-                logger.info(preserve_message)
-                pipeline_status["latest_message"] = preserve_message
-                pipeline_status["history_messages"].append(preserve_message)
+            if not reprocess_failed:
+                async with pipeline_status_lock:
+                    preserve_message = f"Preserving {len(failed_docs_to_preserve)} failed document entries for manual review"
+                    logger.info(preserve_message)
+                    pipeline_status["latest_message"] = preserve_message
+                    pipeline_status["history_messages"].append(preserve_message)
 
-            # Remove failed documents from processing list but keep them in doc_status
-            for doc_id in failed_docs_to_preserve:
-                to_process_docs.pop(doc_id, None)
+                # Remove failed documents from processing list but keep them in doc_status
+                for doc_id in failed_docs_to_preserve:
+                    to_process_docs.pop(doc_id, None)
+            else:
+                async with pipeline_status_lock:
+                    reprocess_message = f"Including {len(failed_docs_to_preserve)} failed document entries for reprocessing"
+                    logger.info(reprocess_message)
+                    pipeline_status["latest_message"] = reprocess_message
+                    pipeline_status["history_messages"].append(reprocess_message)
 
         # Delete inconsistent document entries(excluding failed documents)
         if inconsistent_docs:
@@ -1708,6 +1728,7 @@ class LightRAG:
         self,
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
+        reprocess_failed: bool = False,
     ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
@@ -1799,7 +1820,10 @@ class LightRAG:
 
                 # Validate document data consistency and fix any issues as part of the pipeline
                 to_process_docs = await self._validate_and_fix_document_consistency(
-                    to_process_docs, pipeline_status, pipeline_status_lock
+                    to_process_docs,
+                    pipeline_status,
+                    pipeline_status_lock,
+                    reprocess_failed=reprocess_failed,
                 )
 
                 if not to_process_docs:

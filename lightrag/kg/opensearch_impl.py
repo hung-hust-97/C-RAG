@@ -845,6 +845,52 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             logger.error(f"[{self.workspace}] Error getting all status counts: {e}")
             return {}
 
+    async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of documents in each status across all workspaces"""
+        workspaces_counts = {}
+        try:
+            # List all indices
+            indices = await self.client.indices.get_alias()
+
+            # Find indices that represent doc_status for different workspaces
+            sanitized_ns = _sanitize_index_name(self.namespace)
+            suffix = f"_{sanitized_ns}"
+
+            for index_name in indices.keys():
+                workspace = None
+                if index_name.endswith(suffix):
+                    workspace = index_name[: -len(suffix)] or "default"
+                elif index_name == sanitized_ns:
+                    workspace = "default"
+
+                if workspace:
+                    try:
+                        body = {
+                            "size": 0,
+                            "aggs": {
+                                "status_counts": {"terms": {"field": "status", "size": 100}}
+                            },
+                        }
+                        response = await self.client.search(index=index_name, body=body)
+                        counts = {"all": 0}
+                        for bucket in response["aggregations"]["status_counts"]["buckets"]:
+                            status = bucket["key"]
+                            count = bucket["doc_count"]
+                            counts[status] = count
+                            counts["all"] += count
+
+                        if counts["all"] > 0:
+                            workspaces_counts[workspace] = counts
+                    except OpenSearchException:
+                        continue
+
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error getting status counts across workspaces in OpenSearch: {e}"
+            )
+
+        return workspaces_counts
+
     async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
         """Find a document status record by its file_path field."""
         if not self._index_ready:

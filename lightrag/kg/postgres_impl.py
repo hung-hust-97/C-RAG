@@ -3212,6 +3212,7 @@ class PGVectorStorage(BaseVectorStorage):
         """
         query = f"SELECT *, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at FROM {self.table_name} WHERE workspace=$1 AND id=$2"
         params = {"workspace": self.workspace, "id": id}
+        logger.debug(f"DEBUG: PGKVStorage[{self.table_name}] get_by_id id={id} workspace={self.workspace}")
 
         try:
             result = await self.db.query(query, list(params.values()))
@@ -3807,6 +3808,33 @@ class PGDocStatusStorage(DocStatusStorage):
         counts["all"] = total_count
 
         return counts
+
+    async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of documents in each status across all workspaces
+
+        Returns:
+            Dictionary mapping workspace IDs to status count dictionaries
+        """
+        sql = """
+            SELECT workspace, status, COUNT(*) as count
+            FROM LIGHTRAG_DOC_STATUS
+            GROUP BY workspace, status
+        """
+        result = await self.db.query(sql, [], True)
+
+        workspaces_counts = {}
+        for row in result:
+            ws = row["workspace"]
+            status = row["status"]
+            count = row["count"]
+
+            if ws not in workspaces_counts:
+                workspaces_counts[ws] = {"all": 0}
+
+            workspaces_counts[ws][status] = count
+            workspaces_counts[ws]["all"] += count
+
+        return workspaces_counts
 
     async def index_done_callback(self) -> None:
         # PG handles persistence automatically

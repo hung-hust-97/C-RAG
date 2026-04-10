@@ -710,6 +710,47 @@ class MongoDocStatusStorage(DocStatusStorage):
 
         return counts
 
+    async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of documents in each status across all workspaces"""
+        workspaces_counts = {}
+        try:
+            # List all collections in the database
+            collection_names = await self.db.list_collection_names()
+
+            # Find collections that represent doc_status for different workspaces
+            # They follow the pattern: {workspace}_{namespace}
+            suffix = f"_{self.namespace}"
+            for coll_name in collection_names:
+                workspace = None
+                if coll_name.endswith(suffix):
+                    workspace = coll_name[: -len(suffix)] or "default"
+                elif coll_name == self.namespace:
+                    workspace = "default"
+
+                if workspace:
+                    # Query this collection for status counts
+                    coll = self.db.get_collection(coll_name)
+                    pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+                    cursor = await coll.aggregate(pipeline, allowDiskUse=True)
+
+                    counts = {"all": 0}
+                    async for doc in cursor:
+                        status = doc["_id"]
+                        count = doc["count"]
+                        if status:
+                            counts[status] = count
+                            counts["all"] += count
+
+                    if counts["all"] > 0:
+                        workspaces_counts[workspace] = counts
+
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error getting status counts across workspaces in Mongo: {e}"
+            )
+
+        return workspaces_counts
+
     async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
         """Get document by file path
 

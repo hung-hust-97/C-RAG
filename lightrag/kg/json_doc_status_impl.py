@@ -335,6 +335,15 @@ class JsonDocStatusStorage(DocStatusStorage):
 
         return counts
 
+    async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of documents in each status across all workspaces
+
+        Note: JSON storage is per-workspace, so this implementation currently
+        only returns counts for the current workspace.
+        """
+        counts = await self.get_all_status_counts()
+        return {self.workspace or "default": counts}
+
     async def delete(self, doc_ids: list[str]) -> None:
         """Delete specific records from storage by their IDs
 

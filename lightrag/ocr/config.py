@@ -27,10 +27,13 @@ class OCRConfig:
     
     engine: str = "auto"
     deepseek_api_url: str = "http://10.1.6.52:8006/ocr/pdf"
+    deepseek_image_api_url: str = "http://10.1.6.52:8006/ocr/image"
     tesseract_lang: str = "eng+vie"
     enable_fallback: bool = True
-    timeout: int = 300
+    timeout: int = 1200
     preserve_markdown_structure: bool = True
+    use_hybrid_mode: bool = True
+    min_table_chars: int = 50
     
     @classmethod
     def from_global_args(cls, global_args) -> "OCRConfig":
@@ -47,18 +50,24 @@ class OCRConfig:
         # Load OCR configuration from environment variables via get_env_value
         engine = get_env_value("DEEPSEEK_OCR_ENGINE", "auto")
         deepseek_api_url = get_env_value("DEEPSEEK_API_URL", "http://10.1.6.52:8006/ocr/pdf")
+        deepseek_image_api_url = get_env_value("DEEPSEEK_IMAGE_API_URL", "http://10.1.6.52:8006/ocr/image")
         tesseract_lang = get_env_value("TESSERACT_LANG", "eng+vie")
         enable_fallback = get_env_value("DEEPSEEK_OCR_FALLBACK", True, bool)
-        timeout = get_env_value("DEEPSEEK_OCR_TIMEOUT", 300, int)
+        timeout = get_env_value("DEEPSEEK_OCR_TIMEOUT", 1200, int)
         preserve_markdown_structure = get_env_value("OCR_PRESERVE_MARKDOWN_STRUCTURE", True, bool)
+        use_hybrid_mode = get_env_value("OCR_USE_HYBRID_MODE", True, bool)
+        min_table_chars = get_env_value("OCR_MIN_TABLE_CHARS", 50, int)
         
         config = cls(
             engine=engine,
             deepseek_api_url=deepseek_api_url,
+            deepseek_image_api_url=deepseek_image_api_url,
             tesseract_lang=tesseract_lang,
             enable_fallback=enable_fallback,
             timeout=timeout,
             preserve_markdown_structure=preserve_markdown_structure,
+            use_hybrid_mode=use_hybrid_mode,
+            min_table_chars=min_table_chars,
         )
         
         # Validate configuration
@@ -73,7 +82,7 @@ class OCRConfig:
             ValueError: If configuration is invalid
         """
         # Validate engine value
-        valid_engines = ["auto", "deepseek", "tesseract", "none"]
+        valid_engines = ["auto", "deepseek", "docling", "hybrid", "tesseract", "none"]
         if self.engine not in valid_engines:
             raise ValueError(
                 f"Invalid OCR engine '{self.engine}'. "
@@ -133,7 +142,7 @@ class OCRResult:
     def __post_init__(self):
         """Validate OCRResult after initialization."""
         # Validate engine_used
-        valid_engines = ["deepseek", "tesseract", "none", "pypdf", "docling"]
+        valid_engines = ["deepseek", "tesseract", "none", "pypdf", "docling", "hybrid"]
         if self.engine_used not in valid_engines:
             raise ValueError(
                 f"Invalid engine_used '{self.engine_used}'. "

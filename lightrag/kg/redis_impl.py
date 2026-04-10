@@ -1040,6 +1040,58 @@ class RedisDocStatusStorage(DocStatusStorage):
 
         return counts
 
+    async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of documents in each status across all workspaces"""
+        pattern = f"*_{self.namespace}:*"
+        workspaces_counts = {}
+
+        async with self._get_redis_connection() as redis:
+            try:
+                cursor = 0
+                while True:
+                    cursor, keys = await redis.scan(
+                        cursor, match=pattern, count=1000
+                    )
+                    if keys:
+                        pipe = redis.pipeline()
+                        for key in keys:
+                            pipe.get(key)
+                        values = await pipe.execute()
+
+                        for key, value in zip(keys, values):
+                            if value:
+                                try:
+                                    doc_data = json.loads(value)
+                                    status = doc_data.get("status")
+
+                                    # Extract workspace from key: {workspace}_{namespace}:{id}
+                                    namespace_suffix = f"_{self.namespace}:"
+                                    if namespace_suffix in key:
+                                        ws = key.split(namespace_suffix)[0]
+                                    else:
+                                        # Fallback if pattern doesn't match perfectly
+                                        ws = "unknown"
+
+                                    if ws not in workspaces_counts:
+                                        workspaces_counts[ws] = {"all": 0}
+
+                                    if status:
+                                        workspaces_counts[ws][status] = (
+                                            workspaces_counts[ws].get(status, 0) + 1
+                                        )
+                                        workspaces_counts[ws]["all"] += 1
+                                except json.JSONDecodeError:
+                                    continue
+
+                    if cursor == 0:
+                        break
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Error getting status counts across workspaces: {e}"
+                )
+
+        return workspaces_counts
+
     async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
         """Get document by file path
 

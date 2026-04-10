@@ -1245,5 +1245,45 @@ def create_query_routes(
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+    @router.post(
+        "/query_async",
+        dependencies=[Depends(combined_auth)],
+        summary="Submit an asynchronous query to the graph offline",
+    )
+    async def query_async(http_request: Request, request: QueryRequest):
+        try:
+            _, current_rag = await resolve_request_context(http_request, request.workspace_id)
+            from lightrag.api.celery_tasks import task_execute_query
+            
+            task = task_execute_query.delay(
+                workspace_id=current_rag.workspace, 
+                query_text=request.query, 
+                query_params=request.model_dump()
+            )
+            return {"status": "accepted", "task_id": task.id}
+        except Exception as e:
+            logger.error(f"Error submitting async query: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/query_status/{task_id}",
+        dependencies=[Depends(combined_auth)],
+        summary="Check status of an asynchronous query",
+    )
+    async def query_status(http_request: Request, task_id: str):
+        try:
+            from celery.result import AsyncResult
+            from lightrag.api.celery_app import celery_app
+            
+            res = AsyncResult(task_id, app=celery_app)
+            if res.ready():
+                if res.successful():
+                    return {"status": "completed", "result": res.get()}
+                else:
+                    return {"status": "failed", "error": str(res.result)}
+            return {"status": "processing"}
+        except Exception as e:
+            logger.error(f"Error checking async query status: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
     return router

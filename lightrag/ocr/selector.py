@@ -81,6 +81,16 @@ class OCREngineSelector:
                         logger.warning("Fallback disabled, no OCR engine available")
                         return "none"
             
+            elif self.config.engine == "docling":
+                if self._is_docling_available():
+                    logger.info("Selected Docling extraction engine (explicit configuration)")
+                    return "docling"
+                else:
+                    logger.warning("Requested engine 'docling' not available")
+                    if not self.config.enable_fallback:
+                        logger.warning("Fallback disabled, no extraction engine available")
+                        return "none"
+            
             elif self.config.engine == "tesseract":
                 if self._is_tesseract_available():
                     logger.info("Selected Tesseract OCR engine (explicit configuration)")
@@ -95,17 +105,46 @@ class OCREngineSelector:
                 logger.info("OCR disabled by configuration")
                 return "none"
         
-        # Step 2: Auto-selection with priority: deepseek > tesseract > none
+        # Step 2: Auto-selection with priority: deepseek > docling > tesseract > none
         if self._is_deepseek_available():
             logger.info("Selected DeepSeek OCR engine (auto-selection, priority 1)")
             return "deepseek"
         
+        if self._is_docling_available():
+            logger.info("Selected Docling engine (auto-selection, priority 2)")
+            return "docling"
+            
         if self._is_tesseract_available():
             logger.info("Selected Tesseract OCR engine (auto-selection, fallback)")
             return "tesseract"
         
         logger.warning("No OCR engine available")
         return "none"
+
+    def _is_docling_available(self) -> bool:
+        """Check if Docling is available."""
+        if "docling" in self._availability_cache:
+            return self._availability_cache["docling"]
+        try:
+            import docling
+            self._availability_cache["docling"] = True
+            return True
+        except ImportError:
+            self._availability_cache["docling"] = False
+            return False
+
+    def _is_tesseract_available(self) -> bool:
+        """Check if Tesseract dependencies are available."""
+        if "tesseract" in self._availability_cache:
+            return self._availability_cache["tesseract"]
+        try:
+            import pytesseract
+            # Also check for tesseract binary if possible, but for now just the lib
+            self._availability_cache["tesseract"] = True
+            return True
+        except ImportError:
+            self._availability_cache["tesseract"] = False
+            return False
     
     def _is_deepseek_available(self) -> bool:
         """Check if DeepSeek OCR is available.
@@ -137,33 +176,6 @@ class OCREngineSelector:
         
         return is_available
     
-    def _is_tesseract_available(self) -> bool:
-        """Check if Tesseract OCR is available.
-        
-        Checks if pytesseract and pdf2image libraries are installed.
-        Uses caching to avoid repeated availability checks.
-        
-        Returns:
-            bool: True if Tesseract OCR is available, False otherwise
-        """
-        # Check cache first
-        if "tesseract" in self._availability_cache:
-            return self._availability_cache["tesseract"]
-        
-        # Try to import pytesseract and pdf2image
-        try:
-            import pytesseract  # noqa: F401
-            import pdf2image  # noqa: F401
-            
-            logger.debug("Tesseract OCR available (pytesseract and pdf2image installed)")
-            self._availability_cache["tesseract"] = True
-            return True
-        
-        except ImportError as e:
-            logger.debug(f"Tesseract OCR not available: {e}")
-            self._availability_cache["tesseract"] = False
-            return False
-    
     def get_extractor(self, engine: str):
         """Get extraction function for specified engine.
         
@@ -189,10 +201,6 @@ class OCREngineSelector:
             logger.debug("Returning DeepSeek OCR extractor")
             return DeepSeekOCRExtractor
         
-        elif engine == "tesseract":
-            logger.debug("Returning Tesseract OCR extractor")
-            return self._get_tesseract_extractor()
-        
         elif engine == "none":
             logger.debug("No OCR engine selected")
             return None
@@ -200,58 +208,5 @@ class OCREngineSelector:
         else:
             raise ValueError(
                 f"Unknown OCR engine '{engine}'. "
-                f"Must be one of: 'deepseek', 'tesseract', 'none'"
+                f"Must be one of: 'deepseek', 'none'"
             )
-    
-    def _get_tesseract_extractor(self):
-        """Get Tesseract OCR extraction function.
-        
-        Returns a callable that extracts text from PDF bytes using Tesseract OCR.
-        
-        Returns:
-            callable: Function that accepts file_bytes and returns extracted text
-        """
-        def extract_with_tesseract(file_bytes: bytes) -> str:
-            """Extract text from PDF using Tesseract OCR.
-            
-            Args:
-                file_bytes: PDF file content as bytes
-                
-            Returns:
-                str: Extracted text content
-                
-            Raises:
-                ImportError: If pytesseract or pdf2image not installed
-                Exception: If OCR processing fails
-            """
-            try:
-                import pytesseract
-                from pdf2image import convert_from_bytes
-            except ImportError as e:
-                logger.error(f"Tesseract OCR dependencies not available: {e}")
-                raise ImportError(
-                    "Tesseract OCR requires pytesseract and pdf2image. "
-                    "Install with: pip install pytesseract pdf2image"
-                ) from e
-            
-            logger.info("Processing PDF with Tesseract OCR")
-            
-            # Convert PDF to images
-            images = convert_from_bytes(file_bytes)
-            
-            # Extract text from each page
-            pages_text = []
-            for i, image in enumerate(images):
-                logger.debug(f"Processing page {i + 1}/{len(images)} with Tesseract")
-                text = pytesseract.image_to_string(image, lang=self.config.tesseract_lang)
-                pages_text.append(text)
-            
-            full_text = "\n".join(pages_text)
-            logger.info(
-                f"Tesseract OCR completed: {len(images)} pages, "
-                f"{len(full_text)} characters"
-            )
-            
-            return full_text
-        
-        return extract_with_tesseract

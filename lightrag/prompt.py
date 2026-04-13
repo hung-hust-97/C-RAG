@@ -17,7 +17,11 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
     *   **Entity Details:** For each identified entity, extract the following information:
         *   `entity_name`: The name of the entity. If the entity name is case-insensitive, capitalize the first letter of each significant word (title case). Ensure **consistent naming** across the entire extraction process.
         *   `entity_type`: Categorize the entity using one of the following types: `{entity_types}`. If none of the provided entity types apply, do not add new entity type and classify it as `Other`.
-        *   `entity_description`: Provide a concise yet comprehensive description of the entity's attributes and activities, based *solely* on the information present in the input text.
+        *   `entity_description`: Provide a concise yet comprehensive description (20-100 words) of the entity's attributes and activities, based *solely* on the information present in the input text. Include key facts, roles, and relationships mentioned in the text.
+        *   `entity_disambiguation`: When multiple distinct entities share the same name:
+            *   Add contextual qualifiers to `entity_name` (e.g., "Apple (Company)" vs "Apple (Fruit)")
+            *   OR ensure `entity_description` clearly distinguishes them
+            *   For acronyms with full names, treat them as the same entity and use the most complete form
     *   **Output Format - Entities:** Output a total of 4 fields for each entity, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be the literal string `entity`.
         *   Format: `entity{tuple_delimiter}entity_name{tuple_delimiter}entity_type{tuple_delimiter}entity_description`
 
@@ -92,7 +96,11 @@ Bạn là Chuyên gia Đồ thị Tri thức chịu trách nhiệm trích xuất
     *   **Chi tiết Thực thể:** Đối với mỗi thực thể được xác định, trích xuất các thông tin sau:
         *   `entity_name`: Tên của thực thể. Nếu tên thực thể không phân biệt chữ hoa chữ thường, hãy viết hoa chữ cái đầu tiên của mỗi từ quan trọng (title case). Đảm bảo **đặt tên nhất quán** trong toàn bộ quá trình trích xuất.
         *   `entity_type`: Phân loại thực thể sử dụng một trong các loại sau: `{entity_types}`. Nếu không có loại thực thể nào được cung cấp phù hợp, không thêm loại thực thể mới và phân loại nó là `Other`.
-        *   `entity_description`: Cung cấp mô tả ngắn gọn nhưng toàn diện về các thuộc tính và hoạt động của thực thể, dựa *hoàn toàn* trên thông tin có trong văn bản đầu vào.
+        *   `entity_description`: Cung cấp mô tả ngắn gọn nhưng toàn diện (20-100 từ) về các thuộc tính và hoạt động của thực thể, dựa *hoàn toàn* trên thông tin có trong văn bản đầu vào. Bao gồm các sự kiện chính, vai trò và mối quan hệ được đề cập trong văn bản.
+        *   `entity_disambiguation`: Khi nhiều thực thể riêng biệt có cùng tên:
+            *   Thêm từ phân biệt ngữ cảnh vào `entity_name` (ví dụ: "Apple (Công ty)" vs "Apple (Trái cây)")
+            *   HOẶC đảm bảo `entity_description` phân biệt rõ ràng chúng
+            *   Đối với từ viết tắt có tên đầy đủ, coi chúng là cùng một thực thể và sử dụng dạng đầy đủ nhất
     *   **Định dạng Xuất - Thực thể:** Xuất tổng cộng 4 trường cho mỗi thực thể, được phân tách bởi `{tuple_delimiter}`, trên một dòng duy nhất. Trường đầu tiên *phải* là chuỗi ký tự `entity`.
         *   Định dạng: `entity{tuple_delimiter}entity_name{tuple_delimiter}entity_type{tuple_delimiter}entity_description`
 
@@ -135,7 +143,25 @@ Bạn là Chuyên gia Đồ thị Tri thức chịu trách nhiệm trích xuất
         *   **Ví dụ:** "API Gateway" nên được giữ nguyên thay vì dịch thành "Cổng giao diện lập trình ứng dụng".
         *   **Ví dụ:** "Docker Container" nên được giữ nguyên thay vì dịch thành "Bộ chứa Docker".
 
-8.  **Tín hiệu Hoàn thành:** Xuất chuỗi ký tự `{completion_delimiter}` chỉ sau khi tất cả các thực thể và mối quan hệ, tuân theo tất cả các tiêu chí, đã được trích xuất và xuất hoàn toàn.
+9.  **Xử lý Lỗi OCR & Vấn đề Chất lượng Văn bản:**
+    *   **Lỗi OCR:** Nếu văn bản đầu vào chứa lỗi OCR rõ ràng (ví dụ: "0CR" thay vì "OCR", "l" thay vì "I"), hãy cố gắng suy luận tên thực thể đúng dựa trên ngữ cảnh.
+    *   **Lỗi chính tả:** Đối với lỗi chính tả nhỏ trong tên thực thể, sử dụng chính tả đã sửa trong `entity_name` nhưng ghi chú chính tả gốc trong `entity_description` nếu liên quan.
+    *   **Văn bản Không hoàn chỉnh:** Nếu văn bản bị cắt xén hoặc không hoàn chỉnh, trích xuất thực thể từ thông tin có sẵn mà không phát minh chi tiết thiếu.
+    *   **Ký tự Đặc biệt:** Xử lý ký tự đặc biệt, emoji và vấn đề encoding một cách linh hoạt - trích xuất các thực thể có ý nghĩa trong khi bỏ qua nhiễu.
+    *   **Trường hợp Mơ hồ:** Khi không chắc chắn về cách diễn giải đúng do vấn đề chất lượng văn bản, ưu tiên diễn giải hợp lý nhất theo ngữ cảnh.
+    
+    **Quy tắc Quan trọng cho Xử lý OCR:**
+    
+    *   **A. Quy tắc Ngưỡng Tin cậy:**
+        Nếu văn bản bị lỗi quá nặng dẫn đến nhiều cách hiểu khác nhau có giá trị tương đương, không được tự ý đoán. Hãy đánh dấu thực thể là `[Unknown/Unreadable]` hoặc bỏ qua hoàn toàn để tránh tạo ra thông tin giả. Chỉ trích xuất thực thể khi bạn có độ tin cậy hợp lý về cách diễn giải.
+        
+    *   **B. Quy tắc Giữ nguyên Định dạng Kỹ thuật:**
+        Không "sửa lỗi" các chuỗi ký tự bao gồm chữ và số có dạng số sê-ri, mã định danh, ID, SKU hoặc mã số thuế trừ khi lỗi OCR rõ ràng là lỗi hiển thị (ví dụ: 'S10' thành '510', hoặc 'O' thay vì '0' trong định dạng mã đã biết). Khi không chắc chắn, hãy giữ nguyên định dạng gốc.
+        
+    *   **C. Quy tắc Bảo toàn Thực thể Viết tắt:**
+        Đối với các từ viết tắt chuyên ngành bị lỗi OCR, ưu tiên khôi phục về dạng viết tắt chuẩn trước khi giải nghĩa. Ví dụ, nếu "Al" xuất hiện trong ngữ cảnh kỹ thuật, khôi phục thành "AI" (Artificial Intelligence) thay vì coi đó là tên "Al". Sử dụng manh mối ngữ cảnh để xác định từ viết tắt đúng.
+
+10.  **Tín hiệu Hoàn thành:** Xuất chuỗi ký tự `{completion_delimiter}` chỉ sau khi tất cả các thực thể và mối quan hệ, tuân theo tất cả các tiêu chí, đã được trích xuất và xuất hoàn toàn.
 
 ---Ví dụ---
 {examples}
@@ -300,6 +326,47 @@ relation{tuple_delimiter}Noah Carter{tuple_delimiter}World Athletics Championshi
 {completion_delimiter}
 
 """,
+    """<Entity_types>
+["Person","Organization","Location","Technology","Product","Concept","Identifier"]
+
+<Input Text>
+```
+The c0mp@ny n@me is ###CORRUPTED### and they produce s0ftw@re for %%%UNREADABLE%%% industry. Contact person: J0hn D0e at email: j###@###.com
+```
+
+<Output>
+entity{tuple_delimiter}[Unknown/Unreadable]{tuple_delimiter}organization{tuple_delimiter}The company name is severely corrupted in the source text and cannot be reliably determined. Original text shows "###CORRUPTED###".
+entity{tuple_delimiter}Software{tuple_delimiter}product{tuple_delimiter}Software (mentioned as "s0ftw@re" in text, OCR error corrected) is produced by the unidentified company.
+entity{tuple_delimiter}John Doe{tuple_delimiter}person{tuple_delimiter}John Doe (mentioned as "J0hn D0e" in text, OCR error corrected) is the contact person. Email is corrupted and unreadable.
+relation{tuple_delimiter}[Unknown/Unreadable]{tuple_delimiter}Software{tuple_delimiter}production, manufacturing{tuple_delimiter}The unidentified company produces software products.
+relation{tuple_delimiter}John Doe{tuple_delimiter}[Unknown/Unreadable]{tuple_delimiter}employment, contact person{tuple_delimiter}John Doe is the contact person for the unidentified company.
+{completion_delimiter}
+
+""",
+    """<Entity_types>
+["Person","Organization","Technology","Product","Document","Identifier"]
+
+<Input Text>
+```
+CMC Corporation deployed Al/ML platform using AWS EC2 instances. The system ID is CMC-SYS-2024-001A and uses 0penAl API. Tax ID: 0123456789-001. The Al engineer Nguyen Van B confirmed deployment.
+```
+
+<Output>
+entity{tuple_delimiter}CMC Corporation{tuple_delimiter}organization{tuple_delimiter}CMC Corporation is an organization that deployed an AI/ML platform using AWS infrastructure.
+entity{tuple_delimiter}AI/ML Platform{tuple_delimiter}technology{tuple_delimiter}AI/ML platform (mentioned as "Al/ML" in text, OCR error corrected - "Al" restored to "AI" acronym) is a technology platform deployed by CMC Corporation.
+entity{tuple_delimiter}AWS EC2{tuple_delimiter}technology{tuple_delimiter}AWS EC2 instances are cloud computing resources used by the AI/ML platform.
+entity{tuple_delimiter}CMC-SYS-2024-001A{tuple_delimiter}identifier{tuple_delimiter}CMC-SYS-2024-001A is the system identification code. Format preserved as-is (alphanumeric code, not corrected).
+entity{tuple_delimiter}OpenAI API{tuple_delimiter}technology{tuple_delimiter}OpenAI API (mentioned as "0penAl API" in text, OCR error corrected) is used by the system.
+entity{tuple_delimiter}0123456789-001{tuple_delimiter}identifier{tuple_delimiter}0123456789-001 is the tax identification number. Format preserved as-is (may contain leading zero, not corrected).
+entity{tuple_delimiter}Nguyen Van B{tuple_delimiter}person{tuple_delimiter}Nguyen Van B is an AI engineer (mentioned as "Al engineer" in text, "Al" restored to "AI" acronym) who confirmed the deployment.
+relation{tuple_delimiter}CMC Corporation{tuple_delimiter}AI/ML Platform{tuple_delimiter}deployment, ownership{tuple_delimiter}CMC Corporation deployed the AI/ML platform.
+relation{tuple_delimiter}AI/ML Platform{tuple_delimiter}AWS EC2{tuple_delimiter}infrastructure, cloud hosting{tuple_delimiter}The AI/ML platform runs on AWS EC2 instances.
+relation{tuple_delimiter}AI/ML Platform{tuple_delimiter}OpenAI API{tuple_delimiter}technology integration, API usage{tuple_delimiter}The AI/ML platform uses OpenAI API.
+relation{tuple_delimiter}AI/ML Platform{tuple_delimiter}CMC-SYS-2024-001A{tuple_delimiter}identification, system code{tuple_delimiter}The AI/ML platform is identified by system ID CMC-SYS-2024-001A.
+relation{tuple_delimiter}Nguyen Van B{tuple_delimiter}CMC Corporation{tuple_delimiter}employment, engineering role{tuple_delimiter}Nguyen Van B is an AI engineer at CMC Corporation who confirmed the deployment.
+{completion_delimiter}
+
+""",
 ]
 
 PROMPTS["entity_extraction_examples_vi"] = [
@@ -379,6 +446,47 @@ relation{tuple_delimiter}Giải vô địch Điền kinh Thế giới{tuple_deli
 relation{tuple_delimiter}Noah Carter{tuple_delimiter}Kỷ lục Chạy nước rút 100m{tuple_delimiter}thành tích vận động viên, phá kỷ lục{tuple_delimiter}Noah Carter đã lập kỷ lục chạy nước rút 100m mới tại giải vô địch.
 relation{tuple_delimiter}Noah Carter{tuple_delimiter}Giày đinh Sợi Carbon{tuple_delimiter}thiết bị thể thao, tăng cường hiệu suất{tuple_delimiter}Noah Carter đã sử dụng giày đinh sợi carbon để tăng cường hiệu suất trong cuộc đua.
 relation{tuple_delimiter}Noah Carter{tuple_delimiter}Giải vô địch Điền kinh Thế giới{tuple_delimiter}tham gia vận động viên, cuộc thi{tuple_delimiter}Noah Carter đang thi đấu tại Giải vô địch Điền kinh Thế giới.
+{completion_delimiter}
+
+""",
+    """<Entity_types>
+["Person","Organization","Location","Technology","Product","Concept","Identifier"]
+
+<Input Text>
+```
+Tên c0ng ty là ###BỊ_LỖI### và họ sản xuất ph@n m3m cho ngành %%%KHÔNG_ĐỌC_ĐƯỢC%%%. Người liên hệ: Nguy3n V@n A tại email: ng###@###.vn
+```
+
+<Output>
+entity{tuple_delimiter}[Unknown/Unreadable]{tuple_delimiter}organization{tuple_delimiter}Tên công ty bị lỗi nghiêm trọng trong văn bản nguồn và không thể xác định một cách đáng tin cậy. Văn bản gốc hiển thị "###BỊ_LỖI###".
+entity{tuple_delimiter}Phần mềm{tuple_delimiter}product{tuple_delimiter}Phần mềm (được đề cập là "ph@n m3m" trong văn bản, lỗi OCR đã được sửa) được sản xuất bởi công ty chưa xác định.
+entity{tuple_delimiter}Nguyễn Văn A{tuple_delimiter}person{tuple_delimiter}Nguyễn Văn A (được đề cập là "Nguy3n V@n A" trong văn bản, lỗi OCR đã được sửa) là người liên hệ. Email bị lỗi và không đọc được.
+relation{tuple_delimiter}[Unknown/Unreadable]{tuple_delimiter}Phần mềm{tuple_delimiter}sản xuất, chế tạo{tuple_delimiter}Công ty chưa xác định sản xuất sản phẩm phần mềm.
+relation{tuple_delimiter}Nguyễn Văn A{tuple_delimiter}[Unknown/Unreadable]{tuple_delimiter}làm việc, người liên hệ{tuple_delimiter}Nguyễn Văn A là người liên hệ của công ty chưa xác định.
+{completion_delimiter}
+
+""",
+    """<Entity_types>
+["Person","Organization","Technology","Product","Document","Identifier"]
+
+<Input Text>
+```
+CMC Corporation triển khai nền tảng Al/ML sử dụng AWS EC2. Mã hệ thống là CMC-SYS-2024-001A và dùng 0penAl API. Mã số thuế: 0123456789-001. Kỹ sư Al Nguyễn Văn B xác nhận triển khai.
+```
+
+<Output>
+entity{tuple_delimiter}CMC Corporation{tuple_delimiter}organization{tuple_delimiter}CMC Corporation là tổ chức đã triển khai nền tảng AI/ML sử dụng hạ tầng AWS.
+entity{tuple_delimiter}Nền tảng AI/ML{tuple_delimiter}technology{tuple_delimiter}Nền tảng AI/ML (được đề cập là "Al/ML" trong văn bản, lỗi OCR đã được sửa - "Al" được khôi phục thành từ viết tắt "AI") là nền tảng công nghệ được CMC Corporation triển khai.
+entity{tuple_delimiter}AWS EC2{tuple_delimiter}technology{tuple_delimiter}AWS EC2 là tài nguyên điện toán đám mây được nền tảng AI/ML sử dụng.
+entity{tuple_delimiter}CMC-SYS-2024-001A{tuple_delimiter}identifier{tuple_delimiter}CMC-SYS-2024-001A là mã định danh hệ thống. Định dạng được giữ nguyên (mã chữ số, không sửa).
+entity{tuple_delimiter}OpenAI API{tuple_delimiter}technology{tuple_delimiter}OpenAI API (được đề cập là "0penAl API" trong văn bản, lỗi OCR đã được sửa) được hệ thống sử dụng.
+entity{tuple_delimiter}0123456789-001{tuple_delimiter}identifier{tuple_delimiter}0123456789-001 là mã số thuế. Định dạng được giữ nguyên (có thể chứa số 0 đầu tiên, không sửa).
+entity{tuple_delimiter}Nguyễn Văn B{tuple_delimiter}person{tuple_delimiter}Nguyễn Văn B là kỹ sư AI (được đề cập là "kỹ sư Al" trong văn bản, "Al" được khôi phục thành từ viết tắt "AI") đã xác nhận triển khai.
+relation{tuple_delimiter}CMC Corporation{tuple_delimiter}Nền tảng AI/ML{tuple_delimiter}triển khai, sở hữu{tuple_delimiter}CMC Corporation đã triển khai nền tảng AI/ML.
+relation{tuple_delimiter}Nền tảng AI/ML{tuple_delimiter}AWS EC2{tuple_delimiter}hạ tầng, lưu trữ đám mây{tuple_delimiter}Nền tảng AI/ML chạy trên AWS EC2.
+relation{tuple_delimiter}Nền tảng AI/ML{tuple_delimiter}OpenAI API{tuple_delimiter}tích hợp công nghệ, sử dụng API{tuple_delimiter}Nền tảng AI/ML sử dụng OpenAI API.
+relation{tuple_delimiter}Nền tảng AI/ML{tuple_delimiter}CMC-SYS-2024-001A{tuple_delimiter}định danh, mã hệ thống{tuple_delimiter}Nền tảng AI/ML được xác định bởi mã hệ thống CMC-SYS-2024-001A.
+relation{tuple_delimiter}Nguyễn Văn B{tuple_delimiter}CMC Corporation{tuple_delimiter}làm việc, vai trò kỹ sư{tuple_delimiter}Nguyễn Văn B là kỹ sư AI tại CMC Corporation đã xác nhận triển khai.
 {completion_delimiter}
 
 """,
@@ -853,5 +961,143 @@ Truy vấn: "Vai trò của giáo dục trong việc giảm nghèo là gì?"
   "low_level_keywords": ["Tiếp cận trường học", "Tỷ lệ biết chữ", "Đào tạo nghề", "Bất bình đẳng thu nhập"]
 }
 
+""",
+]
+
+PROMPTS["query_spell_correction"] = """---Role---
+You are an expert spell checker and query normalizer for a Retrieval-Augmented Generation (RAG) system. Your purpose is to correct spelling errors, typos, and OCR artifacts in user queries while preserving the original intent and technical terms.
+
+---Goal---
+Given a user query, correct any spelling errors, typos, or obvious mistakes while:
+1. Preserving the original meaning and intent
+2. Keeping technical terms, acronyms, and proper nouns intact
+3. Maintaining the query language (do not translate)
+4. Handling common OCR errors (0→O, l→I, etc.)
+
+---Instructions & Constraints---
+1. **Output Format**: Return ONLY the corrected query text. Do not include explanations, notes, or any other text.
+
+2. **Correction Guidelines**:
+   - Fix obvious spelling mistakes and typos
+   - Correct common OCR errors in context (e.g., "0CR" → "OCR", "Al" → "AI" in technical context)
+   - Preserve technical terminology, product names, and acronyms
+   - Keep proper nouns (names, places, organizations) in their original form
+   - Do not change the query language
+   - If the query is already correct, return it unchanged
+
+3. **Do NOT Correct**:
+   - Technical codes, IDs, serial numbers (e.g., "CMC-SYS-001A")
+   - Intentional abbreviations (e.g., "pls" for "please" in casual queries)
+   - Domain-specific jargon that may look like typos
+   - Proper nouns even if they seem misspelled
+
+4. **Confidence Rule**:
+   - Only correct when you are confident about the intended word
+   - If multiple interpretations are equally likely, keep the original
+   - For severely corrupted queries, do your best but preserve readable parts
+
+5. **Language Handling**:
+   - Detect the query language and correct within that language
+   - For Vietnamese: Handle tone marks, common typos (ư→u, ơ→o, etc.)
+   - For English: Handle common keyboard typos and OCR errors
+   - For mixed language queries: Correct each part in its respective language
+
+---Examples---
+{examples}
+
+---Real Query---
+Original Query: {query}
+
+Corrected Query:"""
+
+PROMPTS["query_spell_correction_vi"] = """---Vai trò---
+Bạn là chuyên gia kiểm tra chính tả và chuẩn hóa truy vấn cho hệ thống Tạo sinh Tăng cường Truy xuất (RAG). Mục đích của bạn là sửa lỗi chính tả, lỗi gõ và lỗi OCR trong truy vấn của người dùng trong khi vẫn bảo toàn ý định ban đầu và các thuật ngữ kỹ thuật.
+
+---Mục tiêu---
+Với một truy vấn của người dùng, sửa bất kỳ lỗi chính tả, lỗi gõ hoặc lỗi rõ ràng nào trong khi:
+1. Bảo toàn ý nghĩa và ý định ban đầu
+2. Giữ nguyên các thuật ngữ kỹ thuật, từ viết tắt và danh từ riêng
+3. Duy trì ngôn ngữ truy vấn (không dịch)
+4. Xử lý các lỗi OCR phổ biến (0→O, l→I, v.v.)
+
+---Hướng dẫn & Ràng buộc---
+1. **Định dạng Đầu ra**: Chỉ trả về văn bản truy vấn đã được sửa. Không bao gồm giải thích, ghi chú hoặc bất kỳ văn bản nào khác.
+
+2. **Hướng dẫn Sửa chữa**:
+   - Sửa lỗi chính tả và lỗi gõ rõ ràng
+   - Sửa lỗi OCR phổ biến theo ngữ cảnh (ví dụ: "0CR" → "OCR", "Al" → "AI" trong ngữ cảnh kỹ thuật)
+   - Bảo toàn thuật ngữ kỹ thuật, tên sản phẩm và từ viết tắt
+   - Giữ nguyên danh từ riêng (tên, địa điểm, tổ chức) ở dạng gốc
+   - Không thay đổi ngôn ngữ truy vấn
+   - Nếu truy vấn đã đúng, trả về không thay đổi
+
+3. **KHÔNG Sửa**:
+   - Mã kỹ thuật, ID, số sê-ri (ví dụ: "CMC-SYS-001A")
+   - Viết tắt có chủ ý (ví dụ: "k" cho "không" trong truy vấn thông thường)
+   - Thuật ngữ chuyên ngành có thể trông như lỗi gõ
+   - Danh từ riêng ngay cả khi chúng có vẻ sai chính tả
+
+4. **Quy tắc Tin cậy**:
+   - Chỉ sửa khi bạn tự tin về từ dự định
+   - Nếu nhiều cách hiểu có giá trị tương đương, giữ nguyên bản gốc
+   - Đối với truy vấn bị lỗi nghiêm trọng, cố gắng hết sức nhưng bảo toàn các phần có thể đọc được
+
+5. **Xử lý Ngôn ngữ**:
+   - Phát hiện ngôn ngữ truy vấn và sửa trong ngôn ngữ đó
+   - Đối với tiếng Việt: Xử lý dấu thanh, lỗi gõ phổ biến (ư→u, ơ→o, thiếu dấu, v.v.)
+   - Đối với tiếng Anh: Xử lý lỗi gõ bàn phím và lỗi OCR phổ biến
+   - Đối với truy vấn hỗn hợp ngôn ngữ: Sửa từng phần trong ngôn ngữ tương ứng
+
+---Ví dụ---
+{examples}
+
+---Truy vấn Thực---
+Truy vấn Gốc: {query}
+
+Truy vấn Đã sửa:"""
+
+PROMPTS["query_spell_correction_examples"] = [
+    """Example 1:
+Original Query: How does internatinal trade infuence global economc stability?
+Corrected Query: How does international trade influence global economic stability?
+""",
+    """Example 2:
+Original Query: What is the role of Al/ML in moder healthcare?
+Corrected Query: What is the role of AI/ML in modern healthcare?
+""",
+    """Example 3:
+Original Query: Explain Kubernetcs cluster deployment on AWS EC2
+Corrected Query: Explain Kubernetes cluster deployment on AWS EC2
+""",
+    """Example 4:
+Original Query: CMC-SYS-001A system configuraton
+Corrected Query: CMC-SYS-001A system configuration
+""",
+    """Example 5 (Already correct):
+Original Query: What are the benefits of cloud computing?
+Corrected Query: What are the benefits of cloud computing?
+""",
+]
+
+PROMPTS["query_spell_correction_examples_vi"] = [
+    """Ví dụ 1:
+Truy vấn Gốc: Thuong mai quoc te anh huong nhu the nao den su on dinh kinh te toan cau?
+Truy vấn Đã sửa: Thương mại quốc tế ảnh hưởng như thế nào đến sự ổn định kinh tế toàn cầu?
+""",
+    """Ví dụ 2:
+Truy vấn Gốc: Vai tro cua Al/ML trong cham soc suc khoe hien dai la gi?
+Truy vấn Đã sửa: Vai trò của AI/ML trong chăm sóc sức khỏe hiện đại là gì?
+""",
+    """Ví dụ 3:
+Truy vấn Gốc: Giai thich trien khai cum Kubernetcs tren AWS EC2
+Truy vấn Đã sửa: Giải thích triển khai cụm Kubernetes trên AWS EC2
+""",
+    """Ví dụ 4:
+Truy vấn Gốc: Cau hinh he thong CMC-SYS-001A
+Truy vấn Đã sửa: Cấu hình hệ thống CMC-SYS-001A
+""",
+    """Ví dụ 5 (Đã đúng):
+Truy vấn Gốc: Lợi ích của điện toán đám mây là gì?
+Truy vấn Đã sửa: Lợi ích của điện toán đám mây là gì?
 """,
 ]

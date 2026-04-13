@@ -120,7 +120,19 @@ class DeepSeekOCRExtractor:
             
             # Try both 'markdown' and 'text' fields (API may return either)
             text = response_data.get("markdown", "") or response_data.get("text", "")
-            page_count = response_data.get("page_count", 0) or response_data.get("pages", 0)
+            
+            # Extract page_count from response
+            # DeepSeek API may return 'page_count' (int) or 'pages' (list or None)
+            page_count = response_data.get("page_count", 0)
+            if not page_count:
+                pages_field = response_data.get("pages")
+                if isinstance(pages_field, list):
+                    page_count = len(pages_field)
+                elif isinstance(pages_field, int):
+                    page_count = pages_field
+                else:
+                    # pages is None or other type, default to 0
+                    page_count = 0
             
             if not text.strip() or page_count == 0:
                 logger.warning(

@@ -168,6 +168,13 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    enable_spell_correction: bool = True
+    """If True, automatically corrects spelling errors in user queries before processing.
+    Uses LLM to detect and fix typos, OCR errors, and common misspellings while preserving
+    technical terms, proper nouns, and the original query intent.
+    Default is True to improve query quality.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):

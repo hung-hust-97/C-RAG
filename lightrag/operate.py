@@ -3131,6 +3131,56 @@ async def extract_entities(
     return chunk_results
 
 
+async def correct_query_spelling(
+    query: str,
+    llm_func: callable,
+    language: str = "english",
+) -> str:
+    """
+    Correct spelling errors in user query before processing.
+    
+    Args:
+        query: Original user query
+        llm_func: LLM function for spell correction
+        language: Query language (english/vietnamese)
+    
+    Returns:
+        str: Corrected query
+    """
+    if not query or len(query.strip()) < 3:
+        return query
+    
+    # Select appropriate prompt based on language
+    prompt_key = "query_spell_correction" if language.lower() == "english" else "query_spell_correction_vi"
+    examples_key = "query_spell_correction_examples" if language.lower() == "english" else "query_spell_correction_examples_vi"
+    
+    prompt = PROMPTS[prompt_key].format(
+        examples="\n".join(PROMPTS[examples_key]),
+        query=query
+    )
+    
+    try:
+        corrected = await llm_func(
+            prompt,
+            system_prompt="You are a spell checker. Return only the corrected query.",
+            max_tokens=len(query.split()) * 3,  # Allow some expansion
+            temperature=0.1,  # Low temperature for consistency
+        )
+        
+        # Validate correction
+        if corrected and len(corrected.strip()) > 0:
+            if corrected.strip() != query.strip():
+                logger.info(f"[Spell Correction] Original: '{query}' → Corrected: '{corrected.strip()}'")
+            return corrected.strip()
+        else:
+            logger.warning(f"[Spell Correction] Empty result, using original query")
+            return query
+            
+    except Exception as e:
+        logger.error(f"[Spell Correction] Failed: {e}, using original query")
+        return query
+
+
 async def kg_query(
     query: str,
     knowledge_graph_inst: BaseGraphStorage,
@@ -3182,6 +3232,19 @@ async def kg_query(
         use_model_func = global_config["llm_model_func"]
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
+
+    # Spell correction before keyword extraction
+    if query_param.enable_spell_correction:
+        try:
+            from lightrag.language_detector import detect_language
+            detected_lang = detect_language(query)
+            query = await correct_query_spelling(
+                query,
+                llm_func=use_model_func,
+                language=detected_lang
+            )
+        except Exception as e:
+            logger.warning(f"[Spell Correction] Failed to correct query: {e}, using original")
 
     hl_keywords, ll_keywords = await get_keywords_from_query(
         query, query_param, global_config, hashing_kv
@@ -5010,6 +5073,19 @@ async def naive_query(
         use_model_func = global_config["llm_model_func"]
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
+
+    # Spell correction before processing
+    if query_param.enable_spell_correction:
+        try:
+            from lightrag.language_detector import detect_language
+            detected_lang = detect_language(query)
+            query = await correct_query_spelling(
+                query,
+                llm_func=use_model_func,
+                language=detected_lang
+            )
+        except Exception as e:
+            logger.warning(f"[Spell Correction] Failed to correct query: {e}, using original")
 
     tokenizer: Tokenizer = global_config["tokenizer"]
     if not tokenizer:

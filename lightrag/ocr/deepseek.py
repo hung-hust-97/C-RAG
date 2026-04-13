@@ -118,8 +118,9 @@ class DeepSeekOCRExtractor:
             # Parse response to extract text and page_count
             response_data = response.json()
             
-            text = response_data.get("text", "")
-            page_count = response_data.get("page_count", 0)
+            # Try both 'markdown' and 'text' fields (API may return either)
+            text = response_data.get("markdown", "") or response_data.get("text", "")
+            page_count = response_data.get("page_count", 0) or response_data.get("pages", 0)
             
             if not text.strip() or page_count == 0:
                 logger.warning(
@@ -197,7 +198,8 @@ class DeepSeekOCRExtractor:
             # Parse response to extract text
             response_data = response.json()
             
-            text = response_data.get("text", "")
+            # Try both 'markdown' and 'text' fields (API may return either)
+            text = response_data.get("markdown", "") or response_data.get("text", "")
             
             if not text.strip():
                 logger.warning(

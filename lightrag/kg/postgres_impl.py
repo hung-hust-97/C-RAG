@@ -1741,8 +1741,14 @@ class PostgreSQLDB:
 
 
 class ClientManager:
-    _instances: dict[str, Any] = {"db": None, "ref_count": 0}
-    _lock = asyncio.Lock()
+    _instances: dict[int, dict[str, Any]] = {}
+
+    @classmethod
+    def _get_ctx(cls) -> int:
+        try:
+            return id(asyncio.get_running_loop())
+        except RuntimeError:
+            return 0
 
     @staticmethod
     def get_config() -> dict[str, Any]:
@@ -1895,29 +1901,39 @@ class ClientManager:
 
     @classmethod
     async def get_client(cls) -> PostgreSQLDB:
-        async with cls._lock:
-            if cls._instances["db"] is None:
+        ctx = cls._get_ctx()
+        if ctx not in cls._instances:
+            cls._instances[ctx] = {"db": None, "ref_count": 0, "lock": asyncio.Lock()}
+
+        async with cls._instances[ctx]["lock"]:
+            if cls._instances[ctx]["db"] is None:
                 config = ClientManager.get_config()
                 db = PostgreSQLDB(config)
                 await db.initdb()
                 await db.check_tables()
-                cls._instances["db"] = db
-                cls._instances["ref_count"] = 0
-            cls._instances["ref_count"] += 1
-            return cls._instances["db"]
+                cls._instances[ctx]["db"] = db
+                cls._instances[ctx]["ref_count"] = 0
+            cls._instances[ctx]["ref_count"] += 1
+            return cls._instances[ctx]["db"]
 
     @classmethod
     async def release_client(cls, db: PostgreSQLDB):
-        async with cls._lock:
+        ctx = cls._get_ctx()
+        if ctx not in cls._instances:
+            return
+
+        async with cls._instances[ctx]["lock"]:
             if db is not None:
-                if db is cls._instances["db"]:
-                    cls._instances["ref_count"] -= 1
-                    if cls._instances["ref_count"] == 0:
-                        await db.pool.close()
+                if db is cls._instances[ctx]["db"]:
+                    cls._instances[ctx]["ref_count"] -= 1
+                    if cls._instances[ctx]["ref_count"] == 0:
+                        if db.pool:
+                            await db.pool.close()
                         logger.info("Closed PostgreSQL database connection pool")
-                        cls._instances["db"] = None
+                        cls._instances[ctx]["db"] = None
                 else:
-                    await db.pool.close()
+                    if db.pool:
+                        await db.pool.close()
 
 
 @final

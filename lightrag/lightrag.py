@@ -1414,7 +1414,7 @@ class LightRAG:
         # 2. Generate document initial status (without content)
         new_docs: dict[str, Any] = {
             id_: {
-                "status": DocStatus.PENDING,
+                "status": DocStatus.EXTRACTED,  # Changed from PENDING to EXTRACTED (full text extraction done)
                 "content_summary": get_content_summary(content_data["content"]),
                 "content_length": len(content_data["content"]),
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1423,6 +1423,8 @@ class LightRAG:
                     "file_path"
                 ],  # Store file path in document status
                 "track_id": track_id,  # Store track_id in document status
+                "error_msg": None,  # Initialize error fields
+                "error_stage": None,
             }
             for id_, content_data in contents.items()
         }
@@ -1683,17 +1685,17 @@ class LightRAG:
             # Check if document has corresponding content in full_docs (consistency check)
             content_data = await self.full_docs.get_by_id(doc_id)
             if content_data:  # Document passes consistency check
-                # Check if document is in PROCESSING or FAILED status
+                # Check if document is in CHUNKING or FAILED status
                 if hasattr(status_doc, "status") and status_doc.status in [
-                    DocStatus.PROCESSING,
+                    DocStatus.CHUNKING,
                     DocStatus.FAILED,
                 ]:
                     preserved_chunks_list, preserved_chunks_count = (
                         _chunk_fields_from_status_doc(status_doc)
                     )
-                    # Prepare document for status reset to PENDING
+                    # Prepare document for status reset to EXTRACTED
                     docs_to_reset[doc_id] = {
-                        "status": DocStatus.PENDING,
+                        "status": DocStatus.EXTRACTED,
                         "content_summary": status_doc.content_summary,
                         "content_length": status_doc.content_length,
                         "chunks_count": preserved_chunks_count,
@@ -1709,7 +1711,7 @@ class LightRAG:
                     }
 
                     # Update the status in to_process_docs as well
-                    status_doc.status = DocStatus.PENDING
+                    status_doc.status = DocStatus.EXTRACTED
                     reset_count += 1
 
         # Update doc_status storage if there are documents to reset
@@ -1754,16 +1756,18 @@ class LightRAG:
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
-                processing_docs, failed_docs, pending_docs = await asyncio.gather(
+                processing_docs, failed_docs, pending_docs, extracted_docs = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
                     self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                 )
 
                 to_process_docs: dict[str, DocProcessingStatus] = {}
                 to_process_docs.update(processing_docs)
                 to_process_docs.update(failed_docs)
                 to_process_docs.update(pending_docs)
+                to_process_docs.update(extracted_docs)
 
                 if not to_process_docs:
                     logger.info("No documents to process")
@@ -1990,7 +1994,7 @@ class LightRAG:
                                 self.doc_status.upsert(
                                     {
                                         doc_id: {
-                                            "status": DocStatus.PROCESSING,
+                                            "status": DocStatus.CHUNKING,
                                             "chunks_count": len(chunks),
                                             "chunks_list": list(
                                                 chunks.keys()
@@ -2286,16 +2290,18 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
                 # Check for pending documents again
-                processing_docs, failed_docs, pending_docs = await asyncio.gather(
+                processing_docs, failed_docs, pending_docs, extracted_docs = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
                     self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                 )
 
                 to_process_docs = {}
                 to_process_docs.update(processing_docs)
                 to_process_docs.update(failed_docs)
                 to_process_docs.update(pending_docs)
+                to_process_docs.update(extracted_docs)
 
         finally:
             log_message = "Enqueued document processing pipeline stopped"
@@ -3214,17 +3220,17 @@ class LightRAG:
                 doc_status = raw_status
 
             if doc_status != DocStatus.PROCESSED:
-                if doc_status == DocStatus.PENDING:
+                if doc_status == DocStatus.EXTRACTED:
                     warning_msg = (
-                        f"Deleting {doc_id} {file_path}(previous status: PENDING)"
+                        f"Deleting {doc_id} {file_path}(previous status: EXTRACTED)"
                     )
-                elif doc_status == DocStatus.PROCESSING:
+                elif doc_status == DocStatus.CHUNKING:
                     warning_msg = (
-                        f"Deleting {doc_id} {file_path}(previous status: PROCESSING)"
+                        f"Deleting {doc_id} {file_path}(previous status: CHUNKING)"
                     )
-                elif doc_status == DocStatus.PREPROCESSED:
+                elif doc_status == DocStatus.CHUNKED:
                     warning_msg = (
-                        f"Deleting {doc_id} {file_path}(previous status: PREPROCESSED)"
+                        f"Deleting {doc_id} {file_path}(previous status: CHUNKED)"
                     )
                 elif doc_status == DocStatus.FAILED:
                     warning_msg = (

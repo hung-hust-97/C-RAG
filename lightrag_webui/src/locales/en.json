@@ -99,7 +99,7 @@
         "error": "Some files failed to upload"
       },
       "generalError": "Upload Failed\n{{error}}",
-      "fileTypes": "Supported types: TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "Supported types: TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, JPG, JPEG, PNG, WEBP, TIFF, BMP, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
       "fileUploader": {
         "singleFileLimit": "Cannot upload more than 1 file at a time",
         "maxFilesLimit": "Cannot upload more than {{count}} files",
@@ -139,10 +139,14 @@
       "status": {
         "all": "All",
         "completed": "Completed",
+        "chunked": "Chunked",
+        "chunking": "Chunking",
+        "extracted": "Extracted",
+        "extracting": "Extracting",
+        "failed": "Failed",
         "preprocessed": "Preprocessed",
         "processing": "Processing",
-        "pending": "Pending",
-        "failed": "Failed"
+        "pending": "Pending"
       },
       "errors": {
         "loadFailed": "Failed to load documents\n{{error}}",

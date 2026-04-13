@@ -53,8 +53,31 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 7.  **Language & Proper Nouns:**
     *   The entire output (entity names, keywords, and descriptions) must be written in `{language}`.
     *   Proper nouns (e.g., personal names, place names, organization names) should be retained in their original language if a proper, widely accepted translation is not available or would cause ambiguity.
+    *   **Technical Terms and Jargon:** Retain technical terms, technology names, and specialized terminology in English if the source text uses English.
+        *   **Example:** "Kubernetes Cluster" should be kept as-is rather than translated.
+        *   **Example:** "Machine Learning Model" should be kept as-is.
+        *   **Example:** "API Gateway" should be kept as-is.
+        *   **Example:** "Docker Container" should be kept as-is.
 
-8.  **Completion Signal:** Output the literal string `{completion_delimiter}` only after all entities and relationships, following all criteria, have been completely extracted and outputted.
+8.  **Handling OCR Errors & Text Quality Issues:**
+    *   **OCR Errors:** If the input text contains obvious OCR errors (e.g., "0CR" instead of "OCR", "l" instead of "I"), attempt to infer the correct entity name based on context.
+    *   **Typos & Misspellings:** For minor typos in entity names, use the corrected spelling in `entity_name` but note the original spelling in `entity_description` if relevant.
+    *   **Incomplete Text:** If text appears truncated or incomplete, extract entities from available information without inventing missing details.
+    *   **Special Characters:** Handle special characters, emojis, and encoding issues gracefully - extract meaningful entities while ignoring noise.
+    *   **Ambiguous Cases:** When uncertain about the correct interpretation due to text quality issues, prioritize the most contextually reasonable interpretation.
+    
+    **Critical Rules for OCR Handling:**
+    
+    *   **A. Confidence Threshold Rule:**
+        If the text is so corrupted that multiple interpretations are equally likely, do not guess. Mark the entity as `[Unknown/Unreadable]` or skip it entirely to avoid hallucination. Only extract entities when you have reasonable confidence in the interpretation.
+        
+    *   **B. Preserve Technical Format Rule:**
+        Do not "correct" alphanumeric strings that look like serial numbers, codes, IDs, SKUs, or tax identification numbers unless the OCR error is clearly typographical (e.g., 'S10' becoming '510', or 'O' instead of '0' in a known code format). When in doubt, preserve the original format.
+        
+    *   **C. Acronym Restoration Rule:**
+        For domain-specific acronyms affected by OCR errors, prioritize restoring them to their standard abbreviated form before expanding. For example, if "Al" appears in a technical context, restore it to "AI" (Artificial Intelligence) rather than treating it as a name "Al". Use context clues to determine the correct acronym.
+
+9.  **Completion Signal:** Output the literal string `{completion_delimiter}` only after all entities and relationships, following all criteria, have been completely extracted and outputted.
 
 ---Examples---
 {examples}
@@ -718,6 +741,7 @@ Given a user query and its conversation history, your task is to extract two dis
 4. **Concise & Meaningful**: Keywords should be concise words or meaningful phrases. Prioritize multi-word phrases when they represent a single concept.
 5. **Handle Edge Cases**: For queries that are too simple, vague, or nonsensical (e.g., "hello", "ok", "asdfghjkl"), you must return a JSON object with empty lists for both keyword types.
 6. **Language**: All extracted keywords MUST be in {language}. Proper nouns (e.g., personal names, place names, organization names) should be kept in their original language.
+7. **Acronym Extraction**: When the query contains both full terms and acronyms in parentheses (e.g., "Knowledge Management System (KMS)"), extract BOTH as separate keywords.
 
 ---Examples---
 {examples}

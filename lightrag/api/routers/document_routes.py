@@ -276,6 +276,7 @@ class InsertTextRequest(BaseModel):
 
     Attributes:
         text: The text content to be inserted into the RAG system
+        workspace_id: Workspace identifier (required)
         file_source: Source of the text (optional)
     """
 
@@ -283,11 +284,11 @@ class InsertTextRequest(BaseModel):
         min_length=1,
         description="The text to insert",
     )
+    workspace_id: str = Field(
+        description="Workspace identifier for this request (required)"
+    )
     file_source: Optional[str] = Field(
         default=None, min_length=0, description="File Source"
-    )
-    workspace_id: Optional[str] = Field(
-        default=None, description="Workspace identifier for this request"
     )
 
     @field_validator("text", mode="after")
@@ -304,6 +305,7 @@ class InsertTextRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "text": "This is a sample text to be inserted into the RAG system.",
+                "workspace_id": "my-workspace-id",
                 "file_source": "Source of the text (optional)",
             }
         }
@@ -315,6 +317,7 @@ class InsertTextsRequest(BaseModel):
 
     Attributes:
         texts: List of text contents to be inserted into the RAG system
+        workspace_id: Workspace identifier (required)
         file_sources: Sources of the texts (optional)
     """
 
@@ -322,11 +325,11 @@ class InsertTextsRequest(BaseModel):
         min_length=1,
         description="The texts to insert",
     )
+    workspace_id: str = Field(
+        description="Workspace identifier for this request (required)"
+    )
     file_sources: Optional[list[str]] = Field(
         default=None, min_length=0, description="Sources of the texts"
-    )
-    workspace_id: Optional[str] = Field(
-        default=None, description="Workspace identifier for this request"
     )
 
     @field_validator("texts", mode="after")
@@ -351,6 +354,7 @@ class InsertTextsRequest(BaseModel):
                     "This is the first text to be inserted.",
                     "This is the second text to be inserted.",
                 ],
+                "workspace_id": "my-workspace-id",
                 "file_sources": [
                     "First file source (optional)",
                 ],
@@ -579,11 +583,11 @@ class ReembedResponse(BaseModel):
 
 class DocStatusResponse(BaseModel):
     id: str = Field(description="Document identifier")
-    content_summary: str = Field(description="Summary of document content")
-    content_length: int = Field(description="Length of document content in characters")
+    content_summary: Optional[str] = Field(default="", description="Summary of document content")
+    content_length: Optional[int] = Field(default=0, description="Length of document content in characters")
     status: DocStatus = Field(description="Current processing status")
-    created_at: str = Field(description="Creation timestamp (ISO format string)")
-    updated_at: str = Field(description="Last update timestamp (ISO format string)")
+    created_at: Optional[str] = Field(default=None, description="Creation timestamp (ISO format string)")
+    updated_at: Optional[str] = Field(default=None, description="Last update timestamp (ISO format string)")
     workspace_id: str = Field(description="Workspace identifier for this document")
     track_id: Optional[str] = Field(
         default=None, description="Tracking ID for monitoring progress"
@@ -634,19 +638,19 @@ class DocsStatusesResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "statuses": {
-                    "PENDING": [
+                    "EXTRACTED": [
                         {
                             "id": "doc_123",
-                            "content_summary": "Pending document",
+                            "content_summary": "Extracted document",
                             "content_length": 5000,
-                            "status": "pending",
+                            "status": "extracted",
                             "created_at": "2025-03-31T10:00:00",
                             "updated_at": "2025-03-31T10:00:00",
                             "track_id": "upload_20250331_100000_abc123",
                             "chunks_count": None,
                             "error": None,
                             "metadata": None,
-                            "file_path": "pending_doc.pdf",
+                            "file_path": "extracted_doc.pdf",
                         }
                     ],
                     "PREPROCESSED": [
@@ -877,9 +881,9 @@ class PaginatedDocsResponse(BaseModel):
                     "has_prev": False,
                 },
                 "status_counts": {
-                    "PENDING": 10,
-                    "PROCESSING": 5,
-                    "PREPROCESSED": 5,
+                    "EXTRACTED": 10,
+                    "CHUNKING": 5,
+                    "CHUNKED": 5,
                     "PROCESSED": 130,
                     "FAILED": 5,
                 },
@@ -907,9 +911,9 @@ class StatusCountsResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "status_counts": {
-                    "PENDING": 10,
-                    "PROCESSING": 5,
-                    "PREPROCESSED": 5,
+                    "EXTRACTED": 10,
+                    "CHUNKING": 5,
+                    "CHUNKED": 5,
                     "PROCESSED": 130,
                     "FAILED": 5,
                 }
@@ -1003,6 +1007,12 @@ class DocumentManager:
             ".css",  # Cascading Style Sheets
             ".scss",  # Sassy CSS
             ".less",  # LESS CSS
+            ".jpg",   # JPEG Image
+            ".jpeg",  # JPEG Image
+            ".png",   # PNG Image
+            ".webp",  # WebP Image
+            ".tiff",  # TIFF Image
+            ".bmp",   # Bitmap Image
         ),
     ):
         # Store the base input directory and workspace
@@ -1603,10 +1613,6 @@ async def pipeline_enqueue_file(
                     | ".xml"
                     | ".yaml"
                     | ".yml"
-                    | ".rtf"
-                    | ".odt"
-                    | ".epub"
-                    | ".csv"
                     | ".log"
                     | ".conf"
                     | ".ini"
@@ -1629,17 +1635,77 @@ async def pipeline_enqueue_file(
                     | ".css"
                     | ".scss"
                     | ".less"
-                    | ".pdf"
                 ):
+                    # Text-based files: read directly without OCR
+                    try:
+                        content = file.decode('utf-8')
+                        logger.info(f"[File Extraction]Text file read directly: {file_path.name} ({len(content)} chars)")
+                    except UnicodeDecodeError:
+                        # Try other encodings
+                        for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
+                            try:
+                                content = file.decode(encoding)
+                                logger.info(f"[File Extraction]Text file read with {encoding}: {file_path.name} ({len(content)} chars)")
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        else:
+                            error_files = [
+                                {
+                                    "file_path": str(file_path.name),
+                                    "error_description": "[File Extraction]Text file encoding error",
+                                    "original_error": "Failed to decode text file with utf-8, latin-1, cp1252, or iso-8859-1",
+                                    "file_size": file_size,
+                                }
+                            ]
+                            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                            logger.error(f"[File Extraction]Failed to decode text file: {file_path.name}")
+                            return False, track_id
+                    
+                    if not content.strip():
+                        error_files = [
+                            {
+                                "file_path": str(file_path.name),
+                                "error_description": "[File Extraction]Empty text file",
+                                "original_error": "Text file is empty or contains only whitespace",
+                                "file_size": file_size,
+                            }
+                        ]
+                        await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                        logger.warning(f"[File Extraction]Empty text file: {file_path.name}")
+                        return False, track_id
+
+                case (
+                    ".rtf"
+                    | ".odt"
+                    | ".epub"
+                    | ".csv"
+                    | ".pdf"
+                    | ".jpg"
+                    | ".jpeg"
+                    | ".png"
+                    | ".webp"
+                    | ".tiff"
+                    | ".bmp"
+                ):
+                    # Binary files: use OCR/extraction pipeline
                     try:
                         # Create OCR config from global_args
                         ocr_config = OCRConfig.from_global_args(global_args)
                         
+                        # Set engine to deepseek explicitly for images
+                        if ext.lower() in [".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"]:
+                            import copy
+                            img_config = copy.copy(ocr_config)
+                            img_config.engine = "deepseek"
+                            ocr_config = img_config
+
                         # Call process_document_with_ocr() for document extraction (Hybrid/OCR)
                         ocr_result = await process_document_with_ocr(
                             file_bytes=file,
                             password=global_args.pdf_decrypt_password,
-                            ocr_config=ocr_config
+                            ocr_config=ocr_config,
+                            file_extension=ext.lower()
                         )
                         
                         # Log OCR engine used and processing time
@@ -1723,22 +1789,15 @@ async def pipeline_enqueue_file(
 
                 case ".docx":
                     try:
-                        # Try DOCLING first if configured and available
-                        if (
-                            global_args.document_loading_engine == "DOCLING"
-                            and _is_docling_available()
-                        ):
+                        # Try DOCLING first if available, bypassing global_args for better defaults
+                        if _is_docling_available():
                             content = await asyncio.to_thread(
                                 _convert_with_docling, file_path
                             )
                         else:
-                            if (
-                                global_args.document_loading_engine == "DOCLING"
-                                and not _is_docling_available()
-                            ):
-                                logger.warning(
-                                    f"DOCLING engine configured but not available for {file_path.name}. Falling back to python-docx."
-                                )
+                            logger.warning(
+                                f"Docling not available for {file_path.name}. Falling back to python-docx."
+                            )
                             # Use python-docx (non-blocking via to_thread)
                             content = await asyncio.to_thread(_extract_docx, file)
                     except Exception as e:
@@ -1760,22 +1819,15 @@ async def pipeline_enqueue_file(
 
                 case ".pptx":
                     try:
-                        # Try DOCLING first if configured and available
-                        if (
-                            global_args.document_loading_engine == "DOCLING"
-                            and _is_docling_available()
-                        ):
+                        # Try DOCLING first if available, bypassing global_args for better defaults
+                        if _is_docling_available():
                             content = await asyncio.to_thread(
                                 _convert_with_docling, file_path
                             )
                         else:
-                            if (
-                                global_args.document_loading_engine == "DOCLING"
-                                and not _is_docling_available()
-                            ):
-                                logger.warning(
-                                    f"DOCLING engine configured but not available for {file_path.name}. Falling back to python-pptx."
-                                )
+                            logger.warning(
+                                f"Docling not available for {file_path.name}. Falling back to python-pptx."
+                            )
                             # Use python-pptx (non-blocking via to_thread)
                             content = await asyncio.to_thread(_extract_pptx, file)
                     except Exception as e:
@@ -1797,22 +1849,15 @@ async def pipeline_enqueue_file(
 
                 case ".xlsx":
                     try:
-                        # Try DOCLING first if configured and available
-                        if (
-                            global_args.document_loading_engine == "DOCLING"
-                            and _is_docling_available()
-                        ):
+                        # Try DOCLING first if available, bypassing global_args for better defaults
+                        if _is_docling_available():
                             content = await asyncio.to_thread(
                                 _convert_with_docling, file_path
                             )
                         else:
-                            if (
-                                global_args.document_loading_engine == "DOCLING"
-                                and not _is_docling_available()
-                            ):
-                                logger.warning(
-                                    f"DOCLING engine configured but not available for {file_path.name}. Falling back to openpyxl."
-                                )
+                            logger.warning(
+                                f"Docling not available for {file_path.name}. Falling back to openpyxl."
+                            )
                             # Use openpyxl (non-blocking via to_thread)
                             content = await asyncio.to_thread(_extract_xlsx, file)
                     except Exception as e:
@@ -2792,10 +2837,10 @@ def create_document_routes(
             except Exception as e:
                 logger.warning(f"Could not scan doc status for file_path: {e}")
 
-            if found_status in [DocStatus.PENDING, DocStatus.PROCESSING]:
+            if found_status in [DocStatus.EXTRACTED, DocStatus.CHUNKING]:
                 raise HTTPException(
                     status_code=409,
-                    detail="Tài liệu đang được xử lý (Processing/Pending). Vui lòng chờ cho đến khi hoàn thành để xem nội dung."
+                    detail="Tài liệu đang được xử lý (Chunking/Extracted). Vui lòng chờ cho đến khi hoàn thành để xem nội dung."
                 )
 
             if found_doc_id:
@@ -3383,11 +3428,17 @@ def create_document_routes(
             _, current_rag, _ = await resolve_request_context(request, workspace_id)
 
             statuses = (
+                DocStatus.UPLOADING,
+                DocStatus.EXTRACTING,
+                DocStatus.EXTRACTED,
+                DocStatus.CHUNKING,
+                DocStatus.CHUNKED,
+                DocStatus.PROCESSED,
+                DocStatus.FAILED,
+                # Include legacy statuses for backward compatibility
                 DocStatus.PENDING,
                 DocStatus.PROCESSING,
                 DocStatus.PREPROCESSED,
-                DocStatus.PROCESSED,
-                DocStatus.FAILED,
             )
 
             tasks = [current_rag.get_docs_by_status(status) for status in statuses]
@@ -3903,8 +3954,8 @@ def create_document_routes(
                 doc_responses.append(
                     DocStatusResponse(
                         id=doc_id,
-                        content_summary=doc.content_summary,
-                        content_length=doc.content_length,
+                        content_summary=doc.content_summary or "",
+                        content_length=doc.content_length or 0,
                         status=doc.status,
                         created_at=format_datetime(doc.created_at),
                         updated_at=format_datetime(doc.updated_at),
@@ -4058,8 +4109,19 @@ def create_document_routes(
         Get counts of documents by status.
 
         This endpoint retrieves the count of documents in each processing status
-        (PENDING, PROCESSING, PROCESSED, FAILED) for documents in the specified workspace,
-        or all workspaces if no workspace_id is provided.
+        for documents in the specified workspace, or all workspaces if no workspace_id is provided.
+        
+        Status categories:
+        - UPLOADING: File đang được upload (reserved for future use)
+        - EXTRACTING: Đang extract full text (OCR/Docling)
+        - EXTRACTED: Đã extract xong, chờ chunking + KG
+        - CHUNKING: Đang chunking + extract entities
+        - CHUNKED: Đã chunking, chờ multimodal processing
+        - PROCESSED: Hoàn thành tất cả
+        - FAILED: Lỗi ở bất kỳ stage nào
+        
+        Legacy statuses (PENDING, PROCESSING, PREPROCESSED) are automatically
+        migrated to new statuses for backward compatibility.
 
         Returns:
             StatusCountsResponse: A response object containing status counts

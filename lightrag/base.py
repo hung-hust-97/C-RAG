@@ -703,13 +703,26 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
 
 class DocStatus(str, Enum):
-    """Document processing status"""
+    """Document processing status
+    
+    Status flow:
+    UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → CHUNKED → PROCESSED
+                     ↓           ↓          ↓          ↓          ↓
+                  FAILED      FAILED     FAILED     FAILED     FAILED
+    """
 
-    PENDING = "pending"
-    PROCESSING = "processing"
-    PREPROCESSED = "preprocessed"
-    PROCESSED = "processed"
-    FAILED = "failed"
+    UPLOADING = "uploading"           # File đang được upload (chưa dùng, dự phòng)
+    EXTRACTING = "extracting"         # Đang extract full text (OCR/Docling)
+    EXTRACTED = "extracted"           # Đã extract xong, chờ chunking + KG
+    CHUNKING = "chunking"             # Đang chunking + extract entities
+    CHUNKED = "chunked"               # Đã chunking, chờ multimodal processing
+    PROCESSED = "processed"           # Hoàn thành tất cả
+    FAILED = "failed"                 # Lỗi ở bất kỳ stage nào
+    
+    # Legacy statuses for backward compatibility (will be migrated)
+    PENDING = "pending"               # Legacy: mapped to EXTRACTED
+    PROCESSING = "processing"         # Legacy: mapped to CHUNKING
+    PREPROCESSED = "preprocessed"     # Legacy: mapped to CHUNKED
 
 
 @dataclass
@@ -736,6 +749,8 @@ class DocProcessingStatus:
     """List of chunk IDs associated with this document, used for deletion"""
     error_msg: str | None = None
     """Error message if failed"""
+    error_stage: str | None = None
+    """Stage where error occurred: 'extraction', 'chunking', 'entity_extraction', 'graph_building', 'multimodal'"""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional metadata"""
     multimodal_processed: bool | None = field(default=None, repr=False)
@@ -743,20 +758,29 @@ class DocProcessingStatus:
 
     def __post_init__(self):
         """
-        Handle status conversion based on multimodal_processed field.
+        Handle status conversion and legacy status migration.
 
         Business rules:
-        - If multimodal_processed is False and status is PROCESSED,
-          then change status to PREPROCESSED
-        - The multimodal_processed field is kept (with repr=False) for internal use and debugging
+        1. Migrate legacy statuses to new statuses
+        2. Handle multimodal_processed field for backward compatibility
         """
-        # Apply status conversion logic
+        # Migrate legacy statuses to new statuses
+        legacy_migration = {
+            DocStatus.PENDING: DocStatus.EXTRACTED,
+            DocStatus.PROCESSING: DocStatus.CHUNKING,
+            DocStatus.PREPROCESSED: DocStatus.CHUNKED,
+        }
+        
+        if self.status in legacy_migration:
+            self.status = legacy_migration[self.status]
+        
+        # Apply multimodal_processed logic (backward compatibility)
         if self.multimodal_processed is not None:
             if (
                 self.multimodal_processed is False
                 and self.status == DocStatus.PROCESSED
             ):
-                self.status = DocStatus.PREPROCESSED
+                self.status = DocStatus.CHUNKED
 
 
 @dataclass

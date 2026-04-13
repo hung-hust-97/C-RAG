@@ -49,6 +49,11 @@ const getCountValue = (counts: Record<string, number>, ...keys: string[]): numbe
 }
 
 const hasActiveDocumentsStatus = (counts: Record<string, number>): boolean =>
+  getCountValue(counts, 'EXTRACTING', 'extracting') > 0 ||
+  getCountValue(counts, 'EXTRACTED', 'extracted') > 0 ||
+  getCountValue(counts, 'CHUNKING', 'chunking') > 0 ||
+  getCountValue(counts, 'CHUNKED', 'chunked') > 0 ||
+  // Legacy statuses
   getCountValue(counts, 'PROCESSING', 'processing') > 0 ||
   getCountValue(counts, 'PENDING', 'pending') > 0 ||
   getCountValue(counts, 'PREPROCESSED', 'preprocessed') > 0
@@ -469,20 +474,19 @@ export default function DocumentManager() {
   }, [docs]);
 
   const processedCount = getCountValue(statusCounts, 'PROCESSED', 'processed') || documentCounts.processed || 0;
-  const preprocessedCount =
-    getCountValue(statusCounts, 'PREPROCESSED', 'preprocessed') ||
-    documentCounts.preprocessed ||
-    0;
-  const processingCount = getCountValue(statusCounts, 'PROCESSING', 'processing') || documentCounts.processing || 0;
-  const pendingCount = getCountValue(statusCounts, 'PENDING', 'pending') || documentCounts.pending || 0;
+  const chunkedCount = getCountValue(statusCounts, 'CHUNKED', 'chunked', 'PREPROCESSED', 'preprocessed') || documentCounts.preprocessed || documentCounts.chunked || 0;
+  const chunkingCount = getCountValue(statusCounts, 'CHUNKING', 'chunking', 'PROCESSING', 'processing') || documentCounts.processing || documentCounts.chunking || 0;
+  const extractedCount = getCountValue(statusCounts, 'EXTRACTED', 'extracted', 'PENDING', 'pending') || documentCounts.pending || documentCounts.extracted || 0;
+  const extractingCount = getCountValue(statusCounts, 'EXTRACTING', 'extracting') || documentCounts.extracting || 0;
   const failedCount = getCountValue(statusCounts, 'FAILED', 'failed') || documentCounts.failed || 0;
 
   // Store previous status counts
   const prevStatusCounts = useRef({
     processed: 0,
-    preprocessed: 0,
-    processing: 0,
-    pending: 0,
+    chunked: 0,
+    chunking: 0,
+    extracted: 0,
+    extracting: 0,
     failed: 0
   })
 
@@ -1417,14 +1421,17 @@ export default function DocumentManager() {
                               {doc.status === 'processed' && (
                                 <span className="text-green-600">{t('documentPanel.documentManager.status.completed')}</span>
                               )}
-                              {doc.status === 'preprocessed' && (
-                                <span className="text-purple-600">{t('documentPanel.documentManager.status.preprocessed')}</span>
+                              {(doc.status === 'chunked' || doc.status === 'preprocessed') && (
+                                <span className="text-purple-600">{t('documentPanel.documentManager.status.chunked')}</span>
                               )}
-                              {doc.status === 'processing' && (
-                                <span className="text-blue-600">{t('documentPanel.documentManager.status.processing')}</span>
+                              {(doc.status === 'chunking' || doc.status === 'processing') && (
+                                <span className="text-blue-600">{t('documentPanel.documentManager.status.chunking')}</span>
                               )}
-                              {doc.status === 'pending' && (
-                                <span className="text-yellow-600">{t('documentPanel.documentManager.status.pending')}</span>
+                              {(doc.status === 'extracted' || doc.status === 'pending') && (
+                                <span className="text-yellow-600">{t('documentPanel.documentManager.status.extracted')}</span>
+                              )}
+                              {doc.status === 'extracting' && (
+                                <span className="text-orange-600">{t('documentPanel.documentManager.status.extracting')}</span>
                               )}
                               {doc.status === 'failed' && (
                                 <span className="text-red-600">{t('documentPanel.documentManager.status.failed')}</span>
@@ -1447,7 +1454,10 @@ export default function DocumentManager() {
                                     <pre>{formatMetadata(doc.metadata)}</pre>
                                   )}
                                   {doc.error_msg && (
-                                    <pre>{doc.error_msg}</pre>
+                                    <div className="mt-2 text-red-400">
+                                      <div className="font-semibold">Error:</div>
+                                      <pre className="mt-1">{doc.error_msg}</pre>
+                                    </div>
                                   )}
                                 </div>
                               )}

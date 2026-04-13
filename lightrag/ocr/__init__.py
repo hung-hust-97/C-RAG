@@ -50,6 +50,7 @@ async def process_document_with_ocr(
     file_bytes: bytes,
     password: Optional[str] = None,
     ocr_config: Optional[OCRConfig] = None,
+    file_extension: str = ".pdf",
 ) -> OCRResult:
     """Process document with intelligent OCR routing.
     
@@ -109,8 +110,8 @@ async def process_document_with_ocr(
     if engine == "deepseek" or ocr_config.enable_fallback:
         try:
             logger.info("Attempting extraction with DeepSeek OCR")
-            result = await _extract_with_deepseek(file_bytes, ocr_config, start_time)
-            if result.text.strip() and result.page_count > 0:
+            result = await _extract_with_deepseek(file_bytes, ocr_config, start_time, file_extension)
+            if result.text.strip():
                 return result
             logger.warning("DeepSeek OCR returned empty result.")
         except Exception as e:
@@ -181,13 +182,15 @@ async def _extract_with_deepseek(
     file_bytes: bytes,
     config: OCRConfig,
     start_time: float,
+    file_extension: str = ".pdf",
 ) -> OCRResult:
     """Extract text using DeepSeek OCR API.
     
     Args:
-        file_bytes: PDF file content as bytes
+        file_bytes: file content as bytes
         config: OCR configuration
         start_time: Processing start timestamp
+        file_extension: string denoting the extension of the file
         
     Returns:
         OCRResult: Result with extracted text and metadata
@@ -204,17 +207,24 @@ async def _extract_with_deepseek(
     )
     
     try:
-        # Extract text from PDF directly without checking is_available
-        # because the backend queue can cause 5.0s GET timeout incorrectly.
-        result = await extractor.extract_text_from_pdf(file_bytes)
-        
+        # Check if the file is an image
+        if file_extension.lower() in [".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"]:
+            logger.info("Extracting text from image using DeepSeek OCR.")
+            result = await extractor.extract_text_from_image(file_bytes)
+            # Image extraction might not provide page_count, default to 1
+            page_count = result.get("page_count", 1)
+        else:
+            # Assume PDF or document
+            result = await extractor.extract_text_from_pdf(file_bytes)
+            page_count = result["page_count"]
+            
         processing_time = time.time() - start_time
         
         return OCRResult(
             text=result["text"],
             engine_used="deepseek",
             processing_time=processing_time,
-            page_count=result["page_count"],
+            page_count=page_count,
             format="markdown",  # DeepSeek OCR returns markdown
         )
         

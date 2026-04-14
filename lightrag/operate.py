@@ -126,6 +126,41 @@ def chunking_by_token_size(
     chunk_overlap_token_size: int = 100,
     chunk_token_size: int = 1200,
 ) -> list[dict[str, Any]]:
+    """Split content into chunks based on token size with optional character-based splitting.
+
+    This function provides flexible text chunking with two modes:
+    1. Token-based chunking: Splits content by token count with overlap
+    2. Character-based chunking: Splits by a delimiter, then applies token limits
+
+    Args:
+        tokenizer: Tokenizer instance for encoding/decoding text
+        content: Text content to be chunked
+        split_by_character: Optional delimiter to split content before token chunking.
+            If None, uses pure token-based chunking.
+        split_by_character_only: If True, enforces strict character-based splitting
+            without further token-based subdivision. Raises error if any chunk exceeds
+            token limit. If False, oversized chunks are further split by tokens.
+        chunk_overlap_token_size: Number of overlapping tokens between consecutive chunks.
+            Default is 100 tokens.
+        chunk_token_size: Maximum token size for each chunk. Default is 1200 tokens.
+
+    Returns:
+        List of chunk dictionaries, each containing:
+            - tokens (int): Number of tokens in the chunk
+            - content (str): The chunk text content (stripped)
+            - chunk_order_index (int): Sequential index of the chunk
+
+    Raises:
+        ChunkTokenLimitExceededError: When split_by_character_only=True and a
+            character-split chunk exceeds chunk_token_size.
+
+    Examples:
+        >>> tokenizer = TiktokenTokenizer()
+        >>> content = "Long text content..."
+        >>> chunks = chunking_by_token_size(tokenizer, content, chunk_token_size=500)
+        >>> print(chunks[0])
+        {'tokens': 500, 'content': '...', 'chunk_order_index': 0}
+    """
     tokens = tokenizer.encode(content)
     results: list[dict[str, Any]] = []
     if split_by_character:
@@ -326,9 +361,10 @@ async def _summarize_descriptions(
     """Helper function to summarize a list of descriptions using LLM.
 
     Args:
-        entity_or_relation_name: Name of the entity or relation being summarized
-        descriptions: List of description strings to summarize
-        global_config: Global configuration containing LLM function and settings
+        description_type: Type of description being summarized (e.g., "entity", "relation")
+        description_name: Name of the entity or relation being summarized
+        description_list: List of description strings to summarize
+        global_config: Global configuration containing LLM function, tokenizer, and settings
         llm_response_cache: Optional cache for LLM responses
 
     Returns:
@@ -2853,6 +2889,42 @@ async def extract_entities(
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
 ) -> list:
+    """Extract entities and relationships from text chunks using LLM.
+
+    This function processes text chunks to extract knowledge graph entities and relationships
+    using a multi-pass gleaning approach. It supports cancellation, caching, and progress tracking.
+
+    Args:
+        chunks: Dictionary mapping chunk IDs to TextChunkSchema objects containing:
+            - content (str): The text content to process
+            - tokens (int): Token count
+            - full_doc_id (str): Document identifier
+            - chunk_order_index (int): Order in document
+            - file_path (str, optional): Source file path
+        global_config: Configuration dictionary containing:
+            - llm_model_func: LLM function for entity extraction
+            - entity_extract_max_gleaning: Maximum gleaning iterations
+            - tokenizer: Tokenizer instance
+            - addon_params: Additional parameters (language, entity_types)
+        pipeline_status: Optional status dictionary for tracking progress and cancellation
+        pipeline_status_lock: Optional lock for thread-safe status updates
+        llm_response_cache: Optional cache storage for LLM responses
+        text_chunks_storage: Optional storage for persisting chunk extraction results
+
+    Returns:
+        List of tuples containing:
+            - maybe_nodes (list): Extracted entity nodes with metadata
+            - maybe_edges (list): Extracted relationship edges with metadata
+
+    Raises:
+        PipelineCancelledException: If cancellation is requested via pipeline_status
+
+    Notes:
+        - Uses multi-pass gleaning to improve extraction quality
+        - Supports language-specific prompts via PromptManager
+        - Caches LLM responses to avoid redundant API calls
+        - Updates pipeline status with progress information
+    """
     # Check for cancellation at the start of entity extraction
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:

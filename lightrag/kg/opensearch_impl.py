@@ -824,33 +824,55 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
     async def get_all_status_counts(self) -> dict[str, int]:
         """Get document counts for all statuses including an 'all' total."""
         if not self._index_ready:
-            return {}
+            return {"all": 0}
         try:
+            logger.debug(f"[{self.workspace}] Getting status counts from OpenSearch...")
+            
             body = {
                 "size": 0,
                 "aggs": {"status_counts": {"terms": {"field": "status", "size": 100}}},
             }
-            response = await self.client.search(index=self._index_name, body=body)
+            
+            # Add timeout to prevent hanging
+            response = await asyncio.wait_for(
+                self.client.search(index=self._index_name, body=body),
+                timeout=10.0
+            )
+            
             counts = {}
             total = 0
             for bucket in response["aggregations"]["status_counts"]["buckets"]:
                 counts[bucket["key"]] = bucket["doc_count"]
                 total += bucket["doc_count"]
             counts["all"] = total
+            
+            logger.debug(f"[{self.workspace}] Status counts retrieved: {counts}")
             return counts
+            
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.workspace}] Timeout getting status counts after 10s")
+            return {"all": 0}
         except OpenSearchException as e:
             if _is_missing_index_error(e):
                 self._mark_index_missing()
-                return {}
+                return {"all": 0}
             logger.error(f"[{self.workspace}] Error getting all status counts: {e}")
-            return {}
+            return {"all": 0}
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error getting status counts: {str(e)}")
+            return {"all": 0}
 
     async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
         """Get counts of documents in each status across all workspaces"""
         workspaces_counts = {}
         try:
-            # List all indices
-            indices = await self.client.indices.get_alias()
+            logger.debug("Getting status counts across all workspaces from OpenSearch...")
+            
+            # List all indices with timeout
+            indices = await asyncio.wait_for(
+                self.client.indices.get_alias(),
+                timeout=5.0
+            )
 
             # Find indices that represent doc_status for different workspaces
             sanitized_ns = _sanitize_index_name(self.namespace)
@@ -871,7 +893,13 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                                 "status_counts": {"terms": {"field": "status", "size": 100}}
                             },
                         }
-                        response = await self.client.search(index=index_name, body=body)
+                        
+                        # Add timeout for each workspace query
+                        response = await asyncio.wait_for(
+                            self.client.search(index=index_name, body=body),
+                            timeout=5.0
+                        )
+                        
                         counts = {"all": 0}
                         for bucket in response["aggregations"]["status_counts"]["buckets"]:
                             status = bucket["key"]
@@ -881,9 +909,13 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
 
                         if counts["all"] > 0:
                             workspaces_counts[workspace] = counts
-                    except OpenSearchException:
+                    except (OpenSearchException, asyncio.TimeoutError):
                         continue
 
+            logger.debug(f"Status counts across workspaces retrieved: {len(workspaces_counts)} workspaces")
+
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting status counts across workspaces")
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error getting status counts across workspaces in OpenSearch: {e}"

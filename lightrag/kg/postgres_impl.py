@@ -4,6 +4,7 @@ import json
 import os
 import re
 import datetime
+import traceback
 from datetime import timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TypeVar, Union, final
@@ -3805,25 +3806,43 @@ class PGDocStatusStorage(DocStatusStorage):
         Returns:
             Dictionary mapping status names to counts, including 'all' field
         """
-        sql = """
-            SELECT status, COUNT(*) as count
-            FROM LIGHTRAG_DOC_STATUS
-            WHERE workspace=$1
-            GROUP BY status
-        """
-        params = {"workspace": self.workspace}
-        result = await self.db.query(sql, list(params.values()), True)
+        try:
+            logger.debug(f"[{self.workspace}] Getting status counts...")
+            sql = """
+                SELECT status, COUNT(*) as count
+                FROM LIGHTRAG_DOC_STATUS
+                WHERE workspace=$1
+                GROUP BY status
+            """
+            params = {"workspace": self.workspace}
+            
+            # Add timeout to prevent hanging
+            result = await asyncio.wait_for(
+                self.db.query(sql, list(params.values()), True),
+                timeout=10.0  # 10 second timeout
+            )
 
-        counts = {}
-        total_count = 0
-        for row in result:
-            counts[row["status"]] = row["count"]
-            total_count += row["count"]
+            counts = {}
+            total_count = 0
+            for row in result:
+                counts[row["status"]] = row["count"]
+                total_count += row["count"]
 
-        # Add 'all' field with total count
-        counts["all"] = total_count
-
-        return counts
+            # Add 'all' field with total count
+            counts["all"] = total_count
+            
+            logger.debug(f"[{self.workspace}] Status counts retrieved: {counts}")
+            return counts
+            
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.workspace}] Timeout getting status counts after 10s")
+            # Return empty counts on timeout
+            return {"all": 0}
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error getting status counts: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return empty counts on error
+            return {"all": 0}
 
     async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
         """Get counts of documents in each status across all workspaces
@@ -3831,26 +3850,44 @@ class PGDocStatusStorage(DocStatusStorage):
         Returns:
             Dictionary mapping workspace IDs to status count dictionaries
         """
-        sql = """
-            SELECT workspace, status, COUNT(*) as count
-            FROM LIGHTRAG_DOC_STATUS
-            GROUP BY workspace, status
-        """
-        result = await self.db.query(sql, [], True)
+        try:
+            logger.debug("Getting status counts across all workspaces...")
+            sql = """
+                SELECT workspace, status, COUNT(*) as count
+                FROM LIGHTRAG_DOC_STATUS
+                GROUP BY workspace, status
+            """
+            
+            # Add timeout to prevent hanging
+            result = await asyncio.wait_for(
+                self.db.query(sql, [], True),
+                timeout=15.0  # 15 second timeout for cross-workspace query
+            )
 
-        workspaces_counts = {}
-        for row in result:
-            ws = row["workspace"]
-            status = row["status"]
-            count = row["count"]
+            workspaces_counts = {}
+            for row in result:
+                ws = row["workspace"]
+                status = row["status"]
+                count = row["count"]
 
-            if ws not in workspaces_counts:
-                workspaces_counts[ws] = {"all": 0}
+                if ws not in workspaces_counts:
+                    workspaces_counts[ws] = {"all": 0}
 
-            workspaces_counts[ws][status] = count
-            workspaces_counts[ws]["all"] += count
+                workspaces_counts[ws][status] = count
+                workspaces_counts[ws]["all"] += count
 
-        return workspaces_counts
+            logger.debug(f"Status counts across workspaces retrieved: {len(workspaces_counts)} workspaces")
+            return workspaces_counts
+            
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting status counts across workspaces after 15s")
+            # Return empty dict on timeout
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting status counts across workspaces: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return empty dict on error
+            return {}
 
     async def index_done_callback(self) -> None:
         # PG handles persistence automatically

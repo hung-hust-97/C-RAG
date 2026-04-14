@@ -695,27 +695,47 @@ class MongoDocStatusStorage(DocStatusStorage):
         Returns:
             Dictionary mapping status names to counts, including 'all' field
         """
-        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
-        cursor = await self._data.aggregate(pipeline, allowDiskUse=True)
-        result = await cursor.to_list()
+        try:
+            logger.debug(f"[{self.workspace}] Getting status counts from MongoDB...")
+            pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+            
+            # Add timeout to prevent hanging
+            cursor = await asyncio.wait_for(
+                self._data.aggregate(pipeline, allowDiskUse=True),
+                timeout=10.0
+            )
+            result = await asyncio.wait_for(cursor.to_list(), timeout=10.0)
 
-        counts = {}
-        total_count = 0
-        for doc in result:
-            counts[doc["_id"]] = doc["count"]
-            total_count += doc["count"]
+            counts = {}
+            total_count = 0
+            for doc in result:
+                counts[doc["_id"]] = doc["count"]
+                total_count += doc["count"]
 
-        # Add 'all' field with total count
-        counts["all"] = total_count
-
-        return counts
+            # Add 'all' field with total count
+            counts["all"] = total_count
+            
+            logger.debug(f"[{self.workspace}] Status counts retrieved: {counts}")
+            return counts
+            
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.workspace}] Timeout getting status counts after 10s")
+            return {"all": 0}
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error getting status counts: {str(e)}")
+            return {"all": 0}
 
     async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
         """Get counts of documents in each status across all workspaces"""
         workspaces_counts = {}
         try:
-            # List all collections in the database
-            collection_names = await self.db.list_collection_names()
+            logger.debug("Getting status counts across all workspaces from MongoDB...")
+            
+            # Add timeout for listing collections
+            collection_names = await asyncio.wait_for(
+                self.db.list_collection_names(),
+                timeout=5.0
+            )
 
             # Find collections that represent doc_status for different workspaces
             # They follow the pattern: {workspace}_{namespace}
@@ -728,10 +748,14 @@ class MongoDocStatusStorage(DocStatusStorage):
                     workspace = "default"
 
                 if workspace:
-                    # Query this collection for status counts
+                    # Query this collection for status counts with timeout
                     coll = self.db.get_collection(coll_name)
                     pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
-                    cursor = await coll.aggregate(pipeline, allowDiskUse=True)
+                    
+                    cursor = await asyncio.wait_for(
+                        coll.aggregate(pipeline, allowDiskUse=True),
+                        timeout=10.0
+                    )
 
                     counts = {"all": 0}
                     async for doc in cursor:
@@ -744,10 +768,16 @@ class MongoDocStatusStorage(DocStatusStorage):
                     if counts["all"] > 0:
                         workspaces_counts[workspace] = counts
 
+            logger.debug(f"Status counts across workspaces retrieved: {len(workspaces_counts)} workspaces")
+            
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting status counts across workspaces after timeout")
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error getting status counts across workspaces in Mongo: {e}"
             )
+
+        return workspaces_counts
 
         return workspaces_counts
 

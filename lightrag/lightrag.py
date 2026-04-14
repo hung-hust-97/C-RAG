@@ -498,6 +498,35 @@ class LightRAG:
     _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
 
     def __post_init__(self):
+        """Initialize LightRAG instance after dataclass construction.
+
+        This method performs comprehensive initialization including:
+        - Handling deprecated parameters with warnings
+        - Creating working directory if needed
+        - Verifying storage implementations and environment variables
+        - Initializing tokenizer with backward compatibility
+        - Validating configuration parameters
+        - Setting up embedding function with rate limiting
+        - Initializing all storage backends (KV, vector, graph, doc status)
+        - Applying priority wrappers to LLM and embedding functions
+
+        The initialization follows these key steps:
+        1. Deprecation warnings for old parameters
+        2. Storage verification and environment checks
+        3. Tokenizer initialization
+        4. Configuration validation
+        5. Embedding function setup with rate limiting
+        6. Storage class initialization with partial application
+        7. LLM function wrapping with priority queue
+
+        Raises:
+            Various exceptions from storage verification and initialization
+
+        Notes:
+            - Creates new EmbeddingFunc instance to avoid mutating caller's object
+            - Applies priority_limit_async_func_call decorator for concurrency control
+            - Initializes all storage namespaces (chunks, entities, relations, etc.)
+        """
         from lightrag.kg.shared_storage import (
             initialize_share_data,
         )

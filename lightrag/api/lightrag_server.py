@@ -17,6 +17,7 @@ import shutil
 import logging
 import logging.config
 import sys
+import traceback
 import uvicorn
 import pipmaster as pm
 from fastapi.staticfiles import StaticFiles
@@ -590,37 +591,83 @@ def create_app(args):
     async def get_rag_for_workspace(workspace_id: str) -> LightRAG:
         normalized_workspace_id = await resolve_workspace_id_alias(workspace_id)
 
+        # Fast path: return existing instance without lock
         if normalized_workspace_id in rag_instances:
             return rag_instances[normalized_workspace_id]
 
-        async with rag_instances_lock:
-            if normalized_workspace_id in rag_instances:
-                return rag_instances[normalized_workspace_id]
+        # Slow path: acquire lock and initialize
+        logger.info(f"[{normalized_workspace_id}] Acquiring lock for workspace initialization...")
+        
+        try:
+            # Add timeout for lock acquisition to prevent infinite waiting
+            async with asyncio.timeout(30.0):  # 30 second timeout for lock acquisition
+                async with rag_instances_lock:
+                    # Double-check after acquiring lock
+                    if normalized_workspace_id in rag_instances:
+                        logger.info(f"[{normalized_workspace_id}] Instance already created by another request")
+                        return rag_instances[normalized_workspace_id]
 
-            workspace_rag = build_rag_instance(normalized_workspace_id)
+                    logger.info(f"[{normalized_workspace_id}] Building RAG instance...")
+                    workspace_rag = build_rag_instance(normalized_workspace_id)
 
-            try:
-                await workspace_rag.initialize_storages()
-            except RuntimeError as e:
-                if not _is_milvus_dimension_mismatch_error(e):
-                    raise
+                    try:
+                        logger.info(f"[{normalized_workspace_id}] Initializing storages...")
+                        # Add timeout for storage initialization
+                        await asyncio.wait_for(
+                            workspace_rag.initialize_storages(),
+                            timeout=60.0  # 60 second timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"[{normalized_workspace_id}] Timeout initializing storages after 60s")
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"Workspace initialization timeout for {normalized_workspace_id}"
+                        )
+                    except RuntimeError as e:
+                        if not _is_milvus_dimension_mismatch_error(e):
+                            raise
 
-                logger.warning(
-                    f"[{normalized_workspace_id}] Detected Milvus dimension mismatch during workspace initialization: {e}"
-                )
+                        logger.warning(
+                            f"[{normalized_workspace_id}] Detected Milvus dimension mismatch during workspace initialization: {e}"
+                        )
 
-                healed = await _drop_workspace_milvus_collections(normalized_workspace_id)
-                if not healed:
-                    raise
+                        healed = await _drop_workspace_milvus_collections(normalized_workspace_id)
+                        if not healed:
+                            raise
 
-                # Recreate rag instance to ensure clean storage clients after drop.
-                workspace_rag = build_rag_instance(normalized_workspace_id)
-                await workspace_rag.initialize_storages()
+                        # Recreate rag instance to ensure clean storage clients after drop.
+                        workspace_rag = build_rag_instance(normalized_workspace_id)
+                        await asyncio.wait_for(
+                            workspace_rag.initialize_storages(),
+                            timeout=60.0
+                        )
 
-            await workspace_rag.check_and_migrate_data()
-            await maybe_reembed_on_embedding_change(workspace_rag)
-            rag_instances[normalized_workspace_id] = workspace_rag
-            return workspace_rag
+                    logger.info(f"[{normalized_workspace_id}] Checking and migrating data...")
+                    await asyncio.wait_for(
+                        workspace_rag.check_and_migrate_data(),
+                        timeout=120.0  # 2 minute timeout for migration
+                    )
+                    
+                    logger.info(f"[{normalized_workspace_id}] Checking embedding changes...")
+                    await asyncio.wait_for(
+                        maybe_reembed_on_embedding_change(workspace_rag),
+                        timeout=10.0  # 10 second timeout
+                    )
+                    
+                    rag_instances[normalized_workspace_id] = workspace_rag
+                    logger.info(f"[{normalized_workspace_id}] Workspace initialization complete")
+                    return workspace_rag
+                    
+        except asyncio.TimeoutError:
+            logger.error(f"[{normalized_workspace_id}] Timeout acquiring lock or initializing workspace")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Workspace initialization timeout for {normalized_workspace_id}"
+            )
+        except Exception as e:
+            logger.error(f"[{normalized_workspace_id}] Error initializing workspace: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

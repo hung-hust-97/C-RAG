@@ -327,13 +327,28 @@ class JsonDocStatusStorage(DocStatusStorage):
         Returns:
             Dictionary mapping status names to counts, including 'all' field
         """
-        counts = await self.get_status_counts()
+        try:
+            logger.debug(f"[{self.workspace}] Getting status counts from JSON storage...")
+            
+            # Add timeout to prevent hanging
+            counts = await asyncio.wait_for(
+                self.get_status_counts(),
+                timeout=10.0
+            )
 
-        # Add 'all' field with total count
-        total_count = sum(counts.values())
-        counts["all"] = total_count
-
-        return counts
+            # Add 'all' field with total count
+            total_count = sum(counts.values())
+            counts["all"] = total_count
+            
+            logger.debug(f"[{self.workspace}] Status counts retrieved: {counts}")
+            return counts
+            
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.workspace}] Timeout getting status counts after 10s")
+            return {"all": 0}
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error getting status counts: {str(e)}")
+            return {"all": 0}
 
     async def get_status_counts_across_workspaces(self) -> dict[str, dict[str, int]]:
         """Get counts of documents in each status across all workspaces

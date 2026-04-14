@@ -276,6 +276,10 @@ class BaseVectorStorage(StorageNameSpace, ABC):
             top_k: Number of top results to return
             query_embedding: Optional pre-computed embedding for the query.
                            If provided, skips embedding computation for better performance.
+
+        Returns:
+            list[dict[str, Any]]: List of top_k most similar results, each containing
+                vector data and metadata fields
         """
 
     @abstractmethod

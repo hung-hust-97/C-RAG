@@ -97,6 +97,80 @@ def _extract_pdf_ocr(file_bytes: bytes, lang: str = "eng+vie") -> str:
     return "\n".join(pages_text)
 
 
+async def generate_title_from_text(text: str, rag_instance: LightRAG, max_length: int = 100) -> str:
+    """Generate a concise title from text content using LLM.
+
+    Args:
+        text: The text content to generate title from
+        rag_instance: LightRAG instance to use for LLM calls
+        max_length: Maximum length of the generated title
+
+    Returns:
+        str: Generated title, sanitized for use as filename
+    """
+    try:
+        # Truncate text if too long (use first 1000 chars for title generation)
+        text_preview = text[:1000] if len(text) > 1000 else text
+        
+        # Create prompt for title generation
+        system_prompt = "You are a helpful assistant that generates concise, descriptive titles for documents."
+        user_prompt = f"""Based on the following text content, generate a short, descriptive title (maximum {max_length} characters).
+The title should capture the main topic or theme of the text.
+Return ONLY the title text, without quotes or additional formatting.
+
+Text content:
+{text_preview}"""
+
+        # Call LLM to generate title with timeout
+        response = await asyncio.wait_for(
+            rag_instance.llm_model_func(
+                user_prompt,
+                system_prompt=system_prompt,
+                max_tokens=50,
+            ),
+            timeout=10.0  # 10 second timeout for title generation
+        )
+        
+        # Clean up the response
+        title = response.strip().strip('"').strip("'")
+        
+        # Limit length
+        if len(title) > max_length:
+            title = title[:max_length].rsplit(' ', 1)[0]  # Cut at last word boundary
+        
+        # Sanitize for filename use
+        # Remove invalid filename characters
+        invalid_chars = '<>:"/\\|?*\n\r\t'
+        for char in invalid_chars:
+            title = title.replace(char, ' ')
+        
+        # Replace multiple spaces with single space
+        title = ' '.join(title.split())
+        
+        # Ensure title is not empty
+        if not title:
+            title = "Untitled Document"
+        
+        return title
+        
+    except asyncio.TimeoutError:
+        logger.warning("Timeout generating title from text after 10s, using fallback")
+        # Fallback: use first few words of text
+        words = text.split()[:10]
+        fallback_title = ' '.join(words)
+        if len(fallback_title) > max_length:
+            fallback_title = fallback_title[:max_length].rsplit(' ', 1)[0]
+        return fallback_title if fallback_title else "Untitled Document"
+    except Exception as e:
+        logger.warning(f"Failed to generate title from text: {str(e)}")
+        # Fallback: use first few words of text
+        words = text.split()[:10]
+        fallback_title = ' '.join(words)
+        if len(fallback_title) > max_length:
+            fallback_title = fallback_title[:max_length].rsplit(' ', 1)[0]
+        return fallback_title if fallback_title else "Untitled Document"
+
+
 # Function to format datetime to ISO format string with timezone information
 def format_datetime(dt: Any) -> Optional[str]:
     """Format datetime to ISO format string with timezone information
@@ -2914,6 +2988,9 @@ def create_document_routes(
 
         This endpoint allows you to insert text data into the RAG system for later retrieval
         and use in generating responses.
+        
+        If file_source is not provided or is empty, a title will be automatically generated
+        from the text content using LLM and used as the file_source.
 
         Args:
             request (InsertTextRequest): The request body containing the text to be inserted.
@@ -2926,10 +3003,26 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
+            logger.info(f"[insert_text] Starting text insertion, file_source={request.file_source}")
+            
             resolved_workspace_id, current_rag, _ = await resolve_request_context(
                 http_request, request.workspace_id
             )
+            logger.info(f"[insert_text] Resolved workspace: {resolved_workspace_id}")
 
+            # Auto-generate title if file_source is not provided or is unknown_source
+            if not request.file_source or request.file_source == "unknown_source":
+                logger.info("[insert_text] Generating title from text content...")
+                try:
+                    generated_title = await generate_title_from_text(request.text, current_rag)
+                    request.file_source = f"{generated_title}.txt"
+                    logger.info(f"[insert_text] Generated title: {request.file_source}")
+                except Exception as e:
+                    logger.error(f"[insert_text] Error generating title: {str(e)}")
+                    # Use fallback title
+                    request.file_source = "Untitled Document.txt"
+
+            logger.info(f"[insert_text] Checking for existing file_source: {request.file_source}")
             # Check if file_source already exists in doc_status storage
             if (
                 request.file_source
@@ -2944,6 +3037,7 @@ def create_document_routes(
                     status = existing_doc_data.get("status", "unknown")
                     # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
                     existing_track_id = existing_doc_data.get("track_id") or ""
+                    logger.info(f"[insert_text] File source already exists, returning duplicated")
                     return InsertResponse(
                         status="duplicated",
                         message=f"File source '{request.file_source}' already exists in document storage (Status: {status}).",
@@ -2951,6 +3045,7 @@ def create_document_routes(
                         track_id=existing_track_id,
                     )
 
+            logger.info("[insert_text] Checking for duplicate content...")
             # Check if content already exists by computing content hash (doc_id)
             sanitized_text = sanitize_text_for_encoding(request.text)
             content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
@@ -2959,6 +3054,7 @@ def create_document_routes(
                 # Content already exists, return duplicated with existing track_id
                 status = existing_doc.get("status", "unknown")
                 existing_track_id = existing_doc.get("track_id") or ""
+                logger.info(f"[insert_text] Content already exists, returning duplicated")
                 return InsertResponse(
                     status="duplicated",
                     message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
@@ -2968,6 +3064,7 @@ def create_document_routes(
 
             # Generate track_id for text insertion
             track_id = generate_track_id("insert")
+            logger.info(f"[insert_text] Adding background task with track_id: {track_id}")
 
             background_tasks.add_task(
                 pipeline_index_texts,
@@ -2977,9 +3074,10 @@ def create_document_routes(
                 track_id=track_id,
             )
 
+            logger.info(f"[insert_text] Returning success response")
             return InsertResponse(
                 status="success",
-                message="Text successfully received. Processing will continue in background.",
+                message=f"Text successfully received with title '{request.file_source}'. Processing will continue in background.",
                 workspace_id=resolved_workspace_id,
                 track_id=track_id,
             )
@@ -3003,6 +3101,9 @@ def create_document_routes(
 
         This endpoint allows you to insert multiple text entries into the RAG system
         in a single request.
+        
+        If file_sources is not provided or has fewer entries than texts, titles will be
+        automatically generated from the text content using LLM for the missing entries.
 
         Args:
             request (InsertTextsRequest): The request body containing the list of texts.
@@ -3018,6 +3119,22 @@ def create_document_routes(
             resolved_workspace_id, current_rag, _ = await resolve_request_context(
                 http_request, request.workspace_id
             )
+
+            # Auto-generate titles for texts without file_sources
+            if not request.file_sources:
+                request.file_sources = []
+            
+            # Ensure file_sources list has same length as texts
+            while len(request.file_sources) < len(request.texts):
+                request.file_sources.append("unknown_source")
+            
+            # Generate titles for unknown_source entries
+            for i, file_source in enumerate(request.file_sources):
+                if not file_source or file_source == "unknown_source":
+                    logger.info(f"Generating title for text {i+1}/{len(request.texts)}...")
+                    generated_title = await generate_title_from_text(request.texts[i], current_rag)
+                    request.file_sources[i] = f"{generated_title}.txt"
+                    logger.info(f"Generated title: {request.file_sources[i]}")
 
             # Check if any file_sources already exist in doc_status storage
             if request.file_sources:
@@ -3073,7 +3190,7 @@ def create_document_routes(
 
             return InsertResponse(
                 status="success",
-                message="Texts successfully received. Processing will continue in background.",
+                message=f"Texts successfully received with auto-generated titles. Processing will continue in background.",
                 workspace_id=resolved_workspace_id,
                 track_id=track_id,
             )

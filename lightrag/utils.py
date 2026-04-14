@@ -549,10 +549,23 @@ def compute_args_hash(*args: Any) -> str:
 
 
 def compute_mdhash_id(content: str, prefix: str = "") -> str:
-    """
-    Compute a unique ID for a given content string.
+    """Compute a unique MD5-based ID for a given content string.
 
     The ID is a combination of the given prefix and the MD5 hash of the content string.
+    This is commonly used for generating deterministic IDs for entities, chunks, and cache keys.
+
+    Args:
+        content: The content string to hash
+        prefix: Optional prefix to prepend to the hash. Default is empty string.
+
+    Returns:
+        str: The computed ID in format "{prefix}{md5_hash}"
+
+    Examples:
+        >>> compute_mdhash_id("Hello World", "entity-")
+        'entity-b10a8db164e0754105b7a99be72e3fe5'
+        >>> compute_mdhash_id("Hello World")
+        'b10a8db164e0754105b7a99be72e3fe5'
     """
     return prefix + compute_args_hash(content)
 
@@ -1335,7 +1348,24 @@ def pack_user_ass_to_openai_messages(*args: str):
 
 
 def split_string_by_multi_markers(content: str, markers: list[str]) -> list[str]:
-    """Split a string by multiple markers"""
+    """Split a string by multiple delimiter markers.
+
+    This function splits a string using multiple delimiters and returns non-empty
+    stripped results. Useful for parsing structured text with various separators.
+
+    Args:
+        content: The string content to split. If None, treated as empty string.
+        markers: List of delimiter strings to split by. If empty, returns original content.
+
+    Returns:
+        list[str]: List of non-empty stripped string segments
+
+    Examples:
+        >>> split_string_by_multi_markers("a|b;c", ["|", ";"])
+        ['a', 'b', 'c']
+        >>> split_string_by_multi_markers("hello", [])
+        ['hello']
+    """
     if not markers:
         return [content]
     content = content if content is not None else ""
@@ -1353,7 +1383,27 @@ def truncate_list_by_token_size(
     max_token_size: int,
     tokenizer: Tokenizer,
 ) -> list[int]:
-    """Truncate a list of data by token size"""
+    """Truncate a list of items to fit within a maximum token size.
+
+    This function iterates through a list and returns items that fit within the
+    specified token limit. The token count is calculated by applying the key function
+    to each item and encoding the result.
+
+    Args:
+        list_data: List of items to truncate
+        key: Callable that extracts a string from each item for token counting
+        max_token_size: Maximum total token size allowed
+        tokenizer: Tokenizer instance for encoding strings to tokens
+
+    Returns:
+        list: Truncated list containing items that fit within token limit.
+            Returns empty list if max_token_size <= 0.
+
+    Examples:
+        >>> data = [{"text": "hello"}, {"text": "world"}]
+        >>> truncate_list_by_token_size(data, lambda x: x["text"], 10, tokenizer)
+        [{"text": "hello"}, {"text": "world"}]
+    """
     if max_token_size <= 0:
         return []
     tokens = 0
@@ -1365,7 +1415,24 @@ def truncate_list_by_token_size(
 
 
 def cosine_similarity(v1, v2):
-    """Calculate cosine similarity between two vectors"""
+    """Calculate cosine similarity between two vectors.
+
+    Cosine similarity measures the cosine of the angle between two vectors,
+    ranging from -1 (opposite) to 1 (identical direction).
+
+    Args:
+        v1: First vector (numpy array or list)
+        v2: Second vector (numpy array or list)
+
+    Returns:
+        float: Cosine similarity score between -1 and 1
+
+    Examples:
+        >>> v1 = [1, 0, 0]
+        >>> v2 = [1, 0, 0]
+        >>> cosine_similarity(v1, v2)
+        1.0
+    """
     dot_product = np.dot(v1, v2)
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
@@ -1379,10 +1446,26 @@ async def handle_cache(
     mode="default",
     cache_type="unknown",
 ) -> tuple[str, int] | None:
-    """Generic cache handling function with flattened cache keys
+    """Generic cache handling function with flattened cache keys.
+
+    Checks if a cached result exists for the given hash and returns it if found.
+    Uses flattened cache keys in format: {mode}:{cache_type}:{hash}
+
+    Args:
+        hashing_kv: Key-value storage instance for cache lookup
+        args_hash: Hash value computed from function arguments
+        prompt: The prompt string (used for logging)
+        mode: Cache mode identifier (e.g., 'default', 'local', 'global')
+        cache_type: Type of cache (e.g., 'extract', 'query', 'keywords')
 
     Returns:
-        tuple[str, int] | None: (content, create_time) if cache hit, None if cache miss
+        tuple[str, int] | None: (cached_content, create_timestamp) if cache hit,
+            None if cache miss or hashing_kv is None
+
+    Examples:
+        >>> result = await handle_cache(kv_store, "abc123", "prompt", "default", "query")
+        >>> if result:
+        >>>     content, timestamp = result
     """
     if hashing_kv is None:
         return None

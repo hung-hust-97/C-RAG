@@ -3,6 +3,7 @@ __pycache__
 .cache
 
 # Virtual environment directories
+.venv
 *.venv
 
 # Env

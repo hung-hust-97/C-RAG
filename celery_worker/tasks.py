@@ -1,10 +1,6 @@
 """
 Celery tasks for C-RAG document ingestion pipeline.
 
-DEPRECATION WARNING: This module is deprecated and will be removed in a future version.
-Please use celery_worker.tasks instead:
-  from celery_worker.tasks import task_extract_and_enqueue, task_chunk_and_graph, task_execute_query
-
 Architecture:
   task_extract_and_enqueue  --> OCR / Markdown extraction for a single file
   task_chunk_and_graph      --> Chunking + Entity/Relation extraction (graph build)
@@ -14,18 +10,56 @@ Architecture:
 import asyncio
 import logging
 import os
-import warnings
 from pathlib import Path
 
-from lightrag.api.celery_app import celery_app
-
-warnings.warn(
-    "lightrag.api.celery_tasks is deprecated. Use celery_worker.tasks instead.",
-    DeprecationWarning,
-    stacklevel=2
-)
+from celery_worker.app import celery_app
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Worker initialization hook - Reset locks after fork
+# ---------------------------------------------------------------------------
+
+def _reset_locks_after_fork():
+    """
+    Reset asyncio locks after Celery fork to prevent 'bound to different event loop' errors.
+    
+    When Celery uses prefork mode, child processes inherit locks from parent process.
+    These locks are bound to the parent's event loop and cannot be used in child processes.
+    This function clears the lock caches so new locks will be created in the child's event loop.
+    """
+    try:
+        # Import the keyed lock manager
+        from lightrag.kg import shared_storage
+        
+        # Reset the keyed lock manager's async lock caches
+        if hasattr(shared_storage, '_keyed_lock_manager') and shared_storage._keyed_lock_manager is not None:
+            manager = shared_storage._keyed_lock_manager
+            # Clear async lock caches
+            if hasattr(manager, '_async_lock'):
+                manager._async_lock.clear()
+            if hasattr(manager, '_async_lock_count'):
+                manager._async_lock_count.clear()
+            if hasattr(manager, '_async_lock_cleanup_data'):
+                manager._async_lock_cleanup_data.clear()
+            logger.debug("[Celery] Reset asyncio locks after fork")
+    except Exception as e:
+        logger.warning(f"[Celery] Failed to reset locks after fork: {e}")
+
+
+# Register worker process init signal
+from celery.signals import worker_process_init
+
+@worker_process_init.connect
+def init_worker_process(**kwargs):
+    """
+    Called when a new worker process is forked.
+    Reset all asyncio locks to prevent event loop binding issues.
+    """
+    logger.info("[Celery] Worker process initialized, resetting locks...")
+    _reset_locks_after_fork()
+
 
 # ---------------------------------------------------------------------------
 # LightRAG instance factory for Celery workers
@@ -36,6 +70,9 @@ _rag_cache: dict[str, tuple[object, int]] = {}
 
 def _run_async(coro):
     """Run an async coroutine from a synchronous Celery task."""
+    # Reset locks after fork to prevent event loop binding issues
+    _reset_locks_after_fork()
+    
     try:
         # Check if there is an existing running loop
         loop = asyncio.get_running_loop()

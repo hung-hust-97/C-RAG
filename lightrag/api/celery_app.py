@@ -2,8 +2,18 @@ import os
 import asyncio
 from celery import Celery
 import logging
+import warnings
 
 logger = logging.getLogger(__name__)
+
+# DEPRECATION WARNING: This module is deprecated and will be removed in a future version.
+# Please use celery_worker.app instead:
+#   from celery_worker.app import celery_app
+warnings.warn(
+    "lightrag.api.celery_app is deprecated. Use celery_worker.app instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 # Config from environment variables
 CELERY_BROKER_URL = os.environ.get("EMBEDDING_CELERY_BROKER_URL", "redis://localhost:6379/0")

@@ -3733,10 +3733,10 @@ class PGDocStatusStorage(DocStatusStorage):
         # Build WHERE clause with parameterized query
         if status_filter is not None:
             param_count += 1
-            where_clause = "WHERE workspace=$1 AND status=$2"
+            where_clause = "WHERE workspace=$1 AND status=$2 AND id NOT LIKE 'track-%'"
             params["status"] = status_filter.value
         else:
-            where_clause = "WHERE workspace=$1"
+            where_clause = "WHERE workspace=$1 AND id NOT LIKE 'track-%'"
 
         # Build ORDER BY clause using validated whitelist values
         order_clause = f"ORDER BY {sort_field} {sort_direction.upper()}"
@@ -3811,7 +3811,7 @@ class PGDocStatusStorage(DocStatusStorage):
             sql = """
                 SELECT status, COUNT(*) as count
                 FROM LIGHTRAG_DOC_STATUS
-                WHERE workspace=$1
+                WHERE workspace=$1 AND id NOT LIKE 'track-%'
                 GROUP BY status
             """
             params = {"workspace": self.workspace}
@@ -3855,6 +3855,7 @@ class PGDocStatusStorage(DocStatusStorage):
             sql = """
                 SELECT workspace, status, COUNT(*) as count
                 FROM LIGHTRAG_DOC_STATUS
+                WHERE id NOT LIKE 'track-%'
                 GROUP BY workspace, status
             """
             
@@ -4043,6 +4044,81 @@ class PGDocStatusStorage(DocStatusStorage):
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    # Track status management methods
+    async def upsert_track_status(self, track_id: str, status: str, metadata: dict = None) -> None:
+        """Upsert track status using a special doc_id format: track-{track_id}"""
+        track_doc_id = f"track-{track_id}"
+        await self.upsert({
+            track_doc_id: {
+                "status": status,
+                "content_summary": "",  # Empty for track documents
+                "content_length": 0,
+                "created_at": datetime.datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.datetime.now(timezone.utc).isoformat(),
+                "file_path": "",
+                "track_id": track_id,
+                "metadata": metadata or {"is_track_summary": True},
+            }
+        })
+
+    async def get_track_status(self, track_id: str) -> dict | None:
+        """Get track status by track_id"""
+        track_doc_id = f"track-{track_id}"
+        return await self.get_by_id(track_doc_id)
+
+    async def get_status_counts_by_track(self) -> dict[str, int]:
+        """Get counts of tracks in each status (not documents)"""
+        sql = """SELECT status, COUNT(DISTINCT track_id) as count
+                 FROM LIGHTRAG_DOC_STATUS
+                 WHERE workspace=$1 AND track_id IS NOT NULL AND id LIKE 'track-%'
+                 GROUP BY status"""
+        params = {"workspace": self.workspace}
+        result = await self.db.query(sql, list(params.values()), True)
+        counts = {}
+        for doc in result:
+            counts[doc["status"]] = doc["count"]
+        return counts
+
+    async def get_status_counts_by_track_across_workspaces(self) -> dict[str, dict[str, int]]:
+        """Get counts of tracks in each status across all workspaces"""
+        try:
+            logger.debug("Getting track status counts across all workspaces...")
+            sql = """
+                SELECT workspace, status, COUNT(*) as count
+                FROM LIGHTRAG_DOC_STATUS
+                WHERE id LIKE 'track-%'
+                GROUP BY workspace, status
+            """
+            
+            # Add timeout to prevent hanging
+            result = await asyncio.wait_for(
+                self.db.query(sql, [], True),
+                timeout=15.0  # 15 second timeout for cross-workspace query
+            )
+
+            workspaces_counts = {}
+            for row in result:
+                ws = row["workspace"]
+                status = row["status"]
+                count = row["count"]
+
+                if ws not in workspaces_counts:
+                    workspaces_counts[ws] = {"all": 0}
+
+                workspaces_counts[ws][status] = count
+                workspaces_counts[ws]["all"] += count
+
+            logger.debug(f"Track status counts across workspaces retrieved: {len(workspaces_counts)} workspaces")
+            return workspaces_counts
+            
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting track status counts across workspaces after 15s")
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting track status counts across workspaces: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {}
 
 
 class PGGraphQueryException(Exception):
@@ -5720,6 +5796,21 @@ TABLES = {
 	               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	               CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
 	              )"""
+    },
+    "LIGHTRAG_TRACK_STATUS": {
+        "ddl": """CREATE TABLE LIGHTRAG_TRACK_STATUS (
+                   workspace varchar(255) NOT NULL,
+                   track_id varchar(255) NOT NULL,
+                   status varchar(64) NULL,
+                   file_count int4 DEFAULT 0,
+                   processed_count int4 DEFAULT 0,
+                   failed_count int4 DEFAULT 0,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                   metadata JSONB NULL DEFAULT '{}'::jsonb,
+                   error_msg TEXT NULL,
+                   CONSTRAINT LIGHTRAG_TRACK_STATUS_PK PRIMARY KEY (workspace, track_id)
+                  )"""
     },
     "LIGHTRAG_FULL_ENTITIES": {
         "ddl": """CREATE TABLE LIGHTRAG_FULL_ENTITIES (

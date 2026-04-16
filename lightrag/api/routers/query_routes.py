@@ -1251,9 +1251,21 @@ def create_query_routes(
         summary="Submit an asynchronous query to the graph offline",
     )
     async def query_async(http_request: Request, request: QueryRequest):
+        # Check if Celery is available
+        try:
+            from celery_worker.tasks import task_execute_query
+            celery_available = True
+        except ImportError:
+            celery_available = False
+        
+        if not celery_available:
+            raise HTTPException(
+                status_code=503,
+                detail="Async query endpoint unavailable: Celery worker module not installed or configured"
+            )
+        
         try:
             _, current_rag = await resolve_request_context(http_request, request.workspace_id)
-            from lightrag.api.celery_tasks import task_execute_query
             
             task = task_execute_query.delay(
                 workspace_id=current_rag.workspace, 
@@ -1271,10 +1283,21 @@ def create_query_routes(
         summary="Check status of an asynchronous query",
     )
     async def query_status(http_request: Request, task_id: str):
+        # Check if Celery is available
         try:
             from celery.result import AsyncResult
-            from lightrag.api.celery_app import celery_app
-            
+            from celery_worker.app import celery_app
+            celery_available = True
+        except ImportError:
+            celery_available = False
+        
+        if not celery_available:
+            raise HTTPException(
+                status_code=503,
+                detail="Query status endpoint unavailable: Celery worker module not installed or configured"
+            )
+        
+        try:
             res = AsyncResult(task_id, app=celery_app)
             if res.ready():
                 if res.successful():

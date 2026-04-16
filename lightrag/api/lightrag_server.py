@@ -59,21 +59,34 @@ from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.reembed import reembed_workspace_vectors
 
-from .celery_app import celery_app
+# Import logger first for use in Celery import handling
+from lightrag.utils import logger, set_verbose_debug
+
+# Try to import Celery worker module with graceful degradation
+try:
+    from celery_worker.app import celery_app
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+    celery_app = None
+    logger.warning("Celery worker module not available, async processing disabled")
 
 def monkeypatch_apipeline_process_enqueue_documents(self, reprocess_failed=False):
     """
     Monkeypatch for LightRAG.apipeline_process_enqueue_documents to use Celery.
     """
-    celery_app.send_task(
-        "lightrag.api.lightrag_server.apipeline_process_enqueue_documents_task",
-        args=[self.workspace, reprocess_failed]
-    )
-    return True
+    if CELERY_AVAILABLE and celery_app is not None:
+        celery_app.send_task(
+            "lightrag.api.lightrag_server.apipeline_process_enqueue_documents_task",
+            args=[self.workspace, reprocess_failed]
+        )
+        return True
+    else:
+        logger.warning("Celery not available, skipping apipeline_process_enqueue_documents")
+        return False
 
 LightRAG.apipeline_process_enqueue_documents = monkeypatch_apipeline_process_enqueue_documents
 
-from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
     get_namespace_data,
     get_default_workspace,

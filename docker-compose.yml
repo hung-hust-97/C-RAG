@@ -1,14 +1,22 @@
 services:
+  # PostgreSQL database - stores structured metadata and relational data
+  # Used by: lightrag API and celery_worker for document metadata and workspace info
   postgres:
     image: postgres:17-bullseye
     restart: unless-stopped
+    # Set PostgreSQL server max_connections (default: 100)
+    # Formula: max_connections >= (num_workers × pool_size) + (api_servers × pool_size) + buffer
+    # Example: (2 workers × 50) + (1 API × 50) + 50 buffer = 200 connections
+    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=256MB"]
     environment:
+      # Database credentials - customize via .env file
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DATABASE:-crag}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./data/volumes/postgres:/var/lib/postgresql/data
     healthcheck:
+      # Verifies PostgreSQL is ready to accept connections
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
@@ -16,95 +24,123 @@ services:
     ports:
       - "${POSTGRES_PORT_EXPOSE:-5432}:5432"
 
+  # Neo4j graph database - stores knowledge graph relationships
+  # Used by: lightrag API and celery_worker for graph-based RAG operations
   neo4j:
     image: neo4j:5.26.0
     restart: unless-stopped
     environment:
+      # Authentication format: username/password
       NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/Cmcati2026}
+      # Memory configuration for graph operations
       NEO4J_dbms_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-1g}
       NEO4J_dbms_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2g}
       NEO4J_dbms_memory_pagecache_size: ${NEO4J_PAGECACHE:-1g}
     ports:
-      - "${NEO4J_HTTP_PORT:-7474}:7474"
-      - "${NEO4J_BOLT_PORT:-7687}:7687"
+      - "${NEO4J_HTTP_PORT:-7474}:7474"  # Web UI
+      - "${NEO4J_BOLT_PORT:-7687}:7687"  # Bolt protocol for queries
     volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
+      - ./data/volumes/neo4j/data:/data
+      - ./data/volumes/neo4j/logs:/logs
 
+  # etcd - distributed key-value store for Milvus coordination
+  # Required by: milvus for metadata storage and service discovery
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
     environment:
+      # Auto-compaction prevents unbounded growth of revision history
       ETCD_AUTO_COMPACTION_MODE: revision
       ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      # Backend storage quota (4GB)
       ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      # Snapshot frequency for persistence
       ETCD_SNAPSHOT_COUNT: "50000"
     command: >-
       etcd -advertise-client-urls=http://etcd:2379
       -listen-client-urls http://0.0.0.0:2379
       --data-dir /etcd
     volumes:
-      - etcd_data:/etcd
+      - ./data/volumes/etcd:/etcd
     healthcheck:
+      # Verifies etcd cluster health
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # MinIO - S3-compatible object storage for Milvus
+  # Required by: milvus for storing vector index files and logs
   minio:
     image: minio/minio:RELEASE.2025-02-28T09-55-16Z
     restart: unless-stopped
     environment:
+      # MinIO admin credentials - customize via .env file
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
-      - "${MINIO_API_PORT:-19000}:9000"
-      - "${MINIO_CONSOLE_PORT:-19001}:9001"
+      - "${MINIO_API_PORT:-19000}:9000"      # S3 API endpoint
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"  # Web console UI
     command: server /data --console-address ":9001"
     volumes:
-      - minio_data:/data
+      - ./data/volumes/minio:/data
     healthcheck:
+      # Verifies MinIO API is responding
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 3
 
+  # Milvus - vector database for embedding storage and similarity search
+  # Used by: lightrag API and celery_worker for vector-based retrieval
+  # Depends on: etcd (coordination) and minio (object storage)
   milvus:
     image: milvusdb/milvus:v2.5.11
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     environment:
+      # Connection to etcd for metadata coordination
       ETCD_ENDPOINTS: etcd:2379
+      # Connection to MinIO for vector index storage
       MINIO_ADDRESS: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
-      - milvus_data:/var/lib/milvus
+      - ./data/volumes/milvus:/var/lib/milvus
     ports:
-      - "${MILVUS_PORT:-19531}:19530"
-      - "${MILVUS_HEALTH_PORT:-19091}:9091"
+      - "${MILVUS_PORT:-19531}:19530"        # gRPC API
+      - "${MILVUS_HEALTH_PORT:-19091}:9091"  # Metrics endpoint
     depends_on:
       etcd:
-        condition: service_healthy
+        condition: service_healthy  # Wait for etcd to be ready
       minio:
-        condition: service_healthy
+        condition: service_healthy  # Wait for MinIO to be ready
 
+  # Attu - web UI for Milvus database management
+  # Provides visual interface for browsing collections and vector data
   attu:
     image: zilliz/attu:v2.6.4
     restart: unless-stopped
     environment:
+      # Points to Milvus service for database operations
       MILVUS_URL: milvus:19530
     ports:
       - "${ATTU_PORT:-3010}:3000"
     depends_on:
       - milvus
 
+  # Redis - message broker and result backend for Celery
+  # Used by: lightrag API (task enqueueing) and celery_worker (task processing)
+  # Stores: task queues, task results, and task state
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes"]  # Enable persistence
     volumes:
-      - redis_data:/data
+      - ./data/volumes/redis:/data
 
+  # LightRAG API - FastAPI server providing REST endpoints
+  # Handles: document upload, query processing, workspace management
+  # Communicates with: postgres, neo4j, milvus (storage), redis (task enqueueing)
   lightrag:
     image: ghcr.io/hkuds/lightrag:latest
     build:
@@ -114,90 +150,137 @@ services:
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
     volumes:
-      - ./data/rag_storage:/app/data/rag_storage
-      - ./data/inputs:/app/data/inputs
-      - ./data/logs:/app/data/logs
+      # Shared volumes with celery_worker for file access
+      - ./data/rag_storage:/app/data/rag_storage  # RAG working directory
+      - ./data/inputs:/app/data/inputs            # Document uploads
+      - ./data/logs:/app/data/logs                # Application logs
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
       - ./lightrag:/app/lightrag
       - ./scripts:/app/scripts
+      - ./celery_worker:/app/celery_worker        # Celery worker module for task enqueueing
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      # Document processing engine selection
       DOCUMENT_LOADING_ENGINE: "DOCLING"
+      # File system paths
       WORKING_DIR: "/app/data/rag_storage"
       INPUT_DIR: "/app/data/inputs"
+      # Server binding configuration
       HOST: "0.0.0.0"
       PORT: "9621"
+      # Celery configuration - enables async task processing
       EMBEDDING_USE_CELERY: ${EMBEDDING_USE_CELERY:-false}
       EMBEDDING_CELERY_BROKER_URL: ${EMBEDDING_CELERY_BROKER_URL:-redis://redis:6379/0}
       EMBEDDING_CELERY_RESULT_BACKEND: ${EMBEDDING_CELERY_RESULT_BACKEND:-redis://redis:6379/1}
       EMBEDDING_CELERY_QUEUE: ${EMBEDDING_CELERY_QUEUE:-embedding}
       EMBEDDING_CELERY_RESULT_TIMEOUT: ${EMBEDDING_CELERY_RESULT_TIMEOUT:-300}
+      # Embedding client configuration
       EMBEDDING_CLIENT_MAX_CONCURRENCY: ${EMBEDDING_CLIENT_MAX_CONCURRENCY:-2}
       EMBEDDING_HTTP_TIMEOUT: ${EMBEDDING_HTTP_TIMEOUT:-120}
       EMBEDDING_WORKER_EXECUTION_TIMEOUT: ${EMBEDDING_WORKER_EXECUTION_TIMEOUT:-240}
+      # Logging configuration
       LIGHTRAG_LOG_DIR: ${LIGHTRAG_LOG_DIR:-/app/data/logs}
       LIGHTRAG_LOG_LEVEL: ${LIGHTRAG_LOG_LEVEL:-INFO}
       LIGHTRAG_ERROR_LOG_LEVEL: ${LIGHTRAG_ERROR_LOG_LEVEL:-ERROR}
+      # Storage backend connections - shared with celery_worker
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       MILVUS_URI: ${MILVUS_URI:-http://milvus:19530}
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_healthy  # Wait for database to be ready
       milvus:
-        condition: service_started
+        condition: service_started  # Wait for vector DB to start
       neo4j:
-        condition: service_started
+        condition: service_started  # Wait for graph DB to start
       redis:
-        condition: service_started
+        condition: service_started  # Wait for message broker to start
+    healthcheck:
+      # Verifies FastAPI server is responding to requests
+      test: ["CMD", "curl", "-f", "http://localhost:9621/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  celery_worker:
-    image: ghcr.io/hkuds/lightrag:latest
+  # UI - Nginx-based frontend serving React application
+  # Serves: static UI files from /webui/
+  # Proxies: /api/*, /docs, /redoc, /openapi.json to lightrag service
+  # Depends on: lightrag API for backend functionality
+  ui:
     build:
-      context: .
+      context: ./lightrag_webui
       dockerfile: Dockerfile
     restart: unless-stopped
-    entrypoint: ["celery"]
-    command: ["-A", "lightrag.api.celery_app", "worker", "-l", "info", "--pool=prefork", "--concurrency=${CELERY_CONCURRENCY:-2}"]
+    ports:
+      - "${UI_PORT:-8080}:80"
+    environment:
+      # Backend API URL for Nginx proxy configuration
+      VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://lightrag:9621}
+    depends_on:
+      lightrag:
+        condition: service_healthy  # Wait for API to be ready before starting
+    healthcheck:
+      # Verifies Nginx is serving UI content
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/webui/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker - background task processor for document ingestion
+  # Processes: document extraction, chunking, embedding, and graph construction
+  # Communicates with: redis (task queue), postgres, neo4j, milvus (storage)
+  # Shares: volumes and storage configuration with lightrag API
+  celery_worker:
+    build:
+      context: .
+      dockerfile: celery_worker/Dockerfile
+    restart: unless-stopped
     volumes:
-      - ./data/rag_storage:/app/data/rag_storage
-      - ./data/inputs:/app/data/inputs
-      - ./data/logs:/app/data/logs
+      # Shared volumes with lightrag API for file access
+      - ./data/rag_storage:/app/data/rag_storage  # RAG working directory
+      - ./data/inputs:/app/data/inputs            # Document uploads
+      - ./data/logs:/app/data/logs                # Application logs
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
-      - ./lightrag:/app/lightrag
-      - ./scripts:/app/scripts
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
+      # Document processing engine selection
       DOCUMENT_LOADING_ENGINE: "DOCLING"
+      # File system paths - must match lightrag API paths
       WORKING_DIR: "/app/data/rag_storage"
       INPUT_DIR: "/app/data/inputs"
+      # Celery broker and backend configuration
       EMBEDDING_CELERY_BROKER_URL: ${EMBEDDING_CELERY_BROKER_URL:-redis://redis:6379/0}
       EMBEDDING_CELERY_RESULT_BACKEND: ${EMBEDDING_CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      # Worker concurrency - number of parallel task processes
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-2}
+      # Logging configuration
       LIGHTRAG_LOG_DIR: ${LIGHTRAG_LOG_DIR:-/app/data/logs}
+      # Storage backend connections - must match lightrag API configuration
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       MILVUS_URI: ${MILVUS_URI:-http://milvus:19530}
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_healthy  # Wait for database to be ready
       milvus:
-        condition: service_started
+        condition: service_started  # Wait for vector DB to start
       neo4j:
-        condition: service_started
+        condition: service_started  # Wait for graph DB to start
       redis:
-        condition: service_started
+        condition: service_started  # Wait for message broker to start
+    healthcheck:
+      # Verifies worker can connect to broker and process tasks
+      # Uses hostname variable to check specific worker instance
+      test: ["CMD-SHELL", "celery -A celery_worker.app inspect ping -d celery@$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s  # Allow extra time for worker initialization
 
-volumes:
-  postgres_data:
-  etcd_data:
-  minio_data:
-  milvus_data:
-  neo4j_data:
-  neo4j_logs:
-  redis_data:
+# All data is now stored in local bind mounts under ./data/volumes/
+# This makes data easier to access, backup, and manage
+# No named volumes needed anymore

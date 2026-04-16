@@ -183,6 +183,108 @@ docker compose up
 
 > Historical versions of LightRAG docker images can be found here: [LightRAG Docker Images]( https://github.com/HKUDS/LightRAG/pkgs/container/lightrag)
 
+## Architecture
+
+LightRAG uses a three-container architecture for optimal scalability and resource management:
+
+```
+┌──────────────────┐
+│  UI Container    │  Port 8080 (default)
+│  (Nginx)         │
+│                  │
+│  Static Files    │
+│  Proxy /api/* ───┼──┐
+└──────────────────┘  │
+                      │
+┌─────────────────────┼──────────────┐
+│  API Container      ↓              │  Port 9621
+│  (FastAPI)                         │
+│                                    │
+│  REST API Endpoints                │
+│  Task Enqueueing                   │
+└────────────────────────────────────┘
+                      │
+                      ↓ Redis
+┌────────────────────────────────────┐
+│  Celery Worker Container           │
+│                                    │
+│  Background Processing             │
+│  Document Ingestion                │
+│  Entity Extraction                 │
+└────────────────────────────────────┘
+```
+
+### Container Services
+
+**UI Container** (`ui`)
+- Nginx-based static file server
+- Serves React application at `/webui/`
+- Proxies API requests to backend
+- Default port: 8080 (configurable via `UI_PORT`)
+
+**API Container** (`lightrag`)
+- FastAPI server handling REST API requests
+- Manages document uploads and queries
+- Enqueues background tasks to Celery
+- Default port: 9621 (configurable via `PORT`)
+
+**Celery Worker Container** (`celery_worker`)
+- Processes background tasks asynchronously
+- Handles document ingestion pipeline
+- Performs entity and relationship extraction
+- Configurable concurrency via `CELERY_CONCURRENCY`
+
+### Deployment with Docker Compose
+
+The complete stack includes supporting services:
+- **PostgreSQL**: Relational data storage
+- **Neo4j**: Graph database for knowledge graph
+- **Milvus**: Vector database for embeddings
+- **Redis**: Message broker for Celery tasks
+- **Etcd & MinIO**: Milvus dependencies
+
+Start all services:
+```bash
+docker compose up -d
+```
+
+Access the application:
+- **Web UI**: http://localhost:8080/webui/
+- **API Documentation**: http://localhost:9621/docs
+- **Health Check**: http://localhost:9621/health
+
+### Scaling Services
+
+Scale individual services independently based on workload:
+
+```bash
+# Scale UI for high traffic
+docker compose up -d --scale ui=3
+
+# Scale Celery workers for document processing
+docker compose up -d --scale celery_worker=5
+
+# Scale both simultaneously
+docker compose up -d --scale ui=3 --scale celery_worker=5
+```
+
+**Scaling Recommendations:**
+- **UI**: Scale based on concurrent user connections
+- **API**: Single instance sufficient for most workloads (stateless design)
+- **Celery Workers**: Scale based on document ingestion rate and processing time
+
+**Environment Variables for Scaling:**
+- `UI_PORT`: Host port for UI container (default: 8080)
+- `PORT`: Host port for API container (default: 9621)
+- `CELERY_CONCURRENCY`: Worker processes per container (default: 2)
+- `EMBEDDING_USE_CELERY`: Enable async processing (default: false)
+
+For production deployments, consider:
+- Using external load balancers for UI scaling
+- Configuring Redis persistence for task reliability
+- Monitoring Celery queue depth for auto-scaling decisions
+- Setting resource limits in docker-compose.yml
+
 ### Create .env File With Setup Tool
 
 Instead of editing `env.example` by hand, use the interactive setup wizard to generate a configured `.env` and, when needed, `docker-compose.final.yml`:

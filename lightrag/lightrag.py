@@ -2019,6 +2019,19 @@ class LightRAG:
 
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
+                            
+                            # Update track status to CHUNKING
+                            if status_doc.track_id:
+                                try:
+                                    await self.doc_status.upsert_track_status(
+                                        track_id=status_doc.track_id,
+                                        status=DocStatus.CHUNKING,
+                                        metadata={"file_name": file_path}
+                                    )
+                                    logger.debug(f"[Track] Set CHUNKING status for track_id: {status_doc.track_id}")
+                                except Exception as e:
+                                    logger.warning(f"[Track] Failed to set CHUNKING status: {e}")
+                            
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
                                     {
@@ -2198,6 +2211,18 @@ class LightRAG:
                                         }
                                     }
                                 )
+                                
+                                # Update track status to PROCESSED
+                                if status_doc.track_id:
+                                    try:
+                                        await self.doc_status.upsert_track_status(
+                                            track_id=status_doc.track_id,
+                                            status=DocStatus.PROCESSED,
+                                            metadata={"file_name": file_path}
+                                        )
+                                        logger.debug(f"[Track] Set PROCESSED status for track_id: {status_doc.track_id}")
+                                    except Exception as e:
+                                        logger.warning(f"[Track] Failed to set PROCESSED status: {e}")
 
                                 # Call _insert_done after processing each file
                                 await self._insert_done()

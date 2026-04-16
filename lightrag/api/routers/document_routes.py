@@ -4,6 +4,7 @@ This module contains all document-related routes for the LightRAG API.
 
 import asyncio
 import base64
+import os
 import textwrap
 from functools import lru_cache
 from lightrag.utils import logger, get_pinyin_sort_key
@@ -1617,6 +1618,20 @@ async def pipeline_enqueue_file(
     if track_id is None:
         track_id = generate_track_id("unknown")
 
+    # Set track status to EXTRACTING
+    try:
+        await rag.doc_status.upsert_track_status(
+            track_id=track_id,
+            status=DocStatus.EXTRACTING,
+            metadata={"file_name": file_path.name}
+        )
+        logger.info(f"[Track] Set EXTRACTING status for track_id: {track_id}")
+    except Exception as e:
+        logger.warning(f"[Track] Failed to set EXTRACTING status: {e}")
+
+    # Initialize extracting_doc_id for tracking
+    extracting_doc_id = None
+
     try:
         content = ""
         ext = file_path.suffix.lower()
@@ -2007,6 +2022,25 @@ async def pipeline_enqueue_file(
                 logger.info(
                     f"Successfully extracted and enqueued file: {file_path.name}"
                 )
+                
+                # Update track status to EXTRACTED
+                try:
+                    await rag.doc_status.upsert_track_status(
+                        track_id=track_id,
+                        status=DocStatus.EXTRACTED,
+                        metadata={"file_name": file_path.name}
+                    )
+                    logger.info(f"[Track] Set EXTRACTED status for track_id: {track_id}")
+                except Exception as e:
+                    logger.warning(f"[Track] Failed to set EXTRACTED status: {e}")
+                
+                # Delete extracting_doc_id after content-based doc_id is created
+                if extracting_doc_id:
+                    try:
+                        await rag.doc_status.delete([extracting_doc_id])
+                        logger.debug(f"[Extraction] Deleted EXTRACTING doc_id: {extracting_doc_id}")
+                    except Exception as e:
+                        logger.warning(f"[Extraction] Failed to delete EXTRACTING doc_id: {e}")
 
                 # Move file to __enqueued__ directory after enqueuing
                 try:
@@ -2093,11 +2127,30 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = No
         file_path: Path to the saved file
         track_id: Optional tracking ID
     """
+    # Check if Celery is available and enabled
+    use_celery = (
+        os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
+    )
+    
     try:
-        from lightrag.api.celery_tasks import task_extract_and_enqueue
-        workspace_id = rag.workspace
-        task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
-
+        from celery_worker.tasks import task_extract_and_enqueue
+        celery_available = True
+    except ImportError:
+        celery_available = False
+        logger.warning("Celery worker module not available, falling back to synchronous processing")
+    
+    if celery_available and use_celery:
+        try:
+            workspace_id = rag.workspace
+            task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
+            return
+        except Exception as e:
+            logger.error(f"Error enqueueing file via Celery {file_path.name}, falling back to synchronous: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    # Fallback to synchronous processing
+    try:
+        await pipeline_enqueue_file(rag, file_path, track_id)
     except Exception as e:
         logger.error(f"Error indexing file {file_path.name}: {str(e)}")
         logger.error(traceback.format_exc())
@@ -2115,18 +2168,45 @@ async def pipeline_index_files(
     """
     if not file_paths:
         return
+    
+    # Check if Celery is available and enabled
+    use_celery = (
+        os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
+    )
+    
     try:
-        from lightrag.api.celery_tasks import task_extract_and_enqueue
-        workspace_id = rag.workspace
-        
+        from celery_worker.tasks import task_extract_and_enqueue
+        celery_available = True
+    except ImportError:
+        celery_available = False
+        logger.warning("Celery worker module not available, falling back to synchronous processing")
+    
+    if celery_available and use_celery:
+        try:
+            workspace_id = rag.workspace
+            
+            # Use get_pinyin_sort_key for Chinese pinyin sorting
+            sorted_file_paths = sorted(
+                file_paths, key=lambda p: get_pinyin_sort_key(str(p))
+            )
+
+            # Process files sequentially with track_id through Celery
+            for file_path in sorted_file_paths:
+                task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
+            return
+        except Exception as e:
+            logger.error(f"Error enqueueing files via Celery, falling back to synchronous: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    # Fallback to synchronous processing
+    try:
         # Use get_pinyin_sort_key for Chinese pinyin sorting
         sorted_file_paths = sorted(
             file_paths, key=lambda p: get_pinyin_sort_key(str(p))
         )
-
-        # Process files sequentially with track_id through Celery
+        
         for file_path in sorted_file_paths:
-            task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
+            await pipeline_enqueue_file(rag, file_path, track_id)
     except Exception as e:
         logger.error(f"Error indexing files: {str(e)}")
         logger.error(traceback.format_exc())
@@ -2164,8 +2244,29 @@ async def pipeline_index_texts(
     await rag.apipeline_enqueue_documents(
         input=texts, file_paths=normalized_file_sources, track_id=track_id
     )
-    from lightrag.api.celery_tasks import task_chunk_and_graph
-    task_chunk_and_graph.delay(rag.workspace)
+    
+    # Check if Celery is available and enabled
+    use_celery = (
+        os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
+    )
+    
+    try:
+        from celery_worker.tasks import task_chunk_and_graph
+        celery_available = True
+    except ImportError:
+        celery_available = False
+        logger.warning("Celery worker module not available, processing will continue synchronously")
+    
+    if celery_available and use_celery:
+        try:
+            task_chunk_and_graph.delay(rag.workspace)
+        except Exception as e:
+            logger.error(f"Error enqueueing chunk_and_graph task via Celery: {str(e)}")
+            logger.error(traceback.format_exc())
+    else:
+        # When Celery is not available, the processing happens synchronously
+        # through apipeline_enqueue_documents above
+        logger.info("Processing texts synchronously (Celery not available or disabled)")
 
 
 async def run_scanning_process(
@@ -2520,15 +2621,17 @@ def create_document_routes(
         )
 
         # Use canonical workspace_id resolved by backend context.
-        resolved_workspace_id = current_rag.workspace
+        # If it's empty string (default workspace), return "default" for API responses
+        backend_workspace = current_rag.workspace
+        resolved_workspace_id = backend_workspace if backend_workspace else "default"
 
         if get_doc_manager_for_workspace is not None:
-            current_doc_manager = get_doc_manager_for_workspace(resolved_workspace_id)
-        elif resolved_workspace_id == doc_manager.workspace:
+            current_doc_manager = get_doc_manager_for_workspace(backend_workspace)
+        elif backend_workspace == doc_manager.workspace:
             current_doc_manager = doc_manager
         else:
             current_doc_manager = DocumentManager(
-                str(doc_manager.base_input_dir), workspace=resolved_workspace_id
+                str(doc_manager.base_input_dir), workspace=backend_workspace
             )
 
         return resolved_workspace_id, current_rag, current_doc_manager
@@ -3597,6 +3700,12 @@ def create_document_routes(
 
                 if current_index < len(docs_list):
                     doc_id, doc_status = docs_list[current_index]
+                    
+                    # Skip track documents (id starts with "track-")
+                    if doc_id.startswith("track-"):
+                        status_indices[current_status_idx] += 1
+                        current_status_idx = (current_status_idx + 1) % len(status_documents)
+                        continue
 
                     if status not in response.statuses:
                         response.statuses[status] = []
@@ -3978,8 +4087,14 @@ def create_document_routes(
             # Convert to response format
             documents = []
             status_summary = {}
+            track_status = None
 
             for doc_id, doc_status in docs_by_track_id.items():
+                # Skip track summary document (id starts with "track-")
+                if doc_id.startswith("track-"):
+                    track_status = doc_status.status
+                    continue
+                    
                 documents.append(
                     DocStatusResponse(
                         id=doc_id,
@@ -4001,6 +4116,10 @@ def create_document_routes(
                 # Handle both DocStatus enum and string cases for robust deserialization
                 status_key = str(doc_status.status)
                 status_summary[status_key] = status_summary.get(status_key, 0) + 1
+            
+            # If no documents but have track_status, use track_status for summary
+            if not documents and track_status:
+                status_summary[str(track_status)] = 1
 
             return TrackStatusResponse(
                 track_id=track_id,
@@ -4220,13 +4339,19 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def get_document_status_counts(
-        request: Request, workspace_id: Optional[str] = None
+        request: Request, 
+        workspace_id: Optional[str] = None,
+        count_by: str = "track"  # "track" or "document"
     ) -> StatusCountsResponse:
         """
-        Get counts of documents by status.
+        Get counts by status.
 
-        This endpoint retrieves the count of documents in each processing status
-        for documents in the specified workspace, or all workspaces if no workspace_id is provided.
+        This endpoint retrieves the count in each processing status.
+        Can count by track_id (default) or by document_id.
+        
+        Args:
+            count_by: "track" to count by track_id (each upload = 1 count),
+                     "document" to count by doc_id (each document = 1 count)
         
         Status categories:
         - UPLOADING: File đang được upload (reserved for future use)
@@ -4236,9 +4361,6 @@ def create_document_routes(
         - CHUNKED: Đã chunking, chờ multimodal processing
         - PROCESSED: Hoàn thành tất cả
         - FAILED: Lỗi ở bất kỳ stage nào
-        
-        Legacy statuses (PENDING, PROCESSING, PREPROCESSED) are automatically
-        migrated to new statuses for backward compatibility.
 
         Returns:
             StatusCountsResponse: A response object containing status counts
@@ -4257,20 +4379,32 @@ def create_document_routes(
             )
 
             workspaces_stats = None
-            if not is_explicit:
-                # Get aggregated stats across all workspaces
-                workspaces_stats = (
-                    await current_rag.doc_status.get_status_counts_across_workspaces()
-                )
-
-                # Combine all stats for the top-level status_counts
-                total_counts = {"all": 0}
-                for ws_stats in workspaces_stats.values():
-                    for status, count in ws_stats.items():
-                        total_counts[status] = total_counts.get(status, 0) + count
-                status_counts = total_counts
+            
+            # Use track-based or document-based counting
+            if count_by == "track":
+                if not is_explicit:
+                    # Get track counts across all workspaces
+                    workspaces_stats = await current_rag.doc_status.get_status_counts_by_track_across_workspaces()
+                    total_counts = {"all": 0}
+                    for ws_stats in workspaces_stats.values():
+                        for status, count in ws_stats.items():
+                            total_counts[status] = total_counts.get(status, 0) + count
+                    status_counts = total_counts
+                else:
+                    status_counts = await current_rag.doc_status.get_status_counts_by_track()
             else:
-                status_counts = await current_rag.doc_status.get_all_status_counts()
+                # Original document-based counting
+                if not is_explicit:
+                    workspaces_stats = (
+                        await current_rag.doc_status.get_status_counts_across_workspaces()
+                    )
+                    total_counts = {"all": 0}
+                    for ws_stats in workspaces_stats.values():
+                        for status, count in ws_stats.items():
+                            total_counts[status] = total_counts.get(status, 0) + count
+                    status_counts = total_counts
+                else:
+                    status_counts = await current_rag.doc_status.get_all_status_counts()
 
             return StatusCountsResponse(
                 workspace_id=resolved_workspace_id,

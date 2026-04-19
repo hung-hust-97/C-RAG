@@ -1441,11 +1441,17 @@ class LightRAG:
             }
 
         # 2. Generate document initial status (without content)
-        new_docs: dict[str, Any] = {
-            id_: {
+        new_docs: dict[str, Any] = {}
+        for id_, content_data in contents.items():
+            # Compute content_hash for each document
+            from lightrag.utils import compute_content_hash
+            content_hash = compute_content_hash(content_data["content"], self.workspace)
+            
+            new_docs[id_] = {
                 "status": DocStatus.EXTRACTED,  # Changed from PENDING to EXTRACTED (full text extraction done)
                 "content_summary": get_content_summary(content_data["content"]),
                 "content_length": len(content_data["content"]),
+                "content_hash": content_hash,  # Store content_hash
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "file_path": content_data[
@@ -1455,8 +1461,6 @@ class LightRAG:
                 "error_msg": None,  # Initialize error fields
                 "error_stage": None,
             }
-            for id_, content_data in contents.items()
-        }
 
         # 3. Filter out already processed documents
         # Get docs ids
@@ -1625,18 +1629,162 @@ class LightRAG:
         successful_deletions = 0
 
         # Check each document's data consistency
+        docs_to_reextract = []  # Documents that need re-extraction
+        docs_to_reset_extracted = []  # EXTRACTING documents with content that should be EXTRACTED
+        
         for doc_id, status_doc in to_process_docs.items():
             # Check if corresponding content exists in full_docs
             content_data = await self.full_docs.get_by_id(doc_id)
+            
+            # Handle EXTRACTING documents (stuck in extraction phase)
+            if hasattr(status_doc, "status") and status_doc.status == DocStatus.EXTRACTING:
+                if content_data:
+                    # Content exists - extraction was successful, move to EXTRACTED
+                    docs_to_reset_extracted.append({
+                        "doc_id": doc_id,
+                        "status_doc": status_doc,
+                        "content_data": content_data
+                    })
+                    logger.info(f"[Reprocess] EXTRACTING document {doc_id} has content, will reset to EXTRACTED")
+                else:
+                    # No content - extraction failed or incomplete
+                    file_path = getattr(status_doc, "file_path", None)
+                    if reprocess_failed and file_path:
+                        # Try to re-extract
+                        from pathlib import Path
+                        input_dir = Path(self.working_dir) / "inputs"
+                        enqueued_dir = input_dir / "__enqueued__"
+                        
+                        file_exists = False
+                        actual_file_path = None
+                        
+                        if (input_dir / file_path).exists():
+                            file_exists = True
+                            actual_file_path = input_dir / file_path
+                        elif (enqueued_dir / file_path).exists():
+                            file_exists = True
+                            actual_file_path = enqueued_dir / file_path
+                        
+                        if file_exists:
+                            docs_to_reextract.append({
+                                "doc_id": doc_id,
+                                "file_path": str(actual_file_path),
+                                "original_file_name": file_path
+                            })
+                            to_process_docs.pop(doc_id, None)
+                            logger.info(f"[Reprocess] EXTRACTING document {doc_id} will be re-extracted")
+                        else:
+                            # No file - mark as inconsistent
+                            inconsistent_docs.append(doc_id)
+                            logger.warning(f"[Reprocess] EXTRACTING document {doc_id} has no content and no file")
+                    else:
+                        # Mark as inconsistent if not reprocessing
+                        inconsistent_docs.append(doc_id)
+                continue
+            
             if not content_data:
-                # Check if this is a failed document that should be preserved
+                # Document has no content - need to check if we can re-extract
+                file_path = getattr(status_doc, "file_path", None)
+                
+                # Check if this is a failed document
                 if (
                     hasattr(status_doc, "status")
                     and status_doc.status == DocStatus.FAILED
                 ):
-                    failed_docs_to_preserve.append(doc_id)
+                    # If reprocess_failed is True and we have a file path, try to re-extract
+                    if reprocess_failed and file_path:
+                        # Check if file exists in inputs or __enqueued__ directory
+                        from pathlib import Path
+                        input_dir = Path(self.working_dir) / "inputs"
+                        enqueued_dir = input_dir / "__enqueued__"
+                        
+                        file_exists = False
+                        actual_file_path = None
+                        
+                        # Check in inputs directory
+                        if (input_dir / file_path).exists():
+                            file_exists = True
+                            actual_file_path = input_dir / file_path
+                        # Check in __enqueued__ directory
+                        elif (enqueued_dir / file_path).exists():
+                            file_exists = True
+                            actual_file_path = enqueued_dir / file_path
+                        
+                        if file_exists:
+                            # File exists - mark for re-extraction
+                            docs_to_reextract.append({
+                                "doc_id": doc_id,
+                                "file_path": str(actual_file_path),
+                                "original_file_name": file_path
+                            })
+                            
+                            # Remove from current processing list
+                            to_process_docs.pop(doc_id, None)
+                        else:
+                            # File doesn't exist - delete the document entry
+                            inconsistent_docs.append(doc_id)
+                    else:
+                        # Not reprocessing or no file path - preserve for manual review
+                        failed_docs_to_preserve.append(doc_id)
                 else:
+                    # Not a failed document - delete inconsistent entry
                     inconsistent_docs.append(doc_id)
+        
+        # Reset EXTRACTING documents with content to EXTRACTED status
+        if docs_to_reset_extracted:
+            async with pipeline_status_lock:
+                reset_extracting_message = f"Resetting {len(docs_to_reset_extracted)} stuck EXTRACTING documents to EXTRACTED"
+                logger.info(reset_extracting_message)
+                pipeline_status["latest_message"] = reset_extracting_message
+                pipeline_status["history_messages"].append(reset_extracting_message)
+            
+            docs_to_update = {}
+            for doc_info in docs_to_reset_extracted:
+                doc_id = doc_info["doc_id"]
+                status_doc = doc_info["status_doc"]
+                
+                docs_to_update[doc_id] = {
+                    "status": DocStatus.EXTRACTED,
+                    "content_summary": status_doc.content_summary,
+                    "content_length": status_doc.content_length,
+                    "created_at": status_doc.created_at,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": getattr(status_doc, "file_path", None) or "unknown_source",
+                    "track_id": getattr(status_doc, "track_id", ""),
+                    "error_msg": "",
+                    "metadata": {},
+                }
+                
+                # Update status in to_process_docs
+                status_doc.status = DocStatus.EXTRACTED
+            
+            # Batch update all EXTRACTING -> EXTRACTED documents
+            await self.doc_status.upsert(docs_to_update)
+        
+        # Trigger re-extraction for documents with files
+        if docs_to_reextract:
+            async with pipeline_status_lock:
+                reextract_message = f"Re-extracting {len(docs_to_reextract)} failed documents with existing files"
+                logger.info(reextract_message)
+                pipeline_status["latest_message"] = reextract_message
+                pipeline_status["history_messages"].append(reextract_message)
+            
+            # Import Celery task here to avoid circular dependency
+            try:
+                from celery_worker.tasks import task_extract_and_enqueue
+                
+                for doc_info in docs_to_reextract:
+                    logger.info(f"[Reprocess] Triggering re-extraction for {doc_info['doc_id']} ({doc_info['original_file_name']})")
+                    task_extract_and_enqueue.delay(
+                        workspace_id=self.workspace,
+                        file_path_str=doc_info['file_path'],
+                        doc_id=doc_info['doc_id']
+                    )
+            except ImportError as e:
+                logger.error(f"[Reprocess] Failed to import Celery task: {e}")
+                # If Celery is not available, mark these documents as inconsistent
+                for doc_info in docs_to_reextract:
+                    inconsistent_docs.append(doc_info['doc_id'])
 
         # Log information about failed documents that will be preserved
         if failed_docs_to_preserve:
@@ -1785,11 +1933,12 @@ class LightRAG:
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
-                processing_docs, failed_docs, pending_docs, extracted_docs = await asyncio.gather(
+                processing_docs, failed_docs, pending_docs, extracted_docs, extracting_docs = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
                     self.doc_status.get_docs_by_status(DocStatus.PENDING),
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
+                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTING),
                 )
 
                 to_process_docs: dict[str, DocProcessingStatus] = {}
@@ -1797,6 +1946,7 @@ class LightRAG:
                 to_process_docs.update(failed_docs)
                 to_process_docs.update(pending_docs)
                 to_process_docs.update(extracted_docs)
+                to_process_docs.update(extracting_docs)  # Include stuck EXTRACTING documents
 
                 if not to_process_docs:
                     logger.info("No documents to process")
@@ -2021,14 +2171,15 @@ class LightRAG:
                             # Stage 1: Process text chunks and docs (parallel execution)
                             
                             # Update track status to CHUNKING
-                            if status_doc.track_id:
+                            track_id = getattr(status_doc, "track_id", None)
+                            if track_id:
                                 try:
                                     await self.doc_status.upsert_track_status(
-                                        track_id=status_doc.track_id,
+                                        track_id=track_id,
                                         status=DocStatus.CHUNKING,
                                         metadata={"file_name": file_path}
                                     )
-                                    logger.debug(f"[Track] Set CHUNKING status for track_id: {status_doc.track_id}")
+                                    logger.debug(f"[Track] Set CHUNKING status for track_id: {track_id}")
                                 except Exception as e:
                                     logger.warning(f"[Track] Failed to set CHUNKING status: {e}")
                             
@@ -2048,7 +2199,7 @@ class LightRAG:
                                                 timezone.utc
                                             ).isoformat(),
                                             "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
+                                            "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                             "metadata": {
                                                 "processing_start_time": processing_start_time
                                             },
@@ -2146,7 +2297,7 @@ class LightRAG:
                                             timezone.utc
                                         ).isoformat(),
                                         "file_path": file_path,
-                                        "track_id": status_doc.track_id,  # Preserve existing track_id
+                                        "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                         "metadata": {
                                             "processing_start_time": processing_start_time,
                                             "processing_end_time": processing_end_time,
@@ -2203,7 +2354,7 @@ class LightRAG:
                                                 timezone.utc
                                             ).isoformat(),
                                             "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
+                                            "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
@@ -2213,14 +2364,15 @@ class LightRAG:
                                 )
                                 
                                 # Update track status to PROCESSED
-                                if status_doc.track_id:
+                                track_id = getattr(status_doc, "track_id", None)
+                                if track_id:
                                     try:
                                         await self.doc_status.upsert_track_status(
-                                            track_id=status_doc.track_id,
+                                            track_id=track_id,
                                             status=DocStatus.PROCESSED,
                                             metadata={"file_name": file_path}
                                         )
-                                        logger.debug(f"[Track] Set PROCESSED status for track_id: {status_doc.track_id}")
+                                        logger.debug(f"[Track] Set PROCESSED status for track_id: {track_id}")
                                     except Exception as e:
                                         logger.warning(f"[Track] Failed to set PROCESSED status: {e}")
 
@@ -2288,7 +2440,7 @@ class LightRAG:
                                             "created_at": status_doc.created_at,
                                             "updated_at": datetime.now().isoformat(),
                                             "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
+                                            "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
@@ -3945,19 +4097,6 @@ class LightRAG:
             Dict with counts for each status
         """
         return await self.doc_status.get_status_counts()
-
-    async def aget_docs_by_track_id(
-        self, track_id: str
-    ) -> dict[str, DocProcessingStatus]:
-        """Get documents by track_id
-
-        Args:
-            track_id: The tracking ID to search for
-
-        Returns:
-            Dict with document id as keys and document status as values
-        """
-        return await self.doc_status.get_docs_by_track_id(track_id)
 
     async def get_entity_info(
         self, entity_name: str, include_vector_data: bool = False

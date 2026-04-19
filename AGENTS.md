@@ -46,6 +46,58 @@ LightRAG is an advanced Retrieval-Augmented Generation (RAG) framework designed 
 - Configure storage backends through `LIGHTRAG_*` variables and validate them with `docker-compose` services when needed.
 - Treat `lightrag.log*` as local artefacts; purge sensitive information before sharing logs or outputs.
 
+## Document Identification & Migration (track_id → doc_id + content_hash)
+- **CRITICAL**: The `track_id` system has been completely removed and replaced with UUID-based `doc_id` + `content_hash` for duplicate detection.
+- **Document ID Format**: All documents now use `doc-{uuid4}` format (e.g., `doc-550e8400-e29b-41d4-a716-446655440000`) instead of hash-based `doc-{md5_hash}`.
+- **Immediate Availability**: `doc_id` is generated and returned immediately on upload (before extraction), eliminating the need for batch tracking.
+- **Duplicate Detection**: Use `content_hash` (MD5 of content) for detecting duplicate documents, not `doc_id` comparison.
+- **Batch Operations**: Batch upload/scan endpoints return `doc_ids` array instead of single `track_id` for monitoring multiple documents.
+- **Deprecated Endpoints**: `/track_status/{track_id}` endpoint has been removed; use `/documents/{doc_id}` for individual document queries.
+- **Database Schema**: Documents table includes `content_hash` column (VARCHAR(32), nullable, indexed by workspace) for duplicate detection.
+- **Error Handling**: When encountering `track_id` references in legacy code or errors:
+  - Replace with `doc_id` for document identification
+  - Use `content_hash` for duplicate detection logic
+  - Update batch tracking to use `doc_ids` arrays
+  - Query individual documents via `/documents/{doc_id}` endpoint
+  - Use `/documents/paginated` for querying multiple documents with filters
+- **Migration Path**: Existing hash-based `doc_id` values are supported during transition but all new documents use UUID format.
+- **API Responses**: Never include `track_id` in API responses; always use `doc_id` (single) or `doc_ids` (batch) fields.
+- **Status Counting**: Use `count_by="document"` for status counts; `count_by="track"` option has been removed and returns 400 error.
+
+## Document Processing Status System
+LightRAG uses a simplified 6-state status model to track document processing through the pipeline:
+
+**Status Flow:**
+```
+UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
+               ↓            ↓           ↓           ↓
+            FAILED       FAILED      FAILED      FAILED
+```
+
+**Status Definitions:**
+1. **UPLOADING**: File đang được upload (reserved for future use)
+2. **EXTRACTING**: Đang extract full text (OCR/Docling) - handled by extraction worker
+3. **EXTRACTED**: Đã extract xong, chờ chunking + KG - ready for chunking worker
+4. **CHUNKING**: Đang chunking + extract entities - handled by chunking/KG worker
+5. **PROCESSED**: Hoàn thành tất cả - final state
+6. **FAILED**: Lỗi ở bất kỳ stage nào - can be reprocessed
+
+**Legacy Statuses (Deprecated):**
+- `PENDING` → mapped to `EXTRACTED`
+- `PROCESSING` → mapped to `CHUNKING`
+- `PREPROCESSED` → deprecated
+- `CHUNKED` → deprecated
+
+**Worker Responsibilities:**
+- **Extraction Worker** (`celery_worker/tasks.py`): Picks up documents in `EXTRACTING` status, performs OCR/Docling extraction, updates to `EXTRACTED` or `FAILED`
+- **Chunking/KG Worker** (`lightrag.py:apipeline_process_enqueue_documents`): Picks up documents in `EXTRACTED`, `CHUNKING`, `FAILED`, `PENDING`, `PROCESSING` statuses, performs chunking and entity extraction, updates to `PROCESSED` or `FAILED`
+
+**Reprocess Behavior:**
+- `/documents/reprocess_failed` endpoint picks up: `FAILED`, `EXTRACTING`, `EXTRACTED`, `PENDING`, `PROCESSING`
+- Stuck `EXTRACTING` documents with content are automatically reset to `EXTRACTED`
+- Stuck `EXTRACTING` documents without content trigger re-extraction if file exists
+- Documents are validated for consistency before reprocessing
+
 ## Automation & Agent Workflow
 - Use repo-relative `workdir` arguments for every shell command and prefer `rg`/`rg --files` for searches since they are faster under the CLI harness.
 - Default edits to ASCII, rely on `apply_patch` for single-file changes, and only add concise comments that aid comprehension of complex logic.

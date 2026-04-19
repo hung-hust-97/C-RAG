@@ -3454,7 +3454,7 @@ class PGDocStatusStorage(DocStatusStorage):
                 chunks_list=chunks_list,
                 metadata=metadata,
                 error_msg=result[0].get("error_msg"),
-                track_id=result[0].get("track_id"),
+                content_hash=result[0].get("content_hash"),
             )
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
@@ -3503,7 +3503,7 @@ class PGDocStatusStorage(DocStatusStorage):
                 "chunks_list": chunks_list,
                 "metadata": metadata,
                 "error_msg": row.get("error_msg"),
-                "track_id": row.get("track_id"),
+                "content_hash": row.get("content_hash"),
             }
 
         ordered_results: list[dict[str, Any] | None] = []
@@ -3550,6 +3550,7 @@ class PGDocStatusStorage(DocStatusStorage):
             updated_at = self._format_datetime_with_timezone(result[0]["updated_at"])
 
             return dict(
+                id=result[0]["id"],  # Include document ID
                 content_length=result[0]["content_length"],
                 content_summary=result[0]["content_summary"],
                 status=result[0]["status"],
@@ -3560,7 +3561,7 @@ class PGDocStatusStorage(DocStatusStorage):
                 chunks_list=chunks_list,
                 metadata=metadata,
                 error_msg=result[0].get("error_msg"),
-                track_id=result[0].get("track_id"),
+                content_hash=result[0].get("content_hash"),
             )
 
     async def get_status_counts(self) -> dict[str, int]:
@@ -3625,64 +3626,10 @@ class PGDocStatusStorage(DocStatusStorage):
                 chunks_list=chunks_list,
                 metadata=metadata,
                 error_msg=element.get("error_msg"),
-                track_id=element.get("track_id"),
+                content_hash=element.get("content_hash"),
             )
 
         return docs_by_status
-
-    async def get_docs_by_track_id(
-        self, track_id: str
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific track_id"""
-        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and track_id=$2"
-        params = {"workspace": self.workspace, "track_id": track_id}
-        result = await self.db.query(sql, list(params.values()), True)
-
-        docs_by_track_id = {}
-        for element in result:
-            # Parse chunks_list JSON string back to list
-            chunks_list = element.get("chunks_list", [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = element.get("metadata", {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-            # Ensure metadata is a dict
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            # Safe handling for file_path
-            file_path = element.get("file_path")
-            if file_path is None:
-                file_path = "no-file-path"
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(element["created_at"])
-            updated_at = self._format_datetime_with_timezone(element["updated_at"])
-
-            docs_by_track_id[element["id"]] = DocProcessingStatus(
-                content_summary=element["content_summary"],
-                content_length=element["content_length"],
-                status=element["status"],
-                created_at=created_at,
-                updated_at=updated_at,
-                chunks_count=element["chunks_count"],
-                file_path=file_path,
-                chunks_list=chunks_list,
-                track_id=element.get("track_id"),
-                metadata=metadata,
-                error_msg=element.get("error_msg"),
-            )
-
-        return docs_by_track_id
 
     async def get_docs_paginated(
         self,
@@ -3792,7 +3739,7 @@ class PGDocStatusStorage(DocStatusStorage):
                 chunks_count=element["chunks_count"],
                 file_path=element["file_path"],
                 chunks_list=chunks_list,
-                track_id=element.get("track_id"),
+                content_hash=element.get("content_hash"),
                 metadata=metadata,
                 error_msg=element.get("error_msg"),
             )
@@ -3984,9 +3931,9 @@ class PGDocStatusStorage(DocStatusStorage):
                 )
                 return None
 
-        # Modified SQL to include created_at, updated_at, chunks_list, track_id, metadata, and error_msg in both INSERT and UPDATE operations
+        # Modified SQL to include created_at, updated_at, chunks_list, content_hash, metadata, and error_msg in both INSERT and UPDATE operations
         # All fields are updated from the input data in both INSERT and UPDATE cases
-        sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content_summary,content_length,chunks_count,status,file_path,chunks_list,track_id,metadata,error_msg,created_at,updated_at)
+        sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content_summary,content_length,chunks_count,status,file_path,chunks_list,content_hash,metadata,error_msg,created_at,updated_at)
                  values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                   on conflict(id,workspace) do update set
                   content_summary = EXCLUDED.content_summary,
@@ -3995,7 +3942,7 @@ class PGDocStatusStorage(DocStatusStorage):
                   status = EXCLUDED.status,
                   file_path = EXCLUDED.file_path,
                   chunks_list = EXCLUDED.chunks_list,
-                  track_id = EXCLUDED.track_id,
+                  content_hash = EXCLUDED.content_hash,
                   metadata = EXCLUDED.metadata,
                   error_msg = EXCLUDED.error_msg,
                   created_at = EXCLUDED.created_at,
@@ -4005,7 +3952,7 @@ class PGDocStatusStorage(DocStatusStorage):
             created_at = parse_datetime(v.get("created_at"))
             updated_at = parse_datetime(v.get("updated_at"))
 
-            # chunks_count, chunks_list, track_id, metadata, and error_msg are optional
+            # chunks_count, chunks_list, content_hash, metadata, and error_msg are optional
             await self.db.execute(
                 sql,
                 {
@@ -4017,7 +3964,7 @@ class PGDocStatusStorage(DocStatusStorage):
                     "status": v["status"],
                     "file_path": v["file_path"],
                     "chunks_list": json.dumps(v.get("chunks_list", [])),
-                    "track_id": v.get("track_id"),  # Add track_id support
+                    "content_hash": v.get("content_hash"),  # Add content_hash support
                     "metadata": json.dumps(
                         v.get("metadata", {})
                     ),  # Add metadata support
@@ -4026,6 +3973,81 @@ class PGDocStatusStorage(DocStatusStorage):
                     "updated_at": updated_at,  # Use the converted datetime object
                 },
             )
+
+    async def atomic_upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        """Atomically update or insert document status within a transaction.
+        
+        This method ensures atomic document record creation for concurrent uploads.
+        It wraps the upsert operation in a database transaction to handle race conditions.
+        
+        Args:
+            data: dictionary of document IDs and their status data
+        """
+        logger.debug(f"[{self.workspace}] Atomic insert of {len(data)} to {self.namespace}")
+        if not data:
+            return
+
+        def parse_datetime(dt_str):
+            """Parse datetime and ensure it's stored as UTC time in database"""
+            if dt_str is None:
+                return None
+            if isinstance(dt_str, (datetime.date, datetime.datetime)):
+                if isinstance(dt_str, datetime.datetime):
+                    if dt_str.tzinfo is None:
+                        dt_str = dt_str.replace(tzinfo=timezone.utc)
+                    return dt_str.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt_str
+            try:
+                dt = datetime.datetime.fromisoformat(dt_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"[{self.workspace}] Unable to parse datetime string: {dt_str}"
+                )
+                return None
+
+        sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content_summary,content_length,chunks_count,status,file_path,chunks_list,content_hash,metadata,error_msg,created_at,updated_at)
+                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                  on conflict(id,workspace) do update set
+                  content_summary = EXCLUDED.content_summary,
+                  content_length = EXCLUDED.content_length,
+                  chunks_count = EXCLUDED.chunks_count,
+                  status = EXCLUDED.status,
+                  file_path = EXCLUDED.file_path,
+                  chunks_list = EXCLUDED.chunks_list,
+                  content_hash = EXCLUDED.content_hash,
+                  metadata = EXCLUDED.metadata,
+                  error_msg = EXCLUDED.error_msg,
+                  created_at = EXCLUDED.created_at,
+                  updated_at = EXCLUDED.updated_at"""
+
+        async def _atomic_operation(connection: asyncpg.Connection) -> None:
+            """Execute all upserts within a single transaction"""
+            async with connection.transaction():
+                for k, v in data.items():
+                    created_at = parse_datetime(v.get("created_at"))
+                    updated_at = parse_datetime(v.get("updated_at"))
+
+                    await connection.execute(
+                        sql,
+                        self.workspace,
+                        k,
+                        v["content_summary"],
+                        v["content_length"],
+                        v["chunks_count"] if "chunks_count" in v else -1,
+                        v["status"],
+                        v["file_path"],
+                        json.dumps(v.get("chunks_list", [])),
+                        v.get("content_hash"),
+                        json.dumps(v.get("metadata", {})),
+                        v.get("error_msg"),
+                        created_at,
+                        updated_at,
+                    )
+
+        await self.db._run_with_retry(_atomic_operation)
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""
@@ -4045,80 +4067,73 @@ class PGDocStatusStorage(DocStatusStorage):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    # Track status management methods
-    async def upsert_track_status(self, track_id: str, status: str, metadata: dict = None) -> None:
-        """Upsert track status using a special doc_id format: track-{track_id}"""
-        track_doc_id = f"track-{track_id}"
-        await self.upsert({
-            track_doc_id: {
-                "status": status,
-                "content_summary": "",  # Empty for track documents
-                "content_length": 0,
-                "created_at": datetime.datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.datetime.now(timezone.utc).isoformat(),
-                "file_path": "",
-                "track_id": track_id,
-                "metadata": metadata or {"is_track_summary": True},
-            }
-        })
-
-    async def get_track_status(self, track_id: str) -> dict | None:
-        """Get track status by track_id"""
-        track_doc_id = f"track-{track_id}"
-        return await self.get_by_id(track_doc_id)
-
-    async def get_status_counts_by_track(self) -> dict[str, int]:
-        """Get counts of tracks in each status (not documents)"""
-        sql = """SELECT status, COUNT(DISTINCT track_id) as count
-                 FROM LIGHTRAG_DOC_STATUS
-                 WHERE workspace=$1 AND track_id IS NOT NULL AND id LIKE 'track-%'
-                 GROUP BY status"""
-        params = {"workspace": self.workspace}
-        result = await self.db.query(sql, list(params.values()), True)
-        counts = {}
-        for doc in result:
-            counts[doc["status"]] = doc["count"]
-        return counts
-
-    async def get_status_counts_by_track_across_workspaces(self) -> dict[str, dict[str, int]]:
-        """Get counts of tracks in each status across all workspaces"""
+    async def check_duplicate_by_content_hash(
+        self,
+        content_hash: str,
+        exclude_doc_id: str | None = None
+    ) -> tuple[bool, str | None]:
+        """Check if a document with the same content_hash already exists in the workspace.
+        
+        This function queries documents by (workspace, content_hash) and excludes the current
+        doc_id to avoid self-matching. It uses parameterized queries with LIMIT 1 for performance
+        and SQL injection prevention.
+        
+        Args:
+            content_hash: MD5 hash of document content (32 hex characters)
+            exclude_doc_id: Optional doc_id to exclude from search (avoid self-match)
+            
+        Returns:
+            tuple[bool, str | None]: (is_duplicate, existing_doc_id)
+                - (True, doc_id) if duplicate found
+                - (False, None) if no duplicate exists
+                
+        Validates Requirements: 4.1, 4.2, 4.4, 11.2, 11.3
+        
+        Examples:
+            >>> is_dup, existing_id = await storage.check_duplicate_by_content_hash(
+            ...     content_hash="a1b2c3d4e5f6...",
+            ...     exclude_doc_id="doc-550e8400-e29b-41d4-a716-446655440000"
+            ... )
+            >>> if is_dup:
+            ...     print(f"Duplicate of: {existing_id}")
+        """
         try:
-            logger.debug("Getting track status counts across all workspaces...")
-            sql = """
-                SELECT workspace, status, COUNT(*) as count
-                FROM LIGHTRAG_DOC_STATUS
-                WHERE id LIKE 'track-%'
-                GROUP BY workspace, status
-            """
+            # Build parameterized query based on whether we need to exclude a doc_id
+            if exclude_doc_id is not None:
+                sql = """
+                    SELECT id, status 
+                    FROM LIGHTRAG_DOC_STATUS 
+                    WHERE workspace=$1 AND content_hash=$2 AND id != $3 
+                    LIMIT 1
+                """
+                params = [self.workspace, content_hash, exclude_doc_id]
+            else:
+                sql = """
+                    SELECT id, status 
+                    FROM LIGHTRAG_DOC_STATUS 
+                    WHERE workspace=$1 AND content_hash=$2 
+                    LIMIT 1
+                """
+                params = [self.workspace, content_hash]
             
-            # Add timeout to prevent hanging
-            result = await asyncio.wait_for(
-                self.db.query(sql, [], True),
-                timeout=15.0  # 15 second timeout for cross-workspace query
-            )
-
-            workspaces_counts = {}
-            for row in result:
-                ws = row["workspace"]
-                status = row["status"]
-                count = row["count"]
-
-                if ws not in workspaces_counts:
-                    workspaces_counts[ws] = {"all": 0}
-
-                workspaces_counts[ws][status] = count
-                workspaces_counts[ws]["all"] += count
-
-            logger.debug(f"Track status counts across workspaces retrieved: {len(workspaces_counts)} workspaces")
-            return workspaces_counts
+            # Execute query
+            result = await self.db.query(sql, params, multirows=True)
             
-        except asyncio.TimeoutError:
-            logger.error("Timeout getting track status counts across workspaces after 15s")
-            return {}
+            # Check result
+            if result and len(result) > 0:
+                existing_doc_id = result[0]["id"]
+                return (True, existing_doc_id)
+            else:
+                return (False, None)
+                
         except Exception as e:
-            logger.error(f"Error getting track status counts across workspaces: {str(e)}")
-            logger.error(traceback.format_exc())
-            return {}
+            logger.error(
+                f"[{self.workspace}] Error checking duplicate by content_hash: {content_hash}, error: {e}"
+            )
+            # On error, return False to allow processing to continue
+            # This is safer than raising an exception which could block document processing
+            return (False, None)
+
 
 
 class PGGraphQueryException(Exception):

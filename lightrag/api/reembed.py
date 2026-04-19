@@ -40,17 +40,24 @@ async def reembed_workspace_vectors(
                 chunk_ids.append(chunk_id)
 
     # Recreate vector storages first to guarantee a clean index schema.
+    logger.info(f"[{rag.workspace}] Dropping existing collections...")
+    logger.info(f"[{rag.workspace}] Chunks collection name: {rag.chunks_vdb.final_namespace}")
+    logger.info(f"[{rag.workspace}] Entities collection name: {rag.entities_vdb.final_namespace}")
+    logger.info(f"[{rag.workspace}] Relations collection name: {rag.relationships_vdb.final_namespace}")
     await asyncio.gather(
         rag.chunks_vdb.drop(),
         rag.entities_vdb.drop(),
         rag.relationships_vdb.drop(),
     )
+    logger.info(f"[{rag.workspace}] Collections dropped successfully")
 
     chunks_upserted = 0
     entities_upserted = 0
     relations_upserted = 0
 
     # Rebuild chunk vectors from KV text chunks.
+    logger.info(f"[{rag.workspace}] Starting chunk reembed: {len(chunk_ids)} chunk IDs to process")
+    logger.info(f"[{rag.workspace}] Chunks VDB collection name: {getattr(rag.chunks_vdb, 'final_namespace', 'unknown')}")
     for i in range(0, len(chunk_ids), batch_size):
         batch_ids = chunk_ids[i : i + batch_size]
         batch_rows = await rag.text_chunks.get_by_ids(batch_ids)
@@ -59,9 +66,11 @@ async def reembed_workspace_vectors(
             if chunk_row:
                 batch_payload[chunk_id] = chunk_row
 
+        logger.info(f"[{rag.workspace}] Batch {i//batch_size + 1}: Retrieved {len([r for r in batch_rows if r])}/{len(batch_ids)} chunks, upserting {len(batch_payload)} to Milvus")
         if batch_payload:
             await rag.chunks_vdb.upsert(batch_payload)
             chunks_upserted += len(batch_payload)
+            logger.info(f"[{rag.workspace}] Successfully upserted {len(batch_payload)} chunks to Milvus collection: {getattr(rag.chunks_vdb, 'final_namespace', 'unknown')}")
 
     # Rebuild entity vectors from graph nodes.
     nodes = await rag.chunk_entity_relation_graph.get_all_nodes()

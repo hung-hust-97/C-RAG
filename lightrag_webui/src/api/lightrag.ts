@@ -176,7 +176,7 @@ export type ScanResponse = {
 export type ReprocessFailedResponse = {
   status: 'reprocessing_started'
   message: string
-  track_id: string
+  documents_count: number
 }
 
 export type DeleteDocResponse = {

@@ -30,7 +30,7 @@ def _reset_locks_after_fork():
     This function clears the lock caches so new locks will be created in the child's event loop.
     """
     try:
-        # Import the keyed lock manager
+        # Import the shared storage module
         from lightrag.kg import shared_storage
         
         # Reset the keyed lock manager's async lock caches
@@ -43,9 +43,32 @@ def _reset_locks_after_fork():
                 manager._async_lock_count.clear()
             if hasattr(manager, '_async_lock_cleanup_data'):
                 manager._async_lock_cleanup_data.clear()
-            logger.debug("[Celery] Reset asyncio locks after fork")
+            logger.debug("[Celery] Reset keyed lock manager async locks after fork")
+        
+        # Reset global async locks for multiprocess mode
+        if hasattr(shared_storage, '_async_locks') and shared_storage._async_locks is not None:
+            # Recreate all async locks with new event loop
+            shared_storage._async_locks = {
+                "internal_lock": asyncio.Lock(),
+                "graph_db_lock": asyncio.Lock(),
+                "data_init_lock": asyncio.Lock(),
+            }
+            logger.debug("[Celery] Reset global async locks after fork")
+        
+        # Reset single-process mode locks if they exist
+        if hasattr(shared_storage, '_internal_lock') and isinstance(shared_storage._internal_lock, asyncio.Lock):
+            shared_storage._internal_lock = asyncio.Lock()
+            logger.debug("[Celery] Reset internal lock after fork")
+        
+        if hasattr(shared_storage, '_data_init_lock') and isinstance(shared_storage._data_init_lock, asyncio.Lock):
+            shared_storage._data_init_lock = asyncio.Lock()
+            logger.debug("[Celery] Reset data init lock after fork")
+            
+        logger.info("[Celery] Successfully reset all asyncio locks after fork")
     except Exception as e:
         logger.warning(f"[Celery] Failed to reset locks after fork: {e}")
+        import traceback
+        logger.warning(traceback.format_exc())
 
 
 # Register worker process init signal
@@ -133,7 +156,7 @@ async def _get_rag(workspace_id: str):
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)
-def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, track_id: str):
+def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, doc_id: str):
     """
     Celery Task 1 – OCR & Markdown Extraction.
 
@@ -141,7 +164,7 @@ def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, track_
     and writes a PENDING doc_status record. Then automatically triggers
     task_chunk_and_graph to do the heavy graph work.
     """
-    logger.info(f"[Celery/OCR] workspace={workspace_id} file={file_path_str}")
+    logger.info(f"[Celery/OCR] workspace={workspace_id} file={file_path_str} doc_id={doc_id}")
 
     async def _run():
         from lightrag.api.routers.document_routes import pipeline_enqueue_file
@@ -153,7 +176,7 @@ def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, track_
             logger.error(f"[Celery/OCR] File not found: {file_path_str}")
             return False
 
-        success, _ = await pipeline_enqueue_file(rag, file_path, track_id)
+        success, _ = await pipeline_enqueue_file(rag, file_path, doc_id)
         return success
 
     try:

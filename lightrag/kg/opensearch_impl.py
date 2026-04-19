@@ -934,6 +934,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             if hits:
                 doc = hits[0]["_source"]
                 doc["_id"] = hits[0]["_id"]
+                doc["id"] = hits[0]["_id"]  # Also set 'id' for consistency
                 return doc
             return None
         except OpenSearchException as e:

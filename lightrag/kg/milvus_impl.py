@@ -1337,7 +1337,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 lambda client: client.has_collection(self.final_namespace),
             )
             logger.info(
-                f"[{self.workspace}] VectorDB collection '{self.namespace}' exists check: {collection_exists}"
+                f"[{self.workspace}] VectorDB collection '{self.namespace}' (final: '{self.final_namespace}') exists check: {collection_exists}"
             )
 
             if collection_exists:
@@ -1681,6 +1681,25 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             f'workspace_id == "{self.workspace}"' if self.workspace else None
         )
 
+        logger.info(f"[{self.workspace}] Querying Milvus collection: {self.final_namespace}, filter: {workspace_filter}, top_k: {top_k}, threshold: {self.cosine_better_than_threshold}")
+        
+        # Try query without filter first for debugging
+        results_no_filter = self._milvus_call(
+            "search",
+            lambda client: client.search(
+                collection_name=self.final_namespace,
+                data=embedding,
+                limit=top_k,
+                output_fields=output_fields,
+                filter=None,  # No filter
+                search_params={
+                    "metric_type": "COSINE",
+                    "params": {},  # No radius filter
+                },
+            ),
+        )
+        logger.info(f"[{self.workspace}] Query WITHOUT filter returned {len(results_no_filter[0]) if results_no_filter and len(results_no_filter) > 0 else 0} results")
+        
         results = self._milvus_call(
             "search",
             lambda client: client.search(
@@ -1695,6 +1714,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 },
             ),
         )
+        
+        logger.info(f"[{self.workspace}] Query WITH filter returned {len(results[0]) if results and len(results) > 0 else 0} results")
+        
         return [
             {
                 **dp["entity"],

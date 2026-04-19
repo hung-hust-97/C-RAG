@@ -259,8 +259,8 @@ services:
       # Logging configuration
       LIGHTRAG_LOG_DIR: ${LIGHTRAG_LOG_DIR:-/app/data/logs}
       # Storage backend connections - must match lightrag API configuration
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       MILVUS_URI: ${MILVUS_URI:-http://milvus:19530}
     depends_on:

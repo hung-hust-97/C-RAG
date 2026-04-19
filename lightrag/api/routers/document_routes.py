@@ -29,9 +29,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
 from lightrag.utils import (
-    generate_track_id,
     compute_mdhash_id,
     sanitize_text_for_encoding,
+    get_content_summary,
 )
 from lightrag.api.reembed import reembed_workspace_vectors
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -271,7 +271,10 @@ class ScanResponse(BaseModel):
     Attributes:
         status: Status of the scanning operation
         message: Optional message with additional details
-        track_id: Tracking ID for monitoring scanning progress
+        doc_ids: Array of document IDs for monitoring scanning progress
+        total_files: Total number of files found to process
+        queued_files: Number of files successfully queued for processing
+        failed_files: Number of files that failed to queue
     """
 
     status: Literal["scanning_started"] = Field(
@@ -281,14 +284,21 @@ class ScanResponse(BaseModel):
         default=None, description="Additional details about the scanning operation"
     )
     workspace_id: str = Field(description="Workspace identifier for this scan request")
-    track_id: str = Field(description="Tracking ID for monitoring scanning progress")
+    doc_ids: List[str] = Field(description="Array of document IDs for monitoring scanning progress")
+    total_files: int = Field(description="Total number of files found to process")
+    queued_files: int = Field(description="Number of files successfully queued for processing")
+    failed_files: int = Field(description="Number of files that failed to queue")
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "status": "scanning_started",
                 "message": "Scanning process has been initiated in the background",
-                "track_id": "scan_20250729_170612_abc123",
+                "workspace_id": "default",
+                "doc_ids": ["doc-550e8400-e29b-41d4-a716-446655440000", "doc-660e8400-e29b-41d4-a716-446655440001"],
+                "total_files": 2,
+                "queued_files": 2,
+                "failed_files": 0,
             }
         }
     )
@@ -300,24 +310,24 @@ class ReprocessResponse(BaseModel):
     Attributes:
         status: Status of the reprocessing operation
         message: Message describing the operation result
-        track_id: Always empty string. Reprocessed documents retain their original track_id.
+        documents_count: Number of documents that will be reprocessed
     """
 
     status: Literal["reprocessing_started"] = Field(
         description="Status of the reprocessing operation"
     )
     message: str = Field(description="Human-readable message describing the operation")
-    track_id: str = Field(
-        default="",
-        description="Always empty string. Reprocessed documents retain their original track_id from initial upload.",
+    documents_count: int = Field(
+        description="Number of documents that will be reprocessed",
+        default=0
     )
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "status": "reprocessing_started",
-                "message": "Reprocessing of failed documents has been initiated in background",
-                "track_id": "",
+                "message": "Reprocessing of 5 failed documents has been initiated in background",
+                "documents_count": 5
             }
         }
     )
@@ -444,7 +454,7 @@ class InsertResponse(BaseModel):
     Attributes:
         status: Status of the operation (success, duplicated, partial_success, failure)
         message: Detailed message describing the operation result
-        track_id: Tracking ID for monitoring processing status
+        doc_id: Document ID for monitoring processing status
     """
 
     status: Literal["success", "duplicated", "partial_success", "failure"] = Field(
@@ -452,14 +462,52 @@ class InsertResponse(BaseModel):
     )
     message: str = Field(description="Message describing the operation result")
     workspace_id: str = Field(description="Workspace identifier for this operation")
-    track_id: str = Field(description="Tracking ID for monitoring processing status")
+    doc_id: str = Field(description="Document ID for monitoring processing status")
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "status": "success",
                 "message": "File 'document.pdf' uploaded successfully. Processing will continue in background.",
-                "track_id": "upload_20250729_170612_abc123",
+                "doc_id": "doc-550e8400-e29b-41d4-a716-446655440000",
+            }
+        }
+    )
+
+
+class BatchInsertResponse(BaseModel):
+    """Response model for batch document insertion operations
+
+    Attributes:
+        status: Status of the operation (success, partial_success, failure)
+        message: Detailed message describing the operation result
+        workspace_id: Workspace identifier for this operation
+        doc_ids: Array of document IDs for monitoring processing status
+        total_files: Total number of files/texts in the batch
+        queued_files: Number of files/texts successfully queued for processing
+        failed_files: Number of files/texts that failed to queue
+    """
+
+    status: Literal["success", "partial_success", "failure"] = Field(
+        description="Status of the operation"
+    )
+    message: str = Field(description="Message describing the operation result")
+    workspace_id: str = Field(description="Workspace identifier for this operation")
+    doc_ids: List[str] = Field(description="Array of document IDs for monitoring processing status")
+    total_files: int = Field(description="Total number of files/texts in the batch")
+    queued_files: int = Field(description="Number of files/texts successfully queued for processing")
+    failed_files: int = Field(description="Number of files/texts that failed to queue")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "success",
+                "message": "3 texts successfully queued for processing.",
+                "workspace_id": "default",
+                "doc_ids": ["doc-550e8400-e29b-41d4-a716-446655440000", "doc-660e8400-e29b-41d4-a716-446655440001", "doc-770e8400-e29b-41d4-a716-446655440002"],
+                "total_files": 3,
+                "queued_files": 3,
+                "failed_files": 0,
             }
         }
     )
@@ -664,9 +712,6 @@ class DocStatusResponse(BaseModel):
     created_at: Optional[str] = Field(default=None, description="Creation timestamp (ISO format string)")
     updated_at: Optional[str] = Field(default=None, description="Last update timestamp (ISO format string)")
     workspace_id: str = Field(description="Workspace identifier for this document")
-    track_id: Optional[str] = Field(
-        default=None, description="Tracking ID for monitoring progress"
-    )
     chunks_count: Optional[int] = Field(
         default=None, description="Number of chunks the document was split into"
     )
@@ -681,13 +726,12 @@ class DocStatusResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "id": "doc_123456",
+                "id": "doc-550e8400-e29b-41d4-a716-446655440000",
                 "content_summary": "Research paper on machine learning",
                 "content_length": 15240,
                 "status": "processed",
                 "created_at": "2025-03-31T12:34:56",
                 "updated_at": "2025-03-31T12:35:30",
-                "track_id": "upload_20250729_170612_abc123",
                 "chunks_count": 12,
                 "error": None,
                 "metadata": {"author": "John Doe", "year": 2025},
@@ -715,13 +759,12 @@ class DocsStatusesResponse(BaseModel):
                 "statuses": {
                     "EXTRACTED": [
                         {
-                            "id": "doc_123",
+                            "id": "doc-550e8400-e29b-41d4-a716-446655440000",
                             "content_summary": "Extracted document",
                             "content_length": 5000,
                             "status": "extracted",
                             "created_at": "2025-03-31T10:00:00",
                             "updated_at": "2025-03-31T10:00:00",
-                            "track_id": "upload_20250331_100000_abc123",
                             "chunks_count": None,
                             "error": None,
                             "metadata": None,
@@ -730,13 +773,12 @@ class DocsStatusesResponse(BaseModel):
                     ],
                     "PREPROCESSED": [
                         {
-                            "id": "doc_789",
+                            "id": "doc-660e8400-e29b-41d4-a716-446655440001",
                             "content_summary": "Document pending final indexing",
                             "content_length": 7200,
                             "status": "preprocessed",
                             "created_at": "2025-03-31T09:30:00",
                             "updated_at": "2025-03-31T09:35:00",
-                            "track_id": "upload_20250331_093000_xyz789",
                             "chunks_count": 10,
                             "error": None,
                             "metadata": None,
@@ -745,13 +787,12 @@ class DocsStatusesResponse(BaseModel):
                     ],
                     "PROCESSED": [
                         {
-                            "id": "doc_456",
+                            "id": "doc-770e8400-e29b-41d4-a716-446655440002",
                             "content_summary": "Processed document",
                             "content_length": 8000,
                             "status": "processed",
                             "created_at": "2025-03-31T09:00:00",
                             "updated_at": "2025-03-31T09:05:00",
-                            "track_id": "insert_20250331_090000_def456",
                             "chunks_count": 8,
                             "error": None,
                             "metadata": {"author": "John Doe"},
@@ -764,48 +805,8 @@ class DocsStatusesResponse(BaseModel):
     )
 
 
-class TrackStatusResponse(BaseModel):
-    """Response model for tracking document processing status by track_id
-
-    Attributes:
-        track_id: The tracking ID
-        documents: List of documents associated with this track_id
-        total_count: Total number of documents for this track_id
-        status_summary: Count of documents by status
-    """
-
-    track_id: str = Field(description="The tracking ID")
-    workspace_id: str = Field(description="Workspace identifier for this request")
-    documents: List[DocStatusResponse] = Field(
-        description="List of documents associated with this track_id"
-    )
-    total_count: int = Field(description="Total number of documents for this track_id")
-    status_summary: Dict[str, int] = Field(description="Count of documents by status")
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "track_id": "upload_20250729_170612_abc123",
-                "documents": [
-                    {
-                        "id": "doc_123456",
-                        "content_summary": "Research paper on machine learning",
-                        "content_length": 15240,
-                        "status": "PROCESSED",
-                        "created_at": "2025-03-31T12:34:56",
-                        "updated_at": "2025-03-31T12:35:30",
-                        "track_id": "upload_20250729_170612_abc123",
-                        "chunks_count": 12,
-                        "error": None,
-                        "metadata": {"author": "John Doe", "year": 2025},
-                        "file_path": "research_paper.pdf",
-                    }
-                ],
-                "total_count": 1,
-                "status_summary": {"PROCESSED": 1},
-            }
-        }
-    )
+# TrackStatusResponse removed - track_id functionality has been deprecated
+# Use individual document queries with doc_id instead
 
 
 class DocumentsRequest(BaseModel):
@@ -940,7 +941,6 @@ class PaginatedDocsResponse(BaseModel):
                         "status": "PROCESSED",
                         "created_at": "2025-03-31T12:34:56",
                         "updated_at": "2025-03-31T12:35:30",
-                        "track_id": "upload_20250729_170612_abc123",
                         "chunks_count": 12,
                         "error_msg": None,
                         "metadata": {"author": "John Doe", "year": 2025},
@@ -1602,35 +1602,73 @@ async def _extract_text_for_preview(file_path: Path) -> str:
 
 
 async def pipeline_enqueue_file(
-    rag: LightRAG, file_path: Path, track_id: str = None
+    rag: LightRAG, file_path: Path, doc_id: str = None
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
-        track_id: Optional tracking ID, if not provided will be generated
+        doc_id: Optional document ID (for reprocessing existing documents)
     Returns:
-        tuple: (success: bool, track_id: str)
+        tuple: (success: bool, doc_id: str)
     """
+    from lightrag.utils import generate_doc_id
 
-    # Generate track_id if not provided
-    if track_id is None:
-        track_id = generate_track_id("unknown")
-
-    # Set track status to EXTRACTING
-    try:
-        await rag.doc_status.upsert_track_status(
-            track_id=track_id,
-            status=DocStatus.EXTRACTING,
-            metadata={"file_name": file_path.name}
-        )
-        logger.info(f"[Track] Set EXTRACTING status for track_id: {track_id}")
-    except Exception as e:
-        logger.warning(f"[Track] Failed to set EXTRACTING status: {e}")
-
-    # Initialize extracting_doc_id for tracking
-    extracting_doc_id = None
+    # Generate UUID-based doc_id if not provided (before extraction)
+    # Note: UUID4 collisions are extremely rare (~1 in 2^122). If a collision occurs,
+    # the database primary key constraint will fail during upsert, and we retry with
+    # a new UUID up to 3 times before failing.
+    max_uuid_retries = 3
+    for uuid_attempt in range(max_uuid_retries):
+        if doc_id is None:
+            doc_id = generate_doc_id("doc-")
+        
+        # Create document record with status=EXTRACTING and content_hash=NULL
+        try:
+            initial_doc_data = {
+                doc_id: {
+                    "status": DocStatus.EXTRACTING,
+                    "content_summary": "",
+                    "content_length": 0,
+                    "chunks_count": 0,
+                    "file_path": file_path.name,
+                    "chunks_list": [],
+                    "content_hash": None,  # Will be set after extraction
+                    "metadata": {"file_name": file_path.name},
+                    "error_msg": None,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+            await rag.doc_status.upsert(initial_doc_data)
+            logger.info(f"[Document] Created doc_id {doc_id} with EXTRACTING status for file: {file_path.name}")
+            break  # Success - exit retry loop
+            
+        except Exception as e:
+            # Check if this is a UUID collision (primary key violation)
+            error_str = str(e).lower()
+            is_collision = any(keyword in error_str for keyword in [
+                'duplicate key', 'unique constraint', 'primary key', 'already exists'
+            ])
+            
+            if is_collision and uuid_attempt < max_uuid_retries - 1:
+                # UUID collision detected - retry with new UUID
+                logger.warning(
+                    f"[Document] UUID collision detected for doc_id {doc_id} "
+                    f"(attempt {uuid_attempt + 1}/{max_uuid_retries}). Retrying with new UUID."
+                )
+                doc_id = None  # Force generation of new UUID on next iteration
+                continue
+            else:
+                # Non-collision error or max retries exhausted
+                if is_collision:
+                    logger.error(
+                        f"[Document] Failed to generate unique doc_id after {max_uuid_retries} attempts"
+                    )
+                else:
+                    logger.error(f"[Document] Failed to create initial document record: {e}")
+                return False, doc_id if doc_id else generate_doc_id("doc-")
 
     try:
         content = ""
@@ -1648,45 +1686,41 @@ async def pipeline_enqueue_file(
             async with aiofiles.open(file_path, "rb") as f:
                 file = await f.read()
         except PermissionError as e:
-            error_files = [
-                {
-                    "file_path": str(file_path.name),
-                    "error_description": "[File Extraction]Permission denied - cannot read file",
-                    "original_error": str(e),
-                    "file_size": file_size,
+            error_msg = f"[File Extraction]Permission denied - cannot read file: {str(e)}"
+            await rag.doc_status.upsert({
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "error_msg": error_msg,
+                    "content_length": file_size,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
-            ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
-            logger.error(
-                f"[File Extraction]Permission denied reading file: {file_path.name}"
-            )
-            return False, track_id
+            })
+            logger.error(f"[File Extraction]Permission denied reading file: {file_path.name}")
+            return False, doc_id
         except FileNotFoundError as e:
-            error_files = [
-                {
-                    "file_path": str(file_path.name),
-                    "error_description": "[File Extraction]File not found",
-                    "original_error": str(e),
-                    "file_size": file_size,
+            error_msg = f"[File Extraction]File not found: {str(e)}"
+            await rag.doc_status.upsert({
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "error_msg": error_msg,
+                    "content_length": file_size,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
-            ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            })
             logger.error(f"[File Extraction]File not found: {file_path.name}")
-            return False, track_id
+            return False, doc_id
         except Exception as e:
-            error_files = [
-                {
-                    "file_path": str(file_path.name),
-                    "error_description": "[File Extraction]File reading error",
-                    "original_error": str(e),
-                    "file_size": file_size,
+            error_msg = f"[File Extraction]File reading error: {str(e)}"
+            await rag.doc_status.upsert({
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "error_msg": error_msg,
+                    "content_length": file_size,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
-            ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
-            logger.error(
-                f"[File Extraction]Error reading file {file_path.name}: {str(e)}"
-            )
-            return False, track_id
+            })
+            logger.error(f"[File Extraction]Error reading file {file_path.name}: {str(e)}")
+            return False, doc_id
 
         # Process based on file type
         try:
@@ -1739,30 +1773,30 @@ async def pipeline_enqueue_file(
                             except UnicodeDecodeError:
                                 continue
                         else:
-                            error_files = [
-                                {
-                                    "file_path": str(file_path.name),
-                                    "error_description": "[File Extraction]Text file encoding error",
-                                    "original_error": "Failed to decode text file with utf-8, latin-1, cp1252, or iso-8859-1",
-                                    "file_size": file_size,
+                            error_msg = "[File Extraction]Text file encoding error: Failed to decode text file with utf-8, latin-1, cp1252, or iso-8859-1"
+                            await rag.doc_status.upsert({
+                                doc_id: {
+                                    "status": DocStatus.FAILED,
+                                    "error_msg": error_msg,
+                                    "content_length": file_size,
+                                    "updated_at": datetime.now(timezone.utc).isoformat(),
                                 }
-                            ]
-                            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                            })
                             logger.error(f"[File Extraction]Failed to decode text file: {file_path.name}")
-                            return False, track_id
+                            return False, doc_id
                     
                     if not content.strip():
-                        error_files = [
-                            {
-                                "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]Empty text file",
-                                "original_error": "Text file is empty or contains only whitespace",
-                                "file_size": file_size,
+                        error_msg = "[File Extraction]Empty text file: Text file is empty or contains only whitespace"
+                        await rag.doc_status.upsert({
+                            doc_id: {
+                                "status": DocStatus.FAILED,
+                                "error_msg": error_msg,
+                                "content_length": file_size,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                        })
                         logger.warning(f"[File Extraction]Empty text file: {file_path.name}")
-                        return False, track_id
+                        return False, doc_id
 
                 case (
                     ".rtf"
@@ -1839,42 +1873,33 @@ async def pipeline_enqueue_file(
                                     
                         if not content.strip():
                             if ocr_result and ocr_result.error:
-                                error_msg = f"Document extraction failed: {ocr_result.error}"
+                                error_msg = f"[File Extraction]Document extraction failed: {ocr_result.error}"
                             else:
-                                error_msg = "Document extraction returned no content"
+                                error_msg = "[File Extraction]Document extraction returned no content"
                             
-                            error_files = [
-                                {
-                                    "file_path": str(file_path.name),
-                                    "error_description": "[File Extraction]Document extraction failed",
-                                    "original_error": error_msg,
-                                    "file_size": file_size,
+                            await rag.doc_status.upsert({
+                                doc_id: {
+                                    "status": DocStatus.FAILED,
+                                    "error_msg": error_msg,
+                                    "content_length": file_size,
+                                    "updated_at": datetime.now(timezone.utc).isoformat(),
                                 }
-                            ]
-                            await rag.apipeline_enqueue_error_documents(
-                                error_files, track_id
-                            )
-                            logger.error(
-                                f"[File Extraction]{error_msg} for {file_path.name}"
-                            )
-                            return False, track_id
+                            })
+                            logger.error(f"[File Extraction]{error_msg} for {file_path.name}")
+                            return False, doc_id
                             
                     except Exception as e:
-                        error_files = [
-                            {
-                                "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]Document processing error",
-                                "original_error": f"Failed to extract text from Document: {str(e)}",
-                                "file_size": file_size,
+                        error_msg = f"[File Extraction]Document processing error: Failed to extract text from Document: {str(e)}"
+                        await rag.doc_status.upsert({
+                            doc_id: {
+                                "status": DocStatus.FAILED,
+                                "error_msg": error_msg,
+                                "content_length": file_size,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
-                        logger.error(
-                            f"[File Extraction]Error processing Document {file_path.name}: {str(e)}"
-                        )
-                        return False, track_id
+                        })
+                        logger.error(f"[File Extraction]Error processing Document {file_path.name}: {str(e)}")
+                        return False, doc_id
 
                 case ".docx":
                     try:
@@ -1890,21 +1915,17 @@ async def pipeline_enqueue_file(
                             # Use python-docx (non-blocking via to_thread)
                             content = await asyncio.to_thread(_extract_docx, file)
                     except Exception as e:
-                        error_files = [
-                            {
-                                "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]DOCX processing error",
-                                "original_error": f"Failed to extract text from DOCX: {str(e)}",
-                                "file_size": file_size,
+                        error_msg = f"[File Extraction]DOCX processing error: Failed to extract text from DOCX: {str(e)}"
+                        await rag.doc_status.upsert({
+                            doc_id: {
+                                "status": DocStatus.FAILED,
+                                "error_msg": error_msg,
+                                "content_length": file_size,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
-                        logger.error(
-                            f"[File Extraction]Error processing DOCX {file_path.name}: {str(e)}"
-                        )
-                        return False, track_id
+                        })
+                        logger.error(f"[File Extraction]Error processing DOCX {file_path.name}: {str(e)}")
+                        return False, doc_id
 
                 case ".pptx":
                     try:
@@ -1920,21 +1941,17 @@ async def pipeline_enqueue_file(
                             # Use python-pptx (non-blocking via to_thread)
                             content = await asyncio.to_thread(_extract_pptx, file)
                     except Exception as e:
-                        error_files = [
-                            {
-                                "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]PPTX processing error",
-                                "original_error": f"Failed to extract text from PPTX: {str(e)}",
-                                "file_size": file_size,
+                        error_msg = f"[File Extraction]PPTX processing error: Failed to extract text from PPTX: {str(e)}"
+                        await rag.doc_status.upsert({
+                            doc_id: {
+                                "status": DocStatus.FAILED,
+                                "error_msg": error_msg,
+                                "content_length": file_size,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
-                        logger.error(
-                            f"[File Extraction]Error processing PPTX {file_path.name}: {str(e)}"
-                        )
-                        return False, track_id
+                        })
+                        logger.error(f"[File Extraction]Error processing PPTX {file_path.name}: {str(e)}")
+                        return False, doc_id
 
                 case ".xlsx":
                     try:
@@ -1950,97 +1967,140 @@ async def pipeline_enqueue_file(
                             # Use openpyxl (non-blocking via to_thread)
                             content = await asyncio.to_thread(_extract_xlsx, file)
                     except Exception as e:
-                        error_files = [
-                            {
-                                "file_path": str(file_path.name),
-                                "error_description": "[File Extraction]XLSX processing error",
-                                "original_error": f"Failed to extract text from XLSX: {str(e)}",
-                                "file_size": file_size,
+                        error_msg = f"[File Extraction]XLSX processing error: Failed to extract text from XLSX: {str(e)}"
+                        await rag.doc_status.upsert({
+                            doc_id: {
+                                "status": DocStatus.FAILED,
+                                "error_msg": error_msg,
+                                "content_length": file_size,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(
-                            error_files, track_id
-                        )
-                        logger.error(
-                            f"[File Extraction]Error processing XLSX {file_path.name}: {str(e)}"
-                        )
-                        return False, track_id
+                        })
+                        logger.error(f"[File Extraction]Error processing XLSX {file_path.name}: {str(e)}")
+                        return False, doc_id
 
                 case _:
-                    error_files = [
-                        {
-                            "file_path": str(file_path.name),
-                            "error_description": f"[File Extraction]Unsupported file type: {ext}",
-                            "original_error": f"File extension {ext} is not supported",
-                            "file_size": file_size,
+                    error_msg = f"[File Extraction]Unsupported file type: {ext} - File extension {ext} is not supported"
+                    await rag.doc_status.upsert({
+                        doc_id: {
+                            "status": DocStatus.FAILED,
+                            "error_msg": error_msg,
+                            "content_length": file_size,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
                         }
-                    ]
-                    await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                    logger.error(
-                        f"[File Extraction]Unsupported file type: {file_path.name} (extension {ext})"
-                    )
-                    return False, track_id
+                    })
+                    logger.error(f"[File Extraction]Unsupported file type: {file_path.name} (extension {ext})")
+                    return False, doc_id
 
         except Exception as e:
-            error_files = [
-                {
-                    "file_path": str(file_path.name),
-                    "error_description": "[File Extraction]File format processing error",
-                    "original_error": f"Unexpected error during file extracting: {str(e)}",
-                    "file_size": file_size,
+            error_msg = f"[File Extraction]File format processing error: Unexpected error during file extracting: {str(e)}"
+            await rag.doc_status.upsert({
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "error_msg": error_msg,
+                    "content_length": file_size,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
-            ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
-            logger.error(
-                f"[File Extraction]Unexpected error during {file_path.name} extracting: {str(e)}"
-            )
-            return False, track_id
+            })
+            logger.error(f"[File Extraction]Unexpected error during {file_path.name} extracting: {str(e)}")
+            return False, doc_id
 
         # Insert into the RAG queue
         if content:
             # Check if content contains only whitespace characters
             if not content.strip():
-                error_files = [
-                    {
-                        "file_path": str(file_path.name),
-                        "error_description": "[File Extraction]File contains only whitespace",
-                        "original_error": "File content contains only whitespace characters",
-                        "file_size": file_size,
+                error_msg = "[File Extraction]File contains only whitespace: File content contains only whitespace characters"
+                await rag.doc_status.upsert({
+                    doc_id: {
+                        "status": DocStatus.FAILED,
+                        "error_msg": error_msg,
+                        "content_length": file_size,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
-                ]
-                await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                logger.warning(
-                    f"[File Extraction]File contains only whitespace characters: {file_path.name}"
-                )
-                return False, track_id
+                })
+                logger.warning(f"[File Extraction]File contains only whitespace characters: {file_path.name}")
+                return False, doc_id
 
             try:
-                await rag.apipeline_enqueue_documents(
-                    content, file_paths=file_path.name, track_id=track_id
-                )
-
-                logger.info(
-                    f"Successfully extracted and enqueued file: {file_path.name}"
+                # Compute content_hash after successful extraction
+                from lightrag.utils import compute_content_hash, sanitize_text_for_encoding
+                
+                sanitized_content = sanitize_text_for_encoding(content)
+                content_hash = compute_content_hash(sanitized_content, rag.workspace)
+                
+                logger.debug(f"[Document] Computed content_hash for doc_id {doc_id}: {content_hash}")
+                
+                # Check for duplicate content using content_hash
+                is_duplicate, existing_doc_id = await rag.doc_status.check_duplicate_by_content_hash(
+                    content_hash=content_hash,
+                    exclude_doc_id=doc_id
                 )
                 
-                # Update track status to EXTRACTED
-                try:
-                    await rag.doc_status.upsert_track_status(
-                        track_id=track_id,
-                        status=DocStatus.EXTRACTED,
-                        metadata={"file_name": file_path.name}
-                    )
-                    logger.info(f"[Track] Set EXTRACTED status for track_id: {track_id}")
-                except Exception as e:
-                    logger.warning(f"[Track] Failed to set EXTRACTED status: {e}")
-                
-                # Delete extracting_doc_id after content-based doc_id is created
-                if extracting_doc_id:
+                if is_duplicate:
+                    # Mark as duplicate and store reference to original
+                    logger.info(f"[Document] Duplicate detected: doc_id {doc_id} is duplicate of {existing_doc_id}")
+                    
+                    await rag.doc_status.upsert({
+                        doc_id: {
+                            "status": DocStatus.DUPLICATED,
+                            "content_hash": content_hash,
+                            "content_summary": get_content_summary(content),
+                            "content_length": len(content),
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "metadata": {
+                                "file_name": file_path.name,
+                                "duplicate_of": existing_doc_id,
+                                "original_file_path": file_path.name
+                            }
+                        }
+                    })
+                    
+                    logger.info(f"[Document] Marked doc_id {doc_id} as DUPLICATED (original: {existing_doc_id})")
+                    
+                    # Move file to __enqueued__ directory even for duplicates
                     try:
-                        await rag.doc_status.delete([extracting_doc_id])
-                        logger.debug(f"[Extraction] Deleted EXTRACTING doc_id: {extracting_doc_id}")
-                    except Exception as e:
-                        logger.warning(f"[Extraction] Failed to delete EXTRACTING doc_id: {e}")
+                        enqueued_dir = file_path.parent / "__enqueued__"
+                        enqueued_dir.mkdir(exist_ok=True)
+                        unique_filename = get_unique_filename_in_enqueued(
+                            enqueued_dir, file_path.name
+                        )
+                        target_path = enqueued_dir / unique_filename
+                        file_path.rename(target_path)
+                        logger.debug(
+                            f"Moved duplicate file to enqueued directory: {file_path.name} -> {unique_filename}"
+                        )
+                    except Exception as move_error:
+                        logger.error(
+                            f"Failed to move duplicate file {file_path.name} to __enqueued__ directory: {move_error}"
+                        )
+                    
+                    return True, doc_id
+                
+                # Not a duplicate - proceed with normal processing
+                logger.debug(f"[Document] No duplicate found for doc_id {doc_id}, proceeding to chunking")
+                
+                # Update document with content_hash and status EXTRACTED
+                # This allows the document to be picked up by the chunking pipeline
+                await rag.doc_status.upsert({
+                    doc_id: {
+                        "status": DocStatus.EXTRACTED,
+                        "content_hash": content_hash,
+                        "content_summary": get_content_summary(content),
+                        "content_length": len(content),
+                        "file_path": file_path.name,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                })
+                
+                # Store full document content
+                await rag.full_docs.upsert({
+                    doc_id: {
+                        "content": content,
+                        "file_path": file_path.name,
+                    }
+                })
+                
+                logger.info(f"Successfully extracted and enqueued file: {file_path.name} with doc_id: {doc_id}")
 
                 # Move file to __enqueued__ directory after enqueuing
                 try:
@@ -2065,32 +2125,32 @@ async def pipeline_enqueue_file(
                     )
                     # Don't affect the main function's success status
 
-                return True, track_id
+                return True, doc_id
 
             except Exception as e:
-                error_files = [
-                    {
-                        "file_path": str(file_path.name),
-                        "error_description": "Document enqueue error",
-                        "original_error": f"Failed to enqueue document: {str(e)}",
-                        "file_size": file_size,
+                error_msg = f"Document enqueue error: Failed to enqueue document: {str(e)}"
+                await rag.doc_status.upsert({
+                    doc_id: {
+                        "status": DocStatus.FAILED,
+                        "error_msg": error_msg,
+                        "content_length": file_size,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
-                ]
-                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                })
                 logger.error(f"Error enqueueing document {file_path.name}: {str(e)}")
-                return False, track_id
+                return False, doc_id
         else:
-            error_files = [
-                {
-                    "file_path": str(file_path.name),
-                    "error_description": "No content extracted",
-                    "original_error": "No content could be extracted from file",
-                    "file_size": file_size,
+            error_msg = "No content extracted: No content could be extracted from file"
+            await rag.doc_status.upsert({
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "error_msg": error_msg,
+                    "content_length": file_size,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
-            ]
-            await rag.apipeline_enqueue_error_documents(error_files, track_id)
+            })
             logger.error(f"No content extracted from file: {file_path.name}")
-            return False, track_id
+            return False, doc_id
 
     except Exception as e:
         # Catch-all for any unexpected errors
@@ -2099,18 +2159,18 @@ async def pipeline_enqueue_file(
         except Exception:
             file_size = 0
 
-        error_files = [
-            {
-                "file_path": str(file_path.name),
-                "error_description": "Unexpected processing error",
-                "original_error": f"Unexpected error: {str(e)}",
-                "file_size": file_size,
+        error_msg = f"Unexpected processing error: {str(e)}"
+        await rag.doc_status.upsert({
+            doc_id: {
+                "status": DocStatus.FAILED,
+                "error_msg": error_msg,
+                "content_length": file_size,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-        ]
-        await rag.apipeline_enqueue_error_documents(error_files, track_id)
+        })
         logger.error(f"Enqueuing file {file_path.name} error: {str(e)}")
         logger.error(traceback.format_exc())
-        return False, track_id
+        return False, doc_id
     finally:
         if file_path.name.startswith(temp_prefix):
             try:
@@ -2119,14 +2179,28 @@ async def pipeline_enqueue_file(
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 
-async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = None):
-    """Index a file with track_id
+async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None, resolved_workspace_id: str = None) -> str:
+    """Index a file with optional doc_id for reprocessing
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
-        track_id: Optional tracking ID
+        doc_id: Optional document ID (for reprocessing existing documents)
+        resolved_workspace_id: Resolved workspace ID (for Celery task, defaults to rag.workspace or "default")
+        
+    Returns:
+        str: The document ID (UUID-based)
     """
+    from lightrag.utils import generate_doc_id
+    
+    # Generate UUID doc_id if not provided
+    if doc_id is None:
+        doc_id = generate_doc_id("doc-")
+    
+    # Resolve workspace_id for Celery task
+    if resolved_workspace_id is None:
+        resolved_workspace_id = rag.workspace if rag.workspace else "default"
+    
     # Check if Celery is available and enabled
     use_celery = (
         os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
@@ -2141,33 +2215,47 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = No
     
     if celery_available and use_celery:
         try:
-            workspace_id = rag.workspace
-            task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
-            return
+            # Use resolved_workspace_id to ensure consistency with database
+            # Empty workspace ("") is normalized to "default" for Celery tasks
+            task_extract_and_enqueue.delay(workspace_id=resolved_workspace_id, file_path_str=str(file_path), doc_id=doc_id)
+            return doc_id
         except Exception as e:
             logger.error(f"Error enqueueing file via Celery {file_path.name}, falling back to synchronous: {str(e)}")
             logger.error(traceback.format_exc())
     
     # Fallback to synchronous processing
     try:
-        await pipeline_enqueue_file(rag, file_path, track_id)
+        await pipeline_enqueue_file(rag, file_path, doc_id)
+        return doc_id
     except Exception as e:
         logger.error(f"Error indexing file {file_path.name}: {str(e)}")
         logger.error(traceback.format_exc())
+        raise
 
 
 async def pipeline_index_files(
-    rag: LightRAG, file_paths: List[Path], track_id: str = None
-):
+    rag: LightRAG, file_paths: List[Path], resolved_workspace_id: str = None
+) -> List[str]:
     """Index multiple files sequentially to avoid high CPU load
 
     Args:
         rag: LightRAG instance
         file_paths: Paths to the files to index
-        track_id: Optional tracking ID to pass to all files
+        resolved_workspace_id: Resolved workspace ID (for Celery task, defaults to rag.workspace or "default")
+
+    Returns:
+        List[str]: List of generated doc_ids (one per file)
     """
     if not file_paths:
-        return
+        return []
+    
+    from lightrag.utils import generate_doc_id
+    
+    # Resolve workspace_id for Celery task
+    if resolved_workspace_id is None:
+        resolved_workspace_id = rag.workspace if rag.workspace else "default"
+    
+    doc_ids = []
     
     # Check if Celery is available and enabled
     use_celery = (
@@ -2183,20 +2271,24 @@ async def pipeline_index_files(
     
     if celery_available and use_celery:
         try:
-            workspace_id = rag.workspace
-            
             # Use get_pinyin_sort_key for Chinese pinyin sorting
             sorted_file_paths = sorted(
                 file_paths, key=lambda p: get_pinyin_sort_key(str(p))
             )
 
-            # Process files sequentially with track_id through Celery
+            # Process files sequentially, generating unique doc_id for each
             for file_path in sorted_file_paths:
-                task_extract_and_enqueue.delay(workspace_id=workspace_id, file_path_str=str(file_path), track_id=track_id)
-            return
+                doc_id = generate_doc_id("doc-")
+                doc_ids.append(doc_id)
+                # Use resolved_workspace_id to ensure consistency with database
+                task_extract_and_enqueue.delay(workspace_id=resolved_workspace_id, file_path_str=str(file_path), doc_id=doc_id)
+            
+            return doc_ids
         except Exception as e:
             logger.error(f"Error enqueueing files via Celery, falling back to synchronous: {str(e)}")
             logger.error(traceback.format_exc())
+            # Clear doc_ids on error and fall through to synchronous processing
+            doc_ids = []
     
     # Fallback to synchronous processing
     try:
@@ -2206,28 +2298,42 @@ async def pipeline_index_files(
         )
         
         for file_path in sorted_file_paths:
-            await pipeline_enqueue_file(rag, file_path, track_id)
+            doc_id = generate_doc_id("doc-")
+            success, returned_doc_id = await pipeline_enqueue_file(rag, file_path, doc_id)
+            if success:
+                doc_ids.append(returned_doc_id)
+            else:
+                # Still add the doc_id even on failure so client can track the failed document
+                doc_ids.append(returned_doc_id)
+        
+        return doc_ids
     except Exception as e:
         logger.error(f"Error indexing files: {str(e)}")
         logger.error(traceback.format_exc())
+        return doc_ids
 
 
 async def pipeline_index_texts(
     rag: LightRAG,
     texts: List[str],
     file_sources: List[str] = None,
-    track_id: str = None,
-):
-    """Index a list of texts with track_id
+    doc_ids: List[str] = None,
+) -> List[str]:
+    """Index a list of texts, generating unique doc_id for each if not provided
 
     Args:
         rag: LightRAG instance
         texts: The texts to index
         file_sources: Sources of the texts
-        track_id: Optional tracking ID
+        doc_ids: Optional list of doc_ids (one per text). If not provided, UUIDs will be generated.
+
+    Returns:
+        List[str]: List of doc_ids (one per text)
     """
     if not texts:
-        return
+        return []
+    
+    from lightrag.utils import generate_doc_id
 
     normalized_file_sources: list[str] | None = None
     if file_sources:
@@ -2240,9 +2346,17 @@ async def pipeline_index_texts(
             normalized_file_sources.extend(
                 [UNKNOWN_FILE_SOURCE] * (len(texts) - len(normalized_file_sources))
             )
+    else:
+        normalized_file_sources = [UNKNOWN_FILE_SOURCE] * len(texts)
+
+    # Generate unique UUID doc_id for each text if not provided
+    if doc_ids is None:
+        doc_ids = [generate_doc_id("doc-") for _ in texts]
+    elif len(doc_ids) != len(texts):
+        raise ValueError("Number of doc_ids must match number of texts")
 
     await rag.apipeline_enqueue_documents(
-        input=texts, file_paths=normalized_file_sources, track_id=track_id
+        input=texts, ids=doc_ids, file_paths=normalized_file_sources
     )
     
     # Check if Celery is available and enabled
@@ -2267,23 +2381,29 @@ async def pipeline_index_texts(
         # When Celery is not available, the processing happens synchronously
         # through apipeline_enqueue_documents above
         logger.info("Processing texts synchronously (Celery not available or disabled)")
+    
+    return doc_ids
 
 
 async def run_scanning_process(
-    rag: LightRAG, doc_manager: DocumentManager, track_id: str = None
+    rag: LightRAG, doc_manager: DocumentManager
 ):
     """Background task to scan and index documents
 
     Args:
         rag: LightRAG instance
         doc_manager: DocumentManager instance
-        track_id: Optional tracking ID to pass to all scanned files
+        
+    Returns:
+        List[str]: List of generated doc_ids for the scanned files
     """
     try:
         new_files = doc_manager.scan_directory_for_new_files()
         total_files = len(new_files)
         logger.info(f"Found {total_files} files to index.")
 
+        doc_ids = []
+        
         if new_files:
             # Check for files with PROCESSED status and filter them out
             valid_files = []
@@ -2303,7 +2423,7 @@ async def run_scanning_process(
 
             # Process valid files (new files + non-PROCESSED status files)
             if valid_files:
-                await pipeline_index_files(rag, valid_files, track_id)
+                doc_ids = await pipeline_index_files(rag, valid_files, resolved_workspace_id)
                 if processed_files:
                     logger.info(
                         f"Scanning process completed: {len(valid_files)} files Processed {len(processed_files)} skipped."
@@ -2322,10 +2442,13 @@ async def run_scanning_process(
                 "No upload file found, check if there are any documents in the queue..."
             )
             await rag.apipeline_process_enqueue_documents()
+        
+        return doc_ids
 
     except Exception as e:
         logger.error(f"Error during scanning process: {str(e)}")
         logger.error(traceback.format_exc())
+        return []
 
 
 async def background_delete_documents(
@@ -2648,28 +2771,35 @@ def create_document_routes(
         Trigger the scanning process for new documents.
 
         This endpoint initiates a background task that scans the input directory for new documents
-        and processes them. If a scanning process is already running, it returns a status indicating
-        that fact.
+        and processes them. Returns an array of doc_ids for the files that will be processed.
 
         Returns:
-            ScanResponse: A response object containing the scanning status and track_id
+            ScanResponse: A response object containing the scanning status and doc_ids array
         """
         resolved_workspace_id, current_rag, current_doc_manager = (
             await resolve_request_context(request, workspace_id)
         )
 
-        # Generate track_id with "scan" prefix for scanning operation
-        track_id = generate_track_id("scan")
-
-        # Start the scanning process in the background with track_id
+        # Scan for new files to get count
+        new_files = current_doc_manager.scan_directory_for_new_files()
+        
+        # Generate doc_ids for the files
+        from lightrag.utils import generate_doc_id
+        doc_ids = [generate_doc_id("doc-") for _ in new_files]
+        
+        # Start the scanning process in the background
         background_tasks.add_task(
-            run_scanning_process, current_rag, current_doc_manager, track_id
+            run_scanning_process, current_rag, current_doc_manager
         )
+        
         return ScanResponse(
             status="scanning_started",
-            message="Scanning process has been initiated in the background",
+            message=f"Scanning process has been initiated in the background. Found {len(new_files)} files to process.",
             workspace_id=resolved_workspace_id,
-            track_id=track_id,
+            doc_ids=doc_ids,
+            total_files=len(new_files),
+            queued_files=len(doc_ids),
+            failed_files=0,
         )
 
     @router.post(
@@ -2699,21 +2829,20 @@ def create_document_routes(
 
         1. **Filename Duplicate (Synchronous Detection)**:
            - Detected immediately before file processing
-           - Returns `status="duplicated"` with the existing document's track_id
+           - Returns `status="duplicated"` with the existing document's doc_id
            - Two cases:
-             - If filename exists in document storage: returns existing track_id
-             - If filename exists in file system only: returns empty track_id ("")
+             - If filename exists in document storage: returns existing doc_id
+             - If filename exists in file system only: returns empty doc_id ("")
 
         2. **Content Duplicate (Asynchronous Detection)**:
            - Detected during background processing after content extraction
-           - Returns `status="success"` with a new track_id immediately
+           - Returns `status="success"` with a new doc_id immediately
            - The duplicate is detected later when processing the file content
-           - Use `/documents/track_status/{track_id}` to check the final result:
+           - Use `/documents/{doc_id}` to check the final result:
              - Document will have `status="FAILED"`
              - `error_msg` contains "Content already exists. Original doc_id: xxx"
              - `metadata.is_duplicate=true` with reference to original document
              - `metadata.original_doc_id` points to the existing document
-             - `metadata.original_track_id` shows the original upload's track_id
 
         **Why Different Behavior?**
         - Filename check is fast (simple lookup), done synchronously
@@ -2727,7 +2856,7 @@ def create_document_routes(
         Returns:
             InsertResponse: A response object containing the upload status and a message.
                 - status="success": File accepted and queued for processing
-                - status="duplicated": Filename already exists (see track_id for existing document)
+                - status="duplicated": Filename already exists (check doc_id for existing document)
 
         Raises:
             HTTPException: If the file type is not supported (400), file too large (413), or other errors occur (500).
@@ -2775,10 +2904,9 @@ def create_document_routes(
             )
             retry_failed_file = False
             if existing_doc_data:
-                # Get document status and track_id from existing document
+                # Get document status and doc_id from existing document
                 status = existing_doc_data.get("status", "unknown")
-                # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
-                existing_track_id = existing_doc_data.get("track_id") or ""
+                existing_doc_id = existing_doc_data.get("id", "")
                 normalized_status = str(status).strip().lower()
 
                 # Allow retry when previous extraction failed for the same filename.
@@ -2802,7 +2930,7 @@ def create_document_routes(
                         status="duplicated",
                         message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
                         workspace_id=resolved_workspace_id,
-                        track_id=existing_track_id,
+                        doc_id=existing_doc_id,
                     )
 
             file_path = current_doc_manager.input_dir / safe_filename
@@ -2867,14 +2995,14 @@ def create_document_routes(
                                     "Please wait for processing to finish or cancel the pipeline."
                                 ),
                                 workspace_id=resolved_workspace_id,
-                                track_id="",
+                                doc_id="",
                             )
                     else:
                         return InsertResponse(
                             status="duplicated",
                             message=f"File '{safe_filename}' already exists in the input directory.",
                             workspace_id=resolved_workspace_id,
-                            track_id="",
+                            doc_id="",
                         )
 
             # Async streaming write with size check
@@ -2916,18 +3044,19 @@ def create_document_routes(
                     detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
                 )
 
-            track_id = generate_track_id("upload")
-
-            # Add to background tasks and get track_id
+            # Generate doc_id and add to background tasks
+            from lightrag.utils import generate_doc_id
+            doc_id = generate_doc_id("doc-")
+            
             background_tasks.add_task(
-                pipeline_index_file, current_rag, file_path, track_id
+                pipeline_index_file, current_rag, file_path, doc_id
             )
 
             return InsertResponse(
                 status="success",
                 message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
                 workspace_id=resolved_workspace_id,
-                track_id=track_id,
+                doc_id=doc_id,
             )
 
         except HTTPException:
@@ -3136,16 +3265,15 @@ def create_document_routes(
                     request.file_source
                 )
                 if existing_doc_data:
-                    # Get document status and track_id from existing document
+                    # Get document status and doc_id from existing document
                     status = existing_doc_data.get("status", "unknown")
-                    # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
-                    existing_track_id = existing_doc_data.get("track_id") or ""
+                    existing_doc_id = existing_doc_data.get("id", "")
                     logger.info(f"[insert_text] File source already exists, returning duplicated")
                     return InsertResponse(
                         status="duplicated",
                         message=f"File source '{request.file_source}' already exists in document storage (Status: {status}).",
                         workspace_id=resolved_workspace_id,
-                        track_id=existing_track_id,
+                        doc_id=existing_doc_id,
                     )
 
             logger.info("[insert_text] Checking for duplicate content...")
@@ -3154,27 +3282,28 @@ def create_document_routes(
             content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
             existing_doc = await current_rag.doc_status.get_by_id(content_doc_id)
             if existing_doc:
-                # Content already exists, return duplicated with existing track_id
+                # Content already exists, return duplicated with existing doc_id
                 status = existing_doc.get("status", "unknown")
-                existing_track_id = existing_doc.get("track_id") or ""
+                existing_doc_id = existing_doc.get("id", content_doc_id)
                 logger.info(f"[insert_text] Content already exists, returning duplicated")
                 return InsertResponse(
                     status="duplicated",
                     message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
                     workspace_id=resolved_workspace_id,
-                    track_id=existing_track_id,
+                    doc_id=existing_doc_id,
                 )
 
-            # Generate track_id for text insertion
-            track_id = generate_track_id("insert")
-            logger.info(f"[insert_text] Adding background task with track_id: {track_id}")
+            # Generate doc_id for text insertion
+            from lightrag.utils import generate_doc_id
+            doc_id = generate_doc_id("doc-")
+            logger.info(f"[insert_text] Adding background task for text insertion with doc_id: {doc_id}")
 
             background_tasks.add_task(
                 pipeline_index_texts,
                 current_rag,
                 [request.text],
                 file_sources=[request.file_source],
-                track_id=track_id,
+                doc_ids=[doc_id],
             )
 
             logger.info(f"[insert_text] Returning success response")
@@ -3182,7 +3311,7 @@ def create_document_routes(
                 status="success",
                 message=f"Text successfully received with title '{request.file_source}'. Processing will continue in background.",
                 workspace_id=resolved_workspace_id,
-                track_id=track_id,
+                doc_id=doc_id,
             )
         except Exception as e:
             logger.error(f"Error /documents/text: {str(e)}")
@@ -3191,7 +3320,7 @@ def create_document_routes(
 
     @router.post(
         "/texts",
-        response_model=InsertResponse,
+        response_model=BatchInsertResponse,
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
@@ -3213,7 +3342,7 @@ def create_document_routes(
             background_tasks: FastAPI BackgroundTasks for async processing
 
         Returns:
-            InsertResponse: A response object containing the status of the operation.
+            BatchInsertResponse: A response object containing the status and doc_ids array.
 
         Raises:
             HTTPException: If an error occurs during text processing (500).
@@ -3253,15 +3382,18 @@ def create_document_routes(
                             )
                         )
                         if existing_doc_data:
-                            # Get document status and track_id from existing document
+                            # Get document status and doc_id from existing document
                             status = existing_doc_data.get("status", "unknown")
-                            # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
-                            existing_track_id = existing_doc_data.get("track_id") or ""
-                            return InsertResponse(
-                                status="duplicated",
+                            existing_doc_id = existing_doc_data.get("id", "")
+                            # For batch operations, return failure for any duplicate
+                            return BatchInsertResponse(
+                                status="failure",
                                 message=f"File source '{file_source}' already exists in document storage (Status: {status}).",
                                 workspace_id=resolved_workspace_id,
-                                track_id=existing_track_id,
+                                doc_ids=[existing_doc_id] if existing_doc_id else [],
+                                total_files=len(request.texts),
+                                queued_files=0,
+                                failed_files=len(request.texts),
                             )
 
             # Check if any content already exists by computing content hash (doc_id)
@@ -3270,32 +3402,39 @@ def create_document_routes(
                 content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
                 existing_doc = await current_rag.doc_status.get_by_id(content_doc_id)
                 if existing_doc:
-                    # Content already exists, return duplicated with existing track_id
+                    # Content already exists, return failure with existing doc_id
                     status = existing_doc.get("status", "unknown")
-                    existing_track_id = existing_doc.get("track_id") or ""
-                    return InsertResponse(
-                        status="duplicated",
+                    existing_doc_id = existing_doc.get("id", content_doc_id)
+                    return BatchInsertResponse(
+                        status="failure",
                         message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
                         workspace_id=resolved_workspace_id,
-                        track_id=existing_track_id,
+                        doc_ids=[existing_doc_id],
+                        total_files=len(request.texts),
+                        queued_files=0,
+                        failed_files=len(request.texts),
                     )
 
-            # Generate track_id for texts insertion
-            track_id = generate_track_id("insert")
+            # Generate doc_ids for texts insertion
+            from lightrag.utils import generate_doc_id
+            doc_ids = [generate_doc_id("doc-") for _ in request.texts]
 
             background_tasks.add_task(
                 pipeline_index_texts,
                 current_rag,
                 request.texts,
                 file_sources=request.file_sources,
-                track_id=track_id,
+                doc_ids=doc_ids,
             )
 
-            return InsertResponse(
+            return BatchInsertResponse(
                 status="success",
-                message=f"Texts successfully received with auto-generated titles. Processing will continue in background.",
+                message=f"{len(request.texts)} texts successfully received with auto-generated titles. Processing will continue in background.",
                 workspace_id=resolved_workspace_id,
-                track_id=track_id,
+                doc_ids=doc_ids,
+                total_files=len(request.texts),
+                queued_files=len(doc_ids),
+                failed_files=0,
             )
         except Exception as e:
             logger.error(f"Error /documents/texts: {str(e)}")
@@ -3719,7 +3858,6 @@ def create_document_routes(
                             created_at=format_datetime(doc_status.created_at),
                             updated_at=format_datetime(doc_status.updated_at),
                             workspace_id=current_rag.workspace,
-                            track_id=doc_status.track_id,
                             chunks_count=doc_status.chunks_count,
                             error_msg=doc_status.error_msg,
                             metadata=doc_status.metadata,
@@ -4044,97 +4182,39 @@ def create_document_routes(
 
     @router.get(
         "/track_status/{track_id}",
-        response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
+        deprecated=True,
     )
     async def get_track_status(
         track_id: str,
         request: Request,
         workspace_id: Optional[str] = None,
-    ) -> TrackStatusResponse:
+    ):
         """
-        Get the processing status of documents by tracking ID.
-
-        This endpoint retrieves all documents associated with a specific tracking ID,
-        allowing users to monitor the processing progress of their uploaded files or inserted texts.
+        [DEPRECATED] Get the processing status of documents by tracking ID.
+        
+        This endpoint is deprecated and has been removed.
+        Use individual document status queries with doc_id instead.
+        
+        Migration Guide:
+        - Instead of tracking by track_id, track individual documents by their doc_id
+        - Use GET /documents/{doc_id} to query individual document status
+        - Use POST /documents/paginated to query multiple documents
 
         Args:
-            track_id (str): The tracking ID returned from upload, text, or texts endpoints
+            track_id (str): The tracking ID (no longer supported)
 
         Returns:
-            TrackStatusResponse: A response object containing:
-                - track_id: The tracking ID
-                - documents: List of documents associated with this track_id
-                - total_count: Total number of documents for this track_id
+            TrackStatusResponse: Empty response with deprecation notice
 
         Raises:
-            HTTPException: If track_id is invalid (400) or an error occurs (500).
+            HTTPException: 410 Gone - This endpoint has been removed
         """
-        try:
-            resolved_workspace_id, current_rag, _ = await resolve_request_context(
-                request, workspace_id
-            )
-
-            # Validate track_id
-            if not track_id or not track_id.strip():
-                raise HTTPException(status_code=400, detail="Track ID cannot be empty")
-
-            track_id = track_id.strip()
-
-            # Get documents by track_id
-            docs_by_track_id = await current_rag.aget_docs_by_track_id(track_id)
-
-            # Convert to response format
-            documents = []
-            status_summary = {}
-            track_status = None
-
-            for doc_id, doc_status in docs_by_track_id.items():
-                # Skip track summary document (id starts with "track-")
-                if doc_id.startswith("track-"):
-                    track_status = doc_status.status
-                    continue
-                    
-                documents.append(
-                    DocStatusResponse(
-                        id=doc_id,
-                        content_summary=doc_status.content_summary,
-                        content_length=doc_status.content_length,
-                        status=doc_status.status,
-                        created_at=format_datetime(doc_status.created_at),
-                        updated_at=format_datetime(doc_status.updated_at),
-                        workspace_id=current_rag.workspace,
-                        track_id=doc_status.track_id,
-                        chunks_count=doc_status.chunks_count,
-                        error_msg=doc_status.error_msg,
-                        metadata=doc_status.metadata,
-                        file_path=normalize_file_path(doc_status.file_path),
-                    )
-                )
-
-                # Build status summary
-                # Handle both DocStatus enum and string cases for robust deserialization
-                status_key = str(doc_status.status)
-                status_summary[status_key] = status_summary.get(status_key, 0) + 1
-            
-            # If no documents but have track_status, use track_status for summary
-            if not documents and track_status:
-                status_summary[str(track_status)] = 1
-
-            return TrackStatusResponse(
-                track_id=track_id,
-                workspace_id=resolved_workspace_id,
-                documents=documents,
-                total_count=len(documents),
-                status_summary=status_summary,
-            )
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error getting track status for {track_id}: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=410,
+            detail="This endpoint has been removed. Track documents individually using their doc_id instead. "
+                   "Use GET /documents/{doc_id} for individual status or POST /documents/paginated for multiple documents."
+        )
 
     @router.post(
         "/paginated",
@@ -4196,7 +4276,6 @@ def create_document_routes(
                         created_at=format_datetime(doc.created_at),
                         updated_at=format_datetime(doc.updated_at),
                         workspace_id=current_rag.workspace,
-                        track_id=doc.track_id,
                         chunks_count=doc.chunks_count,
                         error_msg=doc.error_msg,
                         metadata=doc.metadata,
@@ -4286,7 +4365,6 @@ def create_document_routes(
                                 created_at=format_datetime(doc.created_at),
                                 updated_at=format_datetime(doc.updated_at),
                                 workspace_id=current_rag.workspace,
-                                track_id=doc.track_id,
                                 chunks_count=doc.chunks_count,
                                 error_msg=doc.error_msg,
                                 metadata=doc.metadata,
@@ -4341,26 +4419,27 @@ def create_document_routes(
     async def get_document_status_counts(
         request: Request, 
         workspace_id: Optional[str] = None,
-        count_by: str = "track"  # "track" or "document"
+        count_by: str = "document"  # Only "document" is supported (track_id removed)
     ) -> StatusCountsResponse:
         """
         Get counts by status.
 
         This endpoint retrieves the count in each processing status.
-        Can count by track_id (default) or by document_id.
+        Counts by document_id (each document = 1 count).
         
         Args:
-            count_by: "track" to count by track_id (each upload = 1 count),
-                     "document" to count by doc_id (each document = 1 count)
+            count_by: "document" to count by doc_id (each document = 1 count)
+                     Note: "track" option has been removed as track_id is deprecated
         
-        Status categories:
+        Status categories (simplified 6-state model):
         - UPLOADING: File đang được upload (reserved for future use)
-        - EXTRACTING: Đang extract full text (OCR/Docling)
-        - EXTRACTED: Đã extract xong, chờ chunking + KG
-        - CHUNKING: Đang chunking + extract entities
-        - CHUNKED: Đã chunking, chờ multimodal processing
-        - PROCESSED: Hoàn thành tất cả
-        - FAILED: Lỗi ở bất kỳ stage nào
+        - EXTRACTING: Đang extract full text (OCR/Docling) - handled by extraction worker
+        - EXTRACTED: Đã extract xong, chờ chunking + KG - ready for chunking worker
+        - CHUNKING: Đang chunking + extract entities - handled by chunking/KG worker
+        - PROCESSED: Hoàn thành tất cả - final state
+        - FAILED: Lỗi ở bất kỳ stage nào - can be reprocessed
+        
+        Legacy statuses (deprecated): PENDING, PROCESSING, PREPROCESSED, CHUNKED
 
         Returns:
             StatusCountsResponse: A response object containing status counts
@@ -4380,31 +4459,26 @@ def create_document_routes(
 
             workspaces_stats = None
             
-            # Use track-based or document-based counting
+            # Only document-based counting is supported (track_id removed)
             if count_by == "track":
-                if not is_explicit:
-                    # Get track counts across all workspaces
-                    workspaces_stats = await current_rag.doc_status.get_status_counts_by_track_across_workspaces()
-                    total_counts = {"all": 0}
-                    for ws_stats in workspaces_stats.values():
-                        for status, count in ws_stats.items():
-                            total_counts[status] = total_counts.get(status, 0) + count
-                    status_counts = total_counts
-                else:
-                    status_counts = await current_rag.doc_status.get_status_counts_by_track()
+                # Return error for deprecated track-based counting
+                raise HTTPException(
+                    status_code=400,
+                    detail="count_by='track' is no longer supported. track_id has been removed. Use count_by='document' instead."
+                )
+            
+            # Document-based counting
+            if not is_explicit:
+                workspaces_stats = (
+                    await current_rag.doc_status.get_status_counts_across_workspaces()
+                )
+                total_counts = {"all": 0}
+                for ws_stats in workspaces_stats.values():
+                    for status, count in ws_stats.items():
+                        total_counts[status] = total_counts.get(status, 0) + count
+                status_counts = total_counts
             else:
-                # Original document-based counting
-                if not is_explicit:
-                    workspaces_stats = (
-                        await current_rag.doc_status.get_status_counts_across_workspaces()
-                    )
-                    total_counts = {"all": 0}
-                    for ws_stats in workspaces_stats.values():
-                        for status, count in ws_stats.items():
-                            total_counts[status] = total_counts.get(status, 0) + count
-                    status_counts = total_counts
-                else:
-                    status_counts = await current_rag.doc_status.get_all_status_counts()
+                status_counts = await current_rag.doc_status.get_all_status_counts()
 
             return StatusCountsResponse(
                 workspace_id=resolved_workspace_id,
@@ -4412,6 +4486,8 @@ def create_document_routes(
                 workspaces=workspaces_stats,
             )
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error getting document status counts: {str(e)}")
             logger.error(traceback.format_exc())
@@ -4428,25 +4504,28 @@ def create_document_routes(
         workspace_id: Optional[str] = None,
     ):
         """
-        Reprocess failed and pending documents.
+        Reprocess failed and stuck documents.
 
         This endpoint triggers the document processing pipeline which automatically
         picks up and reprocesses documents in the following statuses:
         - FAILED: Documents that failed during previous processing attempts
-        - PENDING: Documents waiting to be processed
-        - PROCESSING: Documents with abnormally terminated processing (e.g., server crashes)
+        - EXTRACTING: Documents stuck in extraction phase (e.g., worker crashes)
+        - EXTRACTED: Documents ready for chunking/KG processing
+        - PENDING: Legacy status (mapped to EXTRACTED)
+        - PROCESSING: Legacy status (mapped to CHUNKING)
 
-        This is useful for recovering from server crashes, network errors, LLM service
-        outages, or other temporary failures that caused document processing to fail.
+        This is useful for recovering from:
+        - Server crashes or worker terminations
+        - Network errors or timeouts
+        - LLM service outages
+        - Extraction failures (OCR/Docling errors)
+        - Any temporary failures during processing
 
         The processing happens in the background and can be monitored by checking the
-        pipeline status. The reprocessed documents retain their original track_id from
-        initial upload, so use their original track_id to monitor progress.
+        pipeline status.
 
         Returns:
             ReprocessResponse: Response with status and message.
-                track_id is always empty string because reprocessed documents retain
-                their original track_id from initial upload.
 
         Raises:
             HTTPException: If an error occurs while initiating reprocessing (500).
@@ -4454,20 +4533,183 @@ def create_document_routes(
         try:
             _, current_rag, _ = await resolve_request_context(request, workspace_id)
 
-            # Start the reprocessing in the background
-            # Note: Reprocessed documents retain their original track_id from initial upload
-            background_tasks.add_task(
-                current_rag.apipeline_process_enqueue_documents, reprocess_failed=True
-            )
-            logger.info("Reprocessing of failed documents initiated")
+            # Count documents that will be reprocessed
+            documents_count = 0
+            workspaces_to_process = []
+            
+            try:
+                if workspace_id:
+                    # Single workspace - get counts for this workspace only
+                    status_counts = await current_rag.doc_status.get_all_status_counts()
+                    documents_count = (
+                        status_counts.get(DocStatus.FAILED.value, 0) +
+                        status_counts.get(DocStatus.PENDING.value, 0) +
+                        status_counts.get(DocStatus.PROCESSING.value, 0) +
+                        status_counts.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
+                    )
+                    if documents_count > 0:
+                        workspaces_to_process = [current_rag.workspace]
+                else:
+                    # All workspaces - get counts across all workspaces
+                    workspaces_stats = await current_rag.doc_status.get_status_counts_across_workspaces()
+                    
+                    # Find workspaces with failed/pending/processing/extracting documents
+                    for ws_id, ws_stats in workspaces_stats.items():
+                        ws_failed_count = (
+                            ws_stats.get(DocStatus.FAILED.value, 0) +
+                            ws_stats.get(DocStatus.PENDING.value, 0) +
+                            ws_stats.get(DocStatus.PROCESSING.value, 0) +
+                            ws_stats.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
+                        )
+                        if ws_failed_count > 0:
+                            workspaces_to_process.append(ws_id)
+                            documents_count += ws_failed_count
+                        
+            except Exception as count_error:
+                logger.warning(f"Failed to count documents for reprocessing: {str(count_error)}")
+                logger.warning(traceback.format_exc())
+                # Continue with reprocessing even if count fails
+                documents_count = 0
+                workspaces_to_process = [current_rag.workspace] if workspace_id else []
+
+            # Start the reprocessing in the background for each workspace
+            if workspace_id:
+                # Single workspace reprocess
+                background_tasks.add_task(
+                    current_rag.apipeline_process_enqueue_documents, reprocess_failed=True
+                )
+                workspace_msg = f"in workspace '{current_rag.workspace}'"
+            else:
+                # Multi-workspace reprocess - use Celery task for each workspace
+                try:
+                    from celery_worker.tasks import apipeline_process_enqueue_documents_task
+                    
+                    for ws_id in workspaces_to_process:
+                        try:
+                            # Trigger Celery task for each workspace
+                            apipeline_process_enqueue_documents_task.delay(
+                                workspace_id=ws_id,
+                                reprocess_failed=True
+                            )
+                            logger.info(f"Triggered reprocess Celery task for workspace: {ws_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to trigger reprocess for workspace {ws_id}: {str(e)}")
+                            logger.error(traceback.format_exc())
+                    
+                    workspace_msg = f"across {len(workspaces_to_process)} workspace(s)"
+                except ImportError as e:
+                    logger.error(f"Failed to import Celery task: {e}")
+                    workspace_msg = "failed - Celery not available"
+                    documents_count = 0
+            
+            logger.info(f"Reprocessing of {documents_count} failed documents {workspace_msg} initiated")
 
             return ReprocessResponse(
                 status="reprocessing_started",
-                message="Reprocessing of failed documents has been initiated in background. Documents retain their original track_id.",
+                message=f"Reprocessing of {documents_count} failed documents has been initiated in background.",
+                documents_count=documents_count
             )
 
         except Exception as e:
             logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/{doc_id}",
+        response_model=DocStatusResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Get document status by document ID",
+    )
+    async def get_document_by_id(
+        doc_id: str,
+        request: Request,
+        workspace_id: Optional[str] = None,
+    ) -> DocStatusResponse:
+        """
+        Get the processing status of a single document by its document ID.
+        
+        This endpoint retrieves detailed information about a specific document including:
+        - Processing status (UPLOADING, EXTRACTING, EXTRACTED, CHUNKING, PROCESSED, FAILED)
+        - Content summary and length
+        - Chunk count
+        - Error messages (if any)
+        - Metadata
+        - Timestamps (created_at, updated_at)
+        
+        Args:
+            doc_id (str): The document ID (format: doc-{uuid})
+            workspace_id (Optional[str]): Workspace identifier (optional, can be inferred from context)
+
+        Returns:
+            DocStatusResponse: Document status information
+
+        Raises:
+            HTTPException: 
+                - 400 if doc_id is invalid
+                - 404 if document not found
+                - 500 if an error occurs while retrieving document status
+        """
+        try:
+            # Validate doc_id format
+            if not doc_id or not doc_id.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Document ID cannot be empty"
+                )
+            
+            doc_id = doc_id.strip()
+            
+            # Resolve workspace context
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                request, workspace_id
+            )
+            
+            # Get document by ID
+            doc_data = await current_rag.doc_status.get_by_id(doc_id)
+            
+            if not doc_data:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Document with ID '{doc_id}' not found in workspace '{resolved_workspace_id}'"
+                )
+            
+            # Convert to DocStatusResponse
+            # Handle both dict and DocProcessingStatus object
+            if isinstance(doc_data, dict):
+                return DocStatusResponse(
+                    id=doc_id,
+                    content_summary=doc_data.get("content_summary", ""),
+                    content_length=doc_data.get("content_length", 0),
+                    status=doc_data.get("status", DocStatus.FAILED),
+                    created_at=format_datetime(doc_data.get("created_at")),
+                    updated_at=format_datetime(doc_data.get("updated_at")),
+                    workspace_id=resolved_workspace_id,
+                    chunks_count=doc_data.get("chunks_count"),
+                    error_msg=doc_data.get("error_msg"),
+                    metadata=doc_data.get("metadata"),
+                    file_path=normalize_file_path(doc_data.get("file_path", "")),
+                )
+            else:
+                # DocProcessingStatus object
+                return DocStatusResponse(
+                    id=doc_id,
+                    content_summary=getattr(doc_data, "content_summary", ""),
+                    content_length=getattr(doc_data, "content_length", 0),
+                    status=getattr(doc_data, "status", DocStatus.FAILED),
+                    created_at=format_datetime(getattr(doc_data, "created_at", None)),
+                    updated_at=format_datetime(getattr(doc_data, "updated_at", None)),
+                    workspace_id=resolved_workspace_id,
+                    chunks_count=getattr(doc_data, "chunks_count", None),
+                    error_msg=getattr(doc_data, "error_msg", None),
+                    metadata=getattr(doc_data, "metadata", None),
+                    file_path=normalize_file_path(getattr(doc_data, "file_path", "")),
+                )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error getting document by ID '{doc_id}': {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

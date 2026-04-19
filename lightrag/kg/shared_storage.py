@@ -555,6 +555,7 @@ class KeyedUnifiedLock:
         self._last_async_cleanup_time: Optional[float] = (
             None  # track last async cleanup time for minimum interval
         )
+        self._pid = os.getpid()  # track process ID to detect forks
 
     def __call__(
         self, namespace: str, keys: list[str], *, enable_logging: Optional[bool] = None
@@ -575,8 +576,24 @@ class KeyedUnifiedLock:
         )
 
     def _get_or_create_async_lock(self, combined_key: str) -> asyncio.Lock:
+        # Detect if we're in a forked process (Celery worker)
+        current_pid = os.getpid()
+        if current_pid != self._pid:
+            # Process was forked! Clear all async locks as they're bound to parent's event loop
+            direct_log(
+                f"Process fork detected (parent PID: {self._pid}, current PID: {current_pid}). "
+                f"Clearing {len(self._async_lock)} async locks.",
+                level="INFO",
+                enable_output=True,
+            )
+            self._async_lock.clear()
+            self._async_lock_count.clear()
+            self._async_lock_cleanup_data.clear()
+            self._pid = current_pid
+        
         async_lock = self._async_lock.get(combined_key)
         count = self._async_lock_count.get(combined_key, 0)
+        
         if async_lock is None:
             async_lock = asyncio.Lock()
             self._async_lock[combined_key] = async_lock

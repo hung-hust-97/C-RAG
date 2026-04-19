@@ -716,24 +716,32 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 class DocStatus(str, Enum):
     """Document processing status
     
-    Status flow:
-    UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → CHUNKED → PROCESSED
-                     ↓           ↓          ↓          ↓          ↓
-                  FAILED      FAILED     FAILED     FAILED     FAILED
+    Simplified status flow (6 states):
+    UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
+                     ↓           ↓          ↓          ↓
+                  FAILED      FAILED     FAILED     FAILED
+    
+    Each status corresponds to a processing stage that workers can handle:
+    - UPLOADING: File đang được upload (reserved for future use)
+    - EXTRACTING: Đang extract full text (OCR/Docling) - handled by extraction worker
+    - EXTRACTED: Đã extract xong, chờ chunking + KG - ready for chunking worker
+    - CHUNKING: Đang chunking + extract entities - handled by chunking/KG worker
+    - PROCESSED: Hoàn thành tất cả - final state
+    - FAILED: Lỗi ở bất kỳ stage nào - can be reprocessed
     """
 
-    UPLOADING = "uploading"           # File đang được upload (chưa dùng, dự phòng)
+    UPLOADING = "uploading"           # File đang được upload
     EXTRACTING = "extracting"         # Đang extract full text (OCR/Docling)
     EXTRACTED = "extracted"           # Đã extract xong, chờ chunking + KG
     CHUNKING = "chunking"             # Đang chunking + extract entities
-    CHUNKED = "chunked"               # Đã chunking, chờ multimodal processing
     PROCESSED = "processed"           # Hoàn thành tất cả
     FAILED = "failed"                 # Lỗi ở bất kỳ stage nào
     
-    # Legacy statuses for backward compatibility (will be migrated)
+    # Legacy statuses for backward compatibility (deprecated, will be removed)
     PENDING = "pending"               # Legacy: mapped to EXTRACTED
     PROCESSING = "processing"         # Legacy: mapped to CHUNKING
-    PREPROCESSED = "preprocessed"     # Legacy: mapped to CHUNKED
+    PREPROCESSED = "preprocessed"     # Legacy: deprecated
+    CHUNKED = "chunked"               # Legacy: deprecated
 
 
 @dataclass
@@ -752,8 +760,8 @@ class DocProcessingStatus:
     """ISO format timestamp when document was created"""
     updated_at: str
     """ISO format timestamp when document was last updated"""
-    track_id: str | None = None
-    """Tracking ID for monitoring progress"""
+    content_hash: str | None = None
+    """MD5 hash of document content for duplicate detection"""
     chunks_count: int | None = None
     """Number of chunks after splitting, used for processing"""
     chunks_list: list[str] | None = field(default_factory=list)
@@ -762,6 +770,8 @@ class DocProcessingStatus:
     """Error message if failed"""
     error_stage: str | None = None
     """Stage where error occurred: 'extraction', 'chunking', 'entity_extraction', 'graph_building', 'multimodal'"""
+    track_id: str | None = None
+    """Track ID for grouping related documents"""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional metadata"""
     multimodal_processed: bool | None = field(default=None, repr=False)
@@ -807,12 +817,6 @@ class DocStatusStorage(BaseKVStorage, ABC):
         self, status: DocStatus
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents with a specific status"""
-
-    @abstractmethod
-    async def get_docs_by_track_id(
-        self, track_id: str
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific track_id"""
 
     @abstractmethod
     async def get_docs_paginated(

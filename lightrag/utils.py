@@ -3057,6 +3057,123 @@ def generate_track_id(prefix: str = "upload") -> str:
     return f"{prefix}_{timestamp}_{unique_id}"
 
 
+def generate_doc_id(prefix: str = "doc-") -> str:
+    """Generate a unique UUID-based document identifier.
+
+    This function generates a globally unique document ID using UUID4,
+    enabling immediate document tracking before content extraction.
+    Unlike the old content-based MD5 hashing approach, this allows
+    documents to be tracked through all lifecycle stages including EXTRACTING.
+
+    Args:
+        prefix: Prefix for the document ID. Default is "doc-".
+
+    Returns:
+        str: Unique document ID in format: {prefix}{uuid4}
+
+    Examples:
+        >>> doc_id = generate_doc_id()
+        >>> doc_id.startswith("doc-")
+        True
+        >>> len(doc_id) == 40  # "doc-" (4 chars) + UUID4 (36 chars)
+        True
+        >>> generate_doc_id("custom-")
+        'custom-...'
+    """
+    return f"{prefix}{uuid.uuid4()}"
+
+
+async def generate_doc_id_with_retry(
+    doc_status_storage,
+    prefix: str = "doc-",
+    max_retries: int = 3
+) -> str:
+    """Generate a unique UUID-based document identifier with collision retry.
+
+    This function generates a UUID-based doc_id and verifies it doesn't already
+    exist in the database. If a collision is detected (extremely rare), it retries
+    with a new UUID. This ensures document ID uniqueness even in high-concurrency
+    scenarios.
+
+    Args:
+        doc_status_storage: Document status storage instance for checking existence
+        prefix: Prefix for the document ID. Default is "doc-".
+        max_retries: Maximum number of retry attempts. Default is 3.
+
+    Returns:
+        str: Unique document ID in format: {prefix}{uuid4}
+
+    Raises:
+        RuntimeError: If unable to generate unique doc_id after max_retries
+
+    Examples:
+        >>> doc_id = await generate_doc_id_with_retry(storage)
+        >>> doc_id.startswith("doc-")
+        True
+    """
+    for attempt in range(max_retries):
+        doc_id = generate_doc_id(prefix)
+        
+        # Check if doc_id already exists
+        try:
+            existing_doc = await doc_status_storage.get_by_id(doc_id)
+            
+            if existing_doc is None:
+                # No collision, doc_id is unique
+                return doc_id
+            
+            # Collision detected - log and retry
+            logger.warning(
+                f"UUID collision detected for doc_id: {doc_id} "
+                f"(attempt {attempt + 1}/{max_retries}). Retrying with new UUID."
+            )
+            
+        except Exception as e:
+            # If get_by_id fails (e.g., doc doesn't exist), assume doc_id is unique
+            logger.debug(f"Error checking doc_id existence: {e}. Assuming unique.")
+            return doc_id
+    
+    # Max retries exhausted
+    error_msg = f"Failed to generate unique doc_id after {max_retries} attempts"
+    logger.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+def compute_content_hash(content: str, workspace_id: str = "") -> str:
+    """Compute MD5 hash of document content for duplicate detection.
+
+    This function computes an MD5 hash of sanitized content combined with workspace_id,
+    returning just the raw 32-character hex string without any prefix. The workspace_id
+    is included to ensure that duplicate detection is scoped per workspace - the same
+    content in different workspaces will have different hashes.
+
+    The content should be sanitized via sanitize_text_for_encoding() before
+    being passed to this function to ensure consistent hashing.
+
+    Args:
+        content: Sanitized content string to hash (may be empty)
+        workspace_id: Workspace identifier to scope the hash (default: "")
+
+    Returns:
+        str: MD5 hash as 32-character hex string (no prefix)
+
+    Examples:
+        >>> compute_content_hash("Hello World", "workspace1")
+        'a1b2c3d4e5f6...'
+        >>> compute_content_hash("Hello World", "workspace2")
+        'x9y8z7w6v5u4...'  # Different hash for different workspace
+        >>> compute_content_hash("")
+        'd41d8cd98f00b204e9800998ecf8427e'
+        >>> # Same content in same workspace always produces same hash
+        >>> hash1 = compute_content_hash("test content", "ws1")
+        >>> hash2 = compute_content_hash("test content", "ws1")
+        >>> hash1 == hash2
+        True
+    """
+    # Include workspace_id in hash to scope duplicate detection per workspace
+    return compute_args_hash(workspace_id, content)
+
+
 def get_pinyin_sort_key(text: str) -> str:
     """Generate sort key for Chinese pinyin sorting
 

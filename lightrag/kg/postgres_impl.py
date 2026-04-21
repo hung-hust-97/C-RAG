@@ -1131,6 +1131,19 @@ class PostgreSQLDB:
                 f"Failed to add track_id column or index to LIGHTRAG_DOC_STATUS: {e}"
             )
 
+    async def _migrate_doc_status_uppercase(self):
+        """Migrate lowercase statuses to uppercase"""
+        try:
+            update_sql = """
+            UPDATE LIGHTRAG_DOC_STATUS
+            SET status = UPPER(status)
+            WHERE status IN ('uploading', 'extracting', 'extracted', 'chunking', 'processed', 'failed', 'duplicated', 'pending', 'processing', 'preprocessed', 'chunked')
+            """
+            await self.execute(update_sql)
+        except Exception as e:
+            from lightrag.utils import logger
+            logger.error(f"Failed to migrate lowercase status to uppercase: {e}")
+
     async def _migrate_doc_status_add_metadata_error_msg(self):
         """Add metadata and error_msg columns to LIGHTRAG_DOC_STATUS table if they don't exist"""
         try:
@@ -1521,12 +1534,14 @@ class PostgreSQLDB:
 
         # Migrate doc status to add metadata and error_msg fields if needed
         try:
+            await self._migrate_doc_status_uppercase()
+        except:
+            pass
+            
+        try:
             await self._migrate_doc_status_add_metadata_error_msg()
         except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate doc status metadata/error_msg fields: {e}"
-            )
-
+            logger.error(f"PostgreSQL, Failed to migrate doc status metadata/error_msg fields: {e}")
         # Create pagination optimization indexes for LIGHTRAG_DOC_STATUS
         try:
             await self._create_pagination_indexes()
@@ -4034,7 +4049,27 @@ class PGDocStatusStorage(DocStatusStorage):
                   error_msg = EXCLUDED.error_msg,
                   created_at = EXCLUDED.created_at,
                   updated_at = EXCLUDED.updated_at"""
-        for k, v in data.items():
+        
+        # Merge partial updates with existing records to avoid KeyError
+        existing_rows = await self.get_by_ids(list(data.keys()))
+        existing_map = {row["id"]: row for row in existing_rows} if existing_rows else {}
+
+        for k, update_data in data.items():
+            v = {
+                "content_summary": "",
+                "content_length": 0,
+                "status": "UNKNOWN",
+                "file_path": "",
+                "chunks_count": -1,
+                "chunks_list": [],
+                "content_hash": "",
+                "metadata": {},
+                "error_msg": ""
+            }
+            if k in existing_map:
+                v.update(existing_map[k])
+            v.update(update_data)
+
             # Remove timezone information, store utc time in db
             created_at = parse_datetime(v.get("created_at"))
             updated_at = parse_datetime(v.get("updated_at"))

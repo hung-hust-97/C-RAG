@@ -283,7 +283,7 @@ services:
     healthcheck:
       # Verifies worker can connect to broker and process tasks
       # Uses hostname variable to check specific worker instance
-      test: ["CMD-SHELL", "celery -A celery_worker.app inspect ping -d celery@$HOSTNAME"]
+      test: ["CMD-SHELL", "celery -A celery_worker.app inspect ping -d celery@$$HOSTNAME"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -1630,56 +1630,48 @@ class LightRAG:
 
         # Check each document's data consistency
         docs_to_reextract = []  # Documents that need re-extraction
-        docs_to_reset_extracted = []  # EXTRACTING documents with content that should be EXTRACTED
+        docs_to_mark_failed: dict[str, dict[str, Any]] = {}
         
         for doc_id, status_doc in to_process_docs.items():
             # Check if corresponding content exists in full_docs
             content_data = await self.full_docs.get_by_id(doc_id)
-            
-            # Handle EXTRACTING documents (stuck in extraction phase)
-            if hasattr(status_doc, "status") and status_doc.status == DocStatus.EXTRACTING:
-                if content_data:
-                    # Content exists - extraction was successful, move to EXTRACTED
-                    docs_to_reset_extracted.append({
-                        "doc_id": doc_id,
-                        "status_doc": status_doc,
-                        "content_data": content_data
-                    })
-                    logger.info(f"[Reprocess] EXTRACTING document {doc_id} has content, will reset to EXTRACTED")
-                else:
-                    # No content - extraction failed or incomplete
-                    file_path = getattr(status_doc, "file_path", None)
-                    if reprocess_failed and file_path:
-                        # Try to re-extract
-                        from pathlib import Path
-                        input_dir = Path(self.working_dir) / "inputs"
-                        enqueued_dir = input_dir / "__enqueued__"
-                        
-                        file_exists = False
-                        actual_file_path = None
-                        
-                        if (input_dir / file_path).exists():
-                            file_exists = True
-                            actual_file_path = input_dir / file_path
-                        elif (enqueued_dir / file_path).exists():
-                            file_exists = True
-                            actual_file_path = enqueued_dir / file_path
-                        
-                        if file_exists:
-                            docs_to_reextract.append({
-                                "doc_id": doc_id,
-                                "file_path": str(actual_file_path),
-                                "original_file_name": file_path
-                            })
-                            to_process_docs.pop(doc_id, None)
-                            logger.info(f"[Reprocess] EXTRACTING document {doc_id} will be re-extracted")
-                        else:
-                            # No file - mark as inconsistent
-                            inconsistent_docs.append(doc_id)
-                            logger.warning(f"[Reprocess] EXTRACTING document {doc_id} has no content and no file")
-                    else:
-                        # Mark as inconsistent if not reprocessing
-                        inconsistent_docs.append(doc_id)
+
+            # Normalize stale EXTRACTING/CHUNKING documents to FAILED so the
+            # pipeline can treat them as recoverable failures instead of trying
+            # to "repair" them back to EXTRACTED.
+            if hasattr(status_doc, "status") and status_doc.status in [
+                DocStatus.EXTRACTING,
+                DocStatus.CHUNKING,
+            ]:
+                preserved_chunks_list, preserved_chunks_count = (
+                    _chunk_fields_from_status_doc(status_doc)
+                )
+                error_stage = (
+                    "extraction"
+                    if status_doc.status == DocStatus.EXTRACTING
+                    else "chunking"
+                )
+                docs_to_mark_failed[doc_id] = {
+                    "status": DocStatus.FAILED,
+                    "content_summary": status_doc.content_summary,
+                    "content_length": status_doc.content_length,
+                    "chunks_count": preserved_chunks_count,
+                    "chunks_list": preserved_chunks_list,
+                    "created_at": status_doc.created_at,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": getattr(status_doc, "file_path", None)
+                    or "unknown_source",
+                    "track_id": getattr(status_doc, "track_id", ""),
+                    "error_msg": getattr(status_doc, "error_msg", None)
+                    or f"Document stayed in {status_doc.status.value} and was marked failed",
+                    "error_stage": error_stage,
+                    "metadata": getattr(status_doc, "metadata", {}) or {},
+                }
+                status_doc.status = DocStatus.FAILED
+                failed_docs_to_preserve.append(doc_id)
+                logger.warning(
+                    f"[Reprocess] {status_doc.status.value} document {doc_id} will be marked as FAILED"
+                )
                 continue
             
             if not content_data:
@@ -1729,37 +1721,17 @@ class LightRAG:
                 else:
                     # Not a failed document - delete inconsistent entry
                     inconsistent_docs.append(doc_id)
-        
-        # Reset EXTRACTING documents with content to EXTRACTED status
-        if docs_to_reset_extracted:
+
+        if docs_to_mark_failed:
+            await self.doc_status.upsert(docs_to_mark_failed)
+
             async with pipeline_status_lock:
-                reset_extracting_message = f"Resetting {len(docs_to_reset_extracted)} stuck EXTRACTING documents to EXTRACTED"
+                reset_extracting_message = (
+                    f"Marked {len(docs_to_mark_failed)} stuck EXTRACTING/CHUNKING documents as FAILED"
+                )
                 logger.info(reset_extracting_message)
                 pipeline_status["latest_message"] = reset_extracting_message
                 pipeline_status["history_messages"].append(reset_extracting_message)
-            
-            docs_to_update = {}
-            for doc_info in docs_to_reset_extracted:
-                doc_id = doc_info["doc_id"]
-                status_doc = doc_info["status_doc"]
-                
-                docs_to_update[doc_id] = {
-                    "status": DocStatus.EXTRACTED,
-                    "content_summary": status_doc.content_summary,
-                    "content_length": status_doc.content_length,
-                    "created_at": status_doc.created_at,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "file_path": getattr(status_doc, "file_path", None) or "unknown_source",
-                    "track_id": getattr(status_doc, "track_id", ""),
-                    "error_msg": "",
-                    "metadata": {},
-                }
-                
-                # Update status in to_process_docs
-                status_doc.status = DocStatus.EXTRACTED
-            
-            # Batch update all EXTRACTING -> EXTRACTED documents
-            await self.doc_status.upsert(docs_to_update)
         
         # Trigger re-extraction for documents with files
         if docs_to_reextract:
@@ -1853,53 +1825,6 @@ class LightRAG:
         #     logger.info(final_message)
         #     pipeline_status["latest_message"] = final_message
         #     pipeline_status["history_messages"].append(final_message)
-
-        # Reset PROCESSING and FAILED documents that pass consistency checks to PENDING status
-        docs_to_reset = {}
-        reset_count = 0
-
-        for doc_id, status_doc in to_process_docs.items():
-            # Check if document has corresponding content in full_docs (consistency check)
-            content_data = await self.full_docs.get_by_id(doc_id)
-            if content_data:  # Document passes consistency check
-                # Check if document is in CHUNKING or FAILED status
-                if hasattr(status_doc, "status") and status_doc.status in [
-                    DocStatus.CHUNKING,
-                    DocStatus.FAILED,
-                ]:
-                    preserved_chunks_list, preserved_chunks_count = (
-                        _chunk_fields_from_status_doc(status_doc)
-                    )
-                    # Prepare document for status reset to EXTRACTED
-                    docs_to_reset[doc_id] = {
-                        "status": DocStatus.EXTRACTED,
-                        "content_summary": status_doc.content_summary,
-                        "content_length": status_doc.content_length,
-                        "chunks_count": preserved_chunks_count,
-                        "chunks_list": preserved_chunks_list,
-                        "created_at": status_doc.created_at,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "file_path": getattr(status_doc, "file_path", None)
-                        or "unknown_source",
-                        "track_id": getattr(status_doc, "track_id", ""),
-                        # Clear any error messages and processing metadata
-                        "error_msg": "",
-                        "metadata": {},
-                    }
-
-                    # Update the status in to_process_docs as well
-                    status_doc.status = DocStatus.EXTRACTED
-                    reset_count += 1
-
-        # Update doc_status storage if there are documents to reset
-        if docs_to_reset:
-            await self.doc_status.upsert(docs_to_reset)
-
-            async with pipeline_status_lock:
-                reset_message = f"Reset {reset_count} documents from PROCESSING/FAILED to PENDING status"
-                logger.info(reset_message)
-                pipeline_status["latest_message"] = reset_message
-                pipeline_status["history_messages"].append(reset_message)
 
         return to_process_docs
 
@@ -2073,6 +1998,60 @@ class LightRAG:
                             chunk_ids = list(chunks.keys())
                             return chunk_ids, len(chunk_ids)
                         return _chunk_fields_from_status_doc(status_doc)
+
+                    async def mark_document_failed(
+                        error: Exception,
+                        error_stage: str,
+                    ) -> None:
+                        processing_end_time = int(time.time())
+                        failed_chunks_list, failed_chunks_count = (
+                            get_failed_chunk_snapshot()
+                        )
+
+                        await self.doc_status.upsert(
+                            {
+                                doc_id: {
+                                    "status": DocStatus.FAILED,
+                                    "error_msg": str(error),
+                                    "error_stage": error_stage,
+                                    "chunks_count": failed_chunks_count,
+                                    "chunks_list": failed_chunks_list,
+                                    "content_summary": status_doc.content_summary,
+                                    "content_length": status_doc.content_length,
+                                    "created_at": status_doc.created_at,
+                                    "updated_at": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(),
+                                    "file_path": file_path,
+                                    "track_id": getattr(
+                                        status_doc, "track_id", ""
+                                    ),
+                                    "metadata": {
+                                        "processing_start_time": processing_start_time,
+                                        "processing_end_time": processing_end_time,
+                                    },
+                                }
+                            }
+                        )
+
+                        track_id = getattr(status_doc, "track_id", None)
+                        if track_id:
+                            try:
+                                await self.doc_status.upsert_track_status(
+                                    track_id=track_id,
+                                    status=DocStatus.FAILED,
+                                    metadata={
+                                        "file_name": file_path,
+                                        "error_stage": error_stage,
+                                    },
+                                )
+                                logger.debug(
+                                    f"[Track] Set FAILED status for track_id: {track_id}"
+                                )
+                            except Exception as track_error:
+                                logger.warning(
+                                    f"[Track] Failed to set FAILED status: {track_error}"
+                                )
 
                     async with semaphore:
                         nonlocal processed_count
@@ -2276,35 +2255,7 @@ class LightRAG:
                                         f"Failed to persist LLM cache: {persist_error}"
                                     )
 
-                            # Record processing end time for failed case
-                            processing_end_time = int(time.time())
-                            failed_chunks_list, failed_chunks_count = (
-                                get_failed_chunk_snapshot()
-                            )
-
-                            # Update document status to failed
-                            await self.doc_status.upsert(
-                                {
-                                    doc_id: {
-                                        "status": DocStatus.FAILED,
-                                        "error_msg": str(e),
-                                        "chunks_count": failed_chunks_count,
-                                        "chunks_list": failed_chunks_list,
-                                        "content_summary": status_doc.content_summary,
-                                        "content_length": status_doc.content_length,
-                                        "created_at": status_doc.created_at,
-                                        "updated_at": datetime.now(
-                                            timezone.utc
-                                        ).isoformat(),
-                                        "file_path": file_path,
-                                        "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
-                                        "metadata": {
-                                            "processing_start_time": processing_start_time,
-                                            "processing_end_time": processing_end_time,
-                                        },
-                                    }
-                                }
-                            )
+                            await mark_document_failed(e, "chunking")
 
                         # Concurrency is controlled by keyed lock for individual entities and relationships
                         if file_extraction_stage_ok:
@@ -2421,33 +2372,7 @@ class LightRAG:
                                             f"Failed to persist LLM cache: {persist_error}"
                                         )
 
-                                # Record processing end time for failed case
-                                processing_end_time = int(time.time())
-                                failed_chunks_list, failed_chunks_count = (
-                                    get_failed_chunk_snapshot()
-                                )
-
-                                # Update document status to failed
-                                await self.doc_status.upsert(
-                                    {
-                                        doc_id: {
-                                            "status": DocStatus.FAILED,
-                                            "error_msg": str(e),
-                                            "chunks_count": failed_chunks_count,
-                                            "chunks_list": failed_chunks_list,
-                                            "content_summary": status_doc.content_summary,
-                                            "content_length": status_doc.content_length,
-                                            "created_at": status_doc.created_at,
-                                            "updated_at": datetime.now().isoformat(),
-                                            "file_path": file_path,
-                                            "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
-                                            "metadata": {
-                                                "processing_start_time": processing_start_time,
-                                                "processing_end_time": processing_end_time,
-                                            },
-                                        }
-                                    }
-                                )
+                                await mark_document_failed(e, "merging")
 
                 # Create processing tasks for all documents
                 doc_tasks = []

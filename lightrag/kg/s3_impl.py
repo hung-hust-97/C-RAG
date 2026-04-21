@@ -82,13 +82,21 @@ class S3KVStorage(BaseKVStorage):
                                 fp = base64.b64decode(fp).decode("utf-8")
                             except:
                                 pass
+                                
+                        orig_fn = metadata.get("original_filename", fp)
+                        if metadata.get("orig_fn_is_b64", "false") == "true":
+                            try:
+                                orig_fn = base64.b64decode(orig_fn).decode("utf-8")
+                            except:
+                                pass
+                                
                         result = {
                             "content": data.decode("utf-8"),
                             "file_path": fp,
                             "format": metadata.get("format", "markdown"),
                             "content_hash": metadata.get("content_hash", ""),
                             "extraction_timestamp": metadata.get("extraction_timestamp", ""),
-                            "original_filename": metadata.get("original_filename", fp)
+                            "original_filename": orig_fn
                         }
                     else:
                         result = json.loads(data.decode("utf-8"))
@@ -127,6 +135,9 @@ class S3KVStorage(BaseKVStorage):
                     fp = v.get("file_path", "")
                     fp_b64 = base64.b64encode(fp.encode("utf-8")).decode("ascii")
                     
+                    orig_fn = v.get("original_filename", fp)
+                    orig_fn_b64 = base64.b64encode(orig_fn.encode("utf-8")).decode("ascii")
+                    
                     # Add additional metadata for markdown files
                     metadata_to_save = {
                         "file_path": fp_b64, 
@@ -134,7 +145,8 @@ class S3KVStorage(BaseKVStorage):
                         "format": v.get("format", "markdown"),
                         "content_hash": v.get("content_hash", ""),
                         "extraction_timestamp": v.get("extraction_timestamp", ""),
-                        "original_filename": v.get("original_filename", fp)
+                        "original_filename": orig_fn_b64,
+                        "orig_fn_is_b64": "true"
                     }
                 else:
                     content_bytes = json.dumps(v).encode("utf-8")

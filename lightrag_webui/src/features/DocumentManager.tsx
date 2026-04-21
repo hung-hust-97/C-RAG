@@ -49,13 +49,13 @@ const getCountValue = (counts: Record<string, number>, ...keys: string[]): numbe
 }
 
 const hasActiveDocumentsStatus = (counts: Record<string, number>): boolean =>
-  getCountValue(counts, 'EXTRACTING', 'extracting') > 0 ||
-  getCountValue(counts, 'EXTRACTED', 'extracted') > 0 ||
-  getCountValue(counts, 'CHUNKING', 'chunking') > 0 ||
+  getCountValue(counts, 'EXTRACTING', 'EXTRACTING') > 0 ||
+  getCountValue(counts, 'EXTRACTED', 'EXTRACTED') > 0 ||
+  getCountValue(counts, 'CHUNKING', 'CHUNKING') > 0 ||
   getCountValue(counts, 'CHUNKED', 'chunked') > 0 ||
   // Legacy statuses
-  getCountValue(counts, 'PROCESSING', 'processing') > 0 ||
-  getCountValue(counts, 'PENDING', 'pending') > 0 ||
+  getCountValue(counts, 'PROCESSING', 'PROCESSING') > 0 ||
+  getCountValue(counts, 'PENDING', 'PENDING') > 0 ||
   getCountValue(counts, 'PREPROCESSED', 'preprocessed') > 0
 
 const getDisplayFileName = (doc: DocStatusResponse, maxLength: number = 20): string => {
@@ -473,12 +473,12 @@ export default function DocumentManager() {
     return counts;
   }, [docs]);
 
-  const processedCount = getCountValue(statusCounts, 'PROCESSED', 'processed') || documentCounts.processed || 0;
-  const chunkedCount = getCountValue(statusCounts, 'CHUNKED', 'chunked', 'PREPROCESSED', 'preprocessed') || documentCounts.preprocessed || documentCounts.chunked || 0;
-  const chunkingCount = getCountValue(statusCounts, 'CHUNKING', 'chunking', 'PROCESSING', 'processing') || documentCounts.processing || documentCounts.chunking || 0;
-  const extractedCount = getCountValue(statusCounts, 'EXTRACTED', 'extracted', 'PENDING', 'pending') || documentCounts.pending || documentCounts.extracted || 0;
-  const extractingCount = getCountValue(statusCounts, 'EXTRACTING', 'extracting') || documentCounts.extracting || 0;
-  const failedCount = getCountValue(statusCounts, 'FAILED', 'failed') || documentCounts.failed || 0;
+  const processedCount = getCountValue(statusCounts, 'PROCESSED', 'PROCESSED') || documentCounts.PROCESSED || 0;
+  const chunkedCount = getCountValue(statusCounts, 'CHUNKED', 'chunked', 'PREPROCESSED', 'preprocessed') || documentCounts.PREPROCESSED || documentCounts.CHUNKED || 0;
+  const chunkingCount = getCountValue(statusCounts, 'CHUNKING', 'CHUNKING', 'PROCESSING', 'PROCESSING') || documentCounts.PROCESSING || documentCounts.CHUNKING || 0;
+  const extractedCount = getCountValue(statusCounts, 'EXTRACTED', 'EXTRACTED', 'PENDING', 'PENDING') || documentCounts.PENDING || documentCounts.EXTRACTED || 0;
+  const extractingCount = getCountValue(statusCounts, 'EXTRACTING', 'EXTRACTING') || documentCounts.EXTRACTING || 0;
+  const failedCount = getCountValue(statusCounts, 'FAILED', 'FAILED') || documentCounts.FAILED || 0;
 
   // Store previous status counts
   const prevStatusCounts = useRef({
@@ -574,11 +574,11 @@ export default function DocumentManager() {
     // Update legacy docs state for backward compatibility
     const legacyDocs: DocsStatusesResponse = {
       statuses: {
-        processed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'processed'),
+        processed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PROCESSED'),
         preprocessed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'preprocessed'),
-        processing: response.documents.filter((doc: DocStatusResponse) => doc.status === 'processing'),
-        pending: response.documents.filter((doc: DocStatusResponse) => doc.status === 'pending'),
-        failed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'failed')
+        processing: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PROCESSING'),
+        pending: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PENDING'),
+        failed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'FAILED')
       }
     };
 
@@ -926,11 +926,11 @@ export default function DocumentManager() {
         // Update legacy docs state for backward compatibility
         const legacyDocs: DocsStatusesResponse = {
           statuses: {
-            processed: response.documents.filter(doc => doc.status === 'processed'),
+            processed: response.documents.filter(doc => doc.status === 'PROCESSED'),
             preprocessed: response.documents.filter(doc => doc.status === 'preprocessed'),
-            processing: response.documents.filter(doc => doc.status === 'processing'),
-            pending: response.documents.filter(doc => doc.status === 'pending'),
-            failed: response.documents.filter(doc => doc.status === 'failed')
+            processing: response.documents.filter(doc => doc.status === 'PROCESSING'),
+            pending: response.documents.filter(doc => doc.status === 'PENDING'),
+            failed: response.documents.filter(doc => doc.status === 'FAILED')
           }
         };
 
@@ -1219,12 +1219,12 @@ export default function DocumentManager() {
                   </Button>
                   <Button
                     size="sm"
-                    variant={statusFilter === 'processed' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('processed')}
+                    variant={statusFilter === 'PROCESSED' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('PROCESSED')}
                     disabled={isRefreshing}
                     className={cn(
                       processedCount > 0 ? 'text-green-600' : 'text-gray-500',
-                      statusFilter === 'processed' && 'bg-green-100 dark:bg-green-900/30 font-medium border border-green-400 dark:border-green-600 shadow-sm'
+                      statusFilter === 'PROCESSED' && 'bg-green-100 dark:bg-green-900/30 font-medium border border-green-400 dark:border-green-600 shadow-sm'
                     )}
                   >
                     {t('documentPanel.documentManager.status.completed')} ({processedCount})
@@ -1243,36 +1243,36 @@ export default function DocumentManager() {
                   </Button>
                   <Button
                     size="sm"
-                    variant={statusFilter === 'processing' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('processing')}
+                    variant={statusFilter === 'PROCESSING' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('PROCESSING')}
                     disabled={isRefreshing}
                     className={cn(
                       processingCount > 0 ? 'text-blue-600' : 'text-gray-500',
-                      statusFilter === 'processing' && 'bg-blue-100 dark:bg-blue-900/30 font-medium border border-blue-400 dark:border-blue-600 shadow-sm'
+                      statusFilter === 'PROCESSING' && 'bg-blue-100 dark:bg-blue-900/30 font-medium border border-blue-400 dark:border-blue-600 shadow-sm'
                     )}
                   >
                     {t('documentPanel.documentManager.status.processing')} ({processingCount})
                   </Button>
                   <Button
                     size="sm"
-                    variant={statusFilter === 'pending' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('pending')}
+                    variant={statusFilter === 'PENDING' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('PENDING')}
                     disabled={isRefreshing}
                     className={cn(
                       pendingCount > 0 ? 'text-yellow-600' : 'text-gray-500',
-                      statusFilter === 'pending' && 'bg-yellow-100 dark:bg-yellow-900/30 font-medium border border-yellow-400 dark:border-yellow-600 shadow-sm'
+                      statusFilter === 'PENDING' && 'bg-yellow-100 dark:bg-yellow-900/30 font-medium border border-yellow-400 dark:border-yellow-600 shadow-sm'
                     )}
                   >
                     {t('documentPanel.documentManager.status.pending')} ({pendingCount})
                   </Button>
                   <Button
                     size="sm"
-                    variant={statusFilter === 'failed' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('failed')}
+                    variant={statusFilter === 'FAILED' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('FAILED')}
                     disabled={isRefreshing}
                     className={cn(
                       failedCount > 0 ? 'text-red-600' : 'text-gray-500',
-                      statusFilter === 'failed' && 'bg-red-100 dark:bg-red-900/30 font-medium border border-red-400 dark:border-red-600 shadow-sm'
+                      statusFilter === 'FAILED' && 'bg-red-100 dark:bg-red-900/30 font-medium border border-red-400 dark:border-red-600 shadow-sm'
                     )}
                   >
                     {t('documentPanel.documentManager.status.failed')} ({failedCount})
@@ -1418,22 +1418,22 @@ export default function DocumentManager() {
                           </TableCell>
                           <TableCell>
                             <div className="group relative flex items-center overflow-visible tooltip-container">
-                              {doc.status === 'processed' && (
+                              {doc.status === 'PROCESSED' && (
                                 <span className="text-green-600">{t('documentPanel.documentManager.status.completed')}</span>
                               )}
                               {(doc.status === 'chunked' || doc.status === 'preprocessed') && (
                                 <span className="text-purple-600">{t('documentPanel.documentManager.status.chunked')}</span>
                               )}
-                              {(doc.status === 'chunking' || doc.status === 'processing') && (
+                              {(doc.status === 'CHUNKING' || doc.status === 'PROCESSING') && (
                                 <span className="text-blue-600">{t('documentPanel.documentManager.status.chunking')}</span>
                               )}
-                              {(doc.status === 'extracted' || doc.status === 'pending') && (
+                              {(doc.status === 'EXTRACTED' || doc.status === 'PENDING') && (
                                 <span className="text-yellow-600">{t('documentPanel.documentManager.status.extracted')}</span>
                               )}
-                              {doc.status === 'extracting' && (
+                              {doc.status === 'EXTRACTING' && (
                                 <span className="text-orange-600">{t('documentPanel.documentManager.status.extracting')}</span>
                               )}
-                              {doc.status === 'failed' && (
+                              {doc.status === 'FAILED' && (
                                 <span className="text-red-600">{t('documentPanel.documentManager.status.failed')}</span>
                               )}
 
@@ -1475,7 +1475,7 @@ export default function DocumentManager() {
                             <Checkbox
                               checked={selectedDocIds.includes(doc.id)}
                               onCheckedChange={(checked) => handleDocumentSelect(doc.id, checked === true)}
-                              // disabled={doc.status !== 'processed'}
+                              // disabled={doc.status !== 'PROCESSED'}
                               className="mx-auto"
                             />
                           </TableCell>

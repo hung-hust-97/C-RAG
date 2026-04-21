@@ -285,6 +285,22 @@ WHERE doc_id = 'doc-550e8400...';
 -- Returns: doc_id='doc-550e8400...', content_hash='a1b2c3d4...'
 ```
 
+### LIGHTRAG_DOC_FULL Table - DEPRECATED
+
+**Status**: Deprecated in favor of MinIO/S3 storage
+
+**Reason**: Document content is now stored as markdown files in MinIO (S3KVStorage) instead of PostgreSQL
+
+**Configuration**: 
+- `FULL_DOCS_STORAGE=S3KVStorage` routes content to MinIO
+- Content stored as `.md` files with metadata in S3 object headers
+- PostgreSQL `LIGHTRAG_DOC_FULL` table no longer used when S3KVStorage is configured
+
+**Migration Impact**:
+- ✅ Existing content in `LIGHTRAG_DOC_FULL` can be migrated to MinIO
+- ✅ APIs automatically use MinIO when `FULL_DOCS_STORAGE=S3KVStorage`
+- ⚠️ Table can be dropped after content migration to MinIO
+
 ### track_id Column - REMOVED
 
 **Status**: Removed during migration (optional, can be kept for backward compatibility)
@@ -303,6 +319,28 @@ ALTER TABLE LIGHTRAG_DOC_STATUS DROP COLUMN IF EXISTS track_id;
 ```
 
 **Recommendation**: Remove column unless you have external systems that depend on it.
+
+### LIGHTRAG_DOC_FULL Table Usage
+
+**Current Status**: Table exists but not used when `FULL_DOCS_STORAGE=S3KVStorage`
+
+**Storage Location**: Document content stored in MinIO as markdown files
+
+**Table Cleanup Options**:
+
+**Option 1: Keep table** (for fallback compatibility):
+```sql
+-- Keep table structure but content goes to MinIO
+-- Table remains empty when S3KVStorage is used
+```
+
+**Option 2: Drop table** (recommended for clean schema):
+```sql
+-- Only after confirming all content migrated to MinIO
+DROP TABLE IF EXISTS LIGHTRAG_DOC_FULL;
+```
+
+**Recommendation**: Drop table after confirming MinIO storage is working properly.
 
 ## Client Migration Strategies
 

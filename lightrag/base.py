@@ -716,10 +716,12 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 class DocStatus(str, Enum):
     """Document processing status
     
-    Simplified status flow (6 states):
+    Simplified status flow (7 states):
     UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
                      ↓           ↓          ↓          ↓
                   FAILED      FAILED     FAILED     FAILED
+                     ↓
+                DUPLICATED (detected during extraction)
     
     Each status corresponds to a processing stage that workers can handle:
     - UPLOADING: File đang được upload (reserved for future use)
@@ -728,6 +730,7 @@ class DocStatus(str, Enum):
     - CHUNKING: Đang chunking + extract entities - handled by chunking/KG worker
     - PROCESSED: Hoàn thành tất cả - final state
     - FAILED: Lỗi ở bất kỳ stage nào - can be reprocessed
+    - DUPLICATED: Tài liệu trùng lặp về nội dung - detected via content_hash
     """
 
     UPLOADING = "uploading"           # File đang được upload
@@ -736,6 +739,7 @@ class DocStatus(str, Enum):
     CHUNKING = "chunking"             # Đang chunking + extract entities
     PROCESSED = "processed"           # Hoàn thành tất cả
     FAILED = "failed"                 # Lỗi ở bất kỳ stage nào
+    DUPLICATED = "duplicated"         # Tài liệu trùng lặp về nội dung
     
     # Legacy statuses for backward compatibility (deprecated, will be removed)
     PENDING = "pending"               # Legacy: mapped to EXTRACTED

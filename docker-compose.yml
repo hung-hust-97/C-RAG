@@ -5,9 +5,11 @@ services:
     image: postgres:17-bullseye
     restart: unless-stopped
     # Set PostgreSQL server max_connections (default: 100)
-    # Formula: max_connections >= (num_workers × pool_size) + (api_servers × pool_size) + buffer
-    # Example: (2 workers × 50) + (1 API × 50) + 50 buffer = 200 connections
-    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=256MB"]
+    # With shared pool architecture: 1 pool per process (not per workspace)
+    # Formula: max_connections >= (num_processes × pool_size) + buffer
+    # Current: 1 API process × 400 pool_size + 200 buffer = 600 connections
+    # Set to 1000 for safety margin and future growth
+    command: ["postgres", "-c", "max_connections=1000", "-c", "shared_buffers=512MB", "-c", "max_prepared_transactions=100"]
     environment:
       # Database credentials - customize via .env file
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -263,6 +265,12 @@ services:
       POSTGRES_PORT: 5432
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       MILVUS_URI: ${MILVUS_URI:-http://milvus:19530}
+      # S3/MinIO configuration for full document storage
+      FULL_DOCS_STORAGE: ${FULL_DOCS_STORAGE:-S3KVStorage}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-lightrag-markdown}
     depends_on:
       postgres:
         condition: service_healthy  # Wait for database to be ready

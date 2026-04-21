@@ -84,7 +84,11 @@ class S3KVStorage(BaseKVStorage):
                                 pass
                         result = {
                             "content": data.decode("utf-8"),
-                            "file_path": fp
+                            "file_path": fp,
+                            "format": metadata.get("format", "markdown"),
+                            "content_hash": metadata.get("content_hash", ""),
+                            "extraction_timestamp": metadata.get("extraction_timestamp", ""),
+                            "original_filename": metadata.get("original_filename", fp)
                         }
                     else:
                         result = json.loads(data.decode("utf-8"))
@@ -122,7 +126,16 @@ class S3KVStorage(BaseKVStorage):
                     # Handle non-ASCII in metadata by base64 encoding it
                     fp = v.get("file_path", "")
                     fp_b64 = base64.b64encode(fp.encode("utf-8")).decode("ascii")
-                    metadata_to_save = {"file_path": fp_b64, "is_b64": "true"}
+                    
+                    # Add additional metadata for markdown files
+                    metadata_to_save = {
+                        "file_path": fp_b64, 
+                        "is_b64": "true",
+                        "format": v.get("format", "markdown"),
+                        "content_hash": v.get("content_hash", ""),
+                        "extraction_timestamp": v.get("extraction_timestamp", ""),
+                        "original_filename": v.get("original_filename", fp)
+                    }
                 else:
                     content_bytes = json.dumps(v).encode("utf-8")
                     content_type = "application/json"

@@ -166,8 +166,27 @@ class PostgreSQLDB:
         # Statement LRU cache size (keep as-is, allow None for optional configuration)
         self.statement_cache_size = config.get("statement_cache_size")
 
-        if self.user is None or self.password is None or self.database is None:
-            raise ValueError("Missing database user, password, or database")
+        # Validate required connection parameters
+        if not self.user or not self.password or not self.database:
+            missing_params = []
+            if not self.user:
+                missing_params.append("user")
+            if not self.password:
+                missing_params.append("password") 
+            if not self.database:
+                missing_params.append("database")
+            raise ValueError(f"Missing required database parameters: {', '.join(missing_params)}")
+        
+        # Validate host and port
+        if not self.host:
+            raise ValueError("Missing database host")
+        
+        try:
+            self.port = int(self.port)
+            if self.port <= 0 or self.port > 65535:
+                raise ValueError(f"Invalid port number: {self.port}")
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid port number: {self.port}")
 
         # Guard concurrent pool resets
         self._pool_reconnect_lock = asyncio.Lock()
@@ -193,6 +212,10 @@ class PostgreSQLDB:
             config["connection_retry_backoff_max"],
         )
         self.pool_close_timeout = config["pool_close_timeout"]
+        
+        # Connection pool idle timeout (0 = disabled)
+        self.max_inactive_connection_lifetime = config.get("max_inactive_connection_lifetime", 300.0)
+        
         logger.info(
             "PostgreSQL, Retry config: attempts=%s, backoff=%.1fs, backoff_max=%.1fs, pool_close_timeout=%.1fs",
             self.connection_retry_attempts,
@@ -310,6 +333,8 @@ class PostgreSQLDB:
         return None
 
     async def initdb(self):
+        logger.info(f"Initializing PostgreSQL connection to {self.host}:{self.port}/{self.database}")
+        
         # Prepare connection parameters
         connection_params = {
             "user": self.user,
@@ -320,6 +345,11 @@ class PostgreSQLDB:
             "min_size": 1,
             "max_size": self.max,
         }
+        
+        # Add idle connection timeout if configured (0 = disabled)
+        if hasattr(self, 'max_inactive_connection_lifetime') and self.max_inactive_connection_lifetime > 0:
+            connection_params["max_inactive_connection_lifetime"] = self.max_inactive_connection_lifetime
+            logger.info(f"PostgreSQL, Idle connection timeout: {self.max_inactive_connection_lifetime}s")
 
         # Only add statement_cache_size if it's configured
         if self.statement_cache_size is not None:
@@ -431,10 +461,20 @@ class PostgreSQLDB:
             raise
 
     async def _ensure_pool(self) -> None:
-        """Ensure the connection pool is initialised."""
+        """Ensure the connection pool is initialised and healthy."""
         if self.pool is None:
             async with self._pool_reconnect_lock:
                 if self.pool is None:
+                    await self.initdb()
+        else:
+            # Health check for existing pool
+            try:
+                async with self.pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+            except Exception as e:
+                logger.warning(f"PostgreSQL pool health check failed: {e}, reinitializing pool")
+                async with self._pool_reconnect_lock:
+                    await self._reset_pool()
                     await self.initdb()
 
     async def _reset_pool(self) -> None:
@@ -1147,6 +1187,50 @@ class PostgreSQLDB:
                 f"Failed to add metadata/error_msg columns to LIGHTRAG_DOC_STATUS: {e}"
             )
 
+    async def _migrate_doc_status_add_content_hash(self):
+        """Add content_hash column to LIGHTRAG_DOC_STATUS table if it doesn't exist"""
+        try:
+            # Check if content_hash column exists
+            check_content_hash_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_status'
+            AND column_name = 'content_hash'
+            """
+
+            content_hash_info = await self.query(check_content_hash_sql)
+            if not content_hash_info:
+                logger.info("Adding content_hash column to LIGHTRAG_DOC_STATUS table")
+                add_content_hash_sql = """
+                ALTER TABLE LIGHTRAG_DOC_STATUS
+                ADD COLUMN content_hash VARCHAR(32) NULL
+                """
+                await self.execute(add_content_hash_sql)
+                logger.info(
+                    "Successfully added content_hash column to LIGHTRAG_DOC_STATUS table"
+                )
+
+                # Create index on (workspace, content_hash) for duplicate detection performance
+                logger.info("Creating index on (workspace, content_hash) for duplicate detection")
+                create_index_sql = """
+                CREATE INDEX IF NOT EXISTS idx_lightrag_doc_status_workspace_content_hash
+                ON LIGHTRAG_DOC_STATUS (workspace, content_hash)
+                WHERE content_hash IS NOT NULL
+                """
+                await self.execute(create_index_sql)
+                logger.info(
+                    "Successfully created index on (workspace, content_hash)"
+                )
+            else:
+                logger.info(
+                    "content_hash column already exists in LIGHTRAG_DOC_STATUS table"
+                )
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to add content_hash column to LIGHTRAG_DOC_STATUS: {e}"
+            )
+
     async def _migrate_field_lengths(self):
         """Migrate database field lengths: entity_name, source_id, target_id, and file_path"""
         # Define the field changes needed
@@ -1457,6 +1541,14 @@ class PostgreSQLDB:
                 f"PostgreSQL, Failed to create full entities/relations tables: {e}"
             )
 
+        # Migrate doc status to add content_hash field for duplicate detection
+        try:
+            await self._migrate_doc_status_add_content_hash()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate doc status content_hash field: {e}"
+            )
+
     async def _migrate_create_full_entities_relations_tables(self):
         """Create LIGHTRAG_FULL_ENTITIES and LIGHTRAG_FULL_RELATIONS tables if they don't exist"""
         tables_to_check = [
@@ -1742,199 +1834,194 @@ class PostgreSQLDB:
 
 
 class ClientManager:
-    _instances: dict[int, dict[str, Any]] = {}
+    # Change to global singleton instead of per-event-loop
+    _shared_instance: dict[str, Any] = {"db": None, "ref_count": 0, "lock": asyncio.Lock()}
 
     @classmethod
     def _get_ctx(cls) -> int:
-        try:
-            return id(asyncio.get_running_loop())
-        except RuntimeError:
-            return 0
+        # Always return 0 to force global sharing
+        return 0
 
     @staticmethod
     def get_config() -> dict[str, Any]:
         config = configparser.ConfigParser()
-        config.read("config.ini", "utf-8")
+        
+        # Try to read config.ini, but don't fail if it doesn't exist
+        try:
+            config.read("config.ini", "utf-8")
+        except Exception as e:
+            logger.debug(f"Could not read config.ini: {e}")
+
+        # Reduce default max_connections since it's now shared across all storage types
+        default_max_connections = 30  # Reduced from 50
+
+        # Helper function to get config with validation
+        def get_config_value(env_key: str, config_section: str, config_key: str, fallback: Any, required: bool = False) -> Any:
+            value = os.environ.get(env_key)
+            if value is None:
+                try:
+                    value = config.get(config_section, config_key, fallback=fallback)
+                except (configparser.NoSectionError, configparser.NoOptionError):
+                    value = fallback
+            
+            # Validate required parameters
+            if required and (value is None or (isinstance(value, str) and not value.strip())):
+                raise ValueError(f"Required PostgreSQL parameter '{env_key}' is missing or empty")
+            
+            return value
 
         return {
-            "host": os.environ.get(
-                "POSTGRES_HOST",
-                config.get("postgres", "host", fallback="localhost"),
-            ),
-            "port": os.environ.get(
-                "POSTGRES_PORT", config.get("postgres", "port", fallback=5432)
-            ),
-            "user": os.environ.get(
-                "POSTGRES_USER", config.get("postgres", "user", fallback="postgres")
-            ),
-            "password": os.environ.get(
-                "POSTGRES_PASSWORD",
-                config.get("postgres", "password", fallback=None),
-            ),
-            "database": os.environ.get(
-                "POSTGRES_DATABASE",
-                config.get("postgres", "database", fallback="postgres"),
-            ),
-            "workspace": os.environ.get(
-                "POSTGRES_WORKSPACE",
-                config.get("postgres", "workspace", fallback=None),
-            ),
-            "max_connections": os.environ.get(
-                "POSTGRES_MAX_CONNECTIONS",
-                config.get("postgres", "max_connections", fallback=50),
-            ),
+            "host": get_config_value("POSTGRES_HOST", "postgres", "host", "localhost"),
+            "port": get_config_value("POSTGRES_PORT", "postgres", "port", 5432),
+            "user": get_config_value("POSTGRES_USER", "postgres", "user", None, required=True),
+            "password": get_config_value("POSTGRES_PASSWORD", "postgres", "password", None, required=True),
+            "database": get_config_value("POSTGRES_DATABASE", "postgres", "database", None, required=True),
+            "workspace": get_config_value("POSTGRES_WORKSPACE", "postgres", "workspace", None),
+            "max_connections": get_config_value("POSTGRES_MAX_CONNECTIONS", "postgres", "max_connections", default_max_connections),
             # SSL configuration
-            "ssl_mode": os.environ.get(
-                "POSTGRES_SSL_MODE",
-                config.get("postgres", "ssl_mode", fallback=None),
-            ),
-            "ssl_cert": os.environ.get(
-                "POSTGRES_SSL_CERT",
-                config.get("postgres", "ssl_cert", fallback=None),
-            ),
-            "ssl_key": os.environ.get(
-                "POSTGRES_SSL_KEY",
-                config.get("postgres", "ssl_key", fallback=None),
-            ),
-            "ssl_root_cert": os.environ.get(
-                "POSTGRES_SSL_ROOT_CERT",
-                config.get("postgres", "ssl_root_cert", fallback=None),
-            ),
-            "ssl_crl": os.environ.get(
-                "POSTGRES_SSL_CRL",
-                config.get("postgres", "ssl_crl", fallback=None),
-            ),
+            "ssl_mode": get_config_value("POSTGRES_SSL_MODE", "postgres", "ssl_mode", None),
+            "ssl_cert": get_config_value("POSTGRES_SSL_CERT", "postgres", "ssl_cert", None),
+            "ssl_key": get_config_value("POSTGRES_SSL_KEY", "postgres", "ssl_key", None),
+            "ssl_root_cert": get_config_value("POSTGRES_SSL_ROOT_CERT", "postgres", "ssl_root_cert", None),
+            "ssl_crl": get_config_value("POSTGRES_SSL_CRL", "postgres", "ssl_crl", None),
             # Vector configuration
-            "enable_vector": os.environ.get(
-                "POSTGRES_ENABLE_VECTOR",
-                config.get("postgres", "enable_vector", fallback="true"),
-            ).lower()
-            in ("true", "1", "yes", "on"),
-            "vector_index_type": os.environ.get(
-                "POSTGRES_VECTOR_INDEX_TYPE",
-                config.get("postgres", "vector_index_type", fallback="HNSW"),
-            ),
-            "hnsw_m": int(
-                os.environ.get(
-                    "POSTGRES_HNSW_M",
-                    config.get("postgres", "hnsw_m", fallback="16"),
-                )
-            ),
-            "hnsw_ef": int(
-                os.environ.get(
-                    "POSTGRES_HNSW_EF",
-                    config.get("postgres", "hnsw_ef", fallback="64"),
-                )
-            ),
-            "ivfflat_lists": int(
-                os.environ.get(
-                    "POSTGRES_IVFFLAT_LISTS",
-                    config.get("postgres", "ivfflat_lists", fallback="100"),
-                )
-            ),
-            "vchordrq_build_options": os.environ.get(
-                "POSTGRES_VCHORDRQ_BUILD_OPTIONS",
-                config.get("postgres", "vchordrq_build_options", fallback=""),
-            ),
-            "vchordrq_probes": os.environ.get(
-                "POSTGRES_VCHORDRQ_PROBES",
-                config.get("postgres", "vchordrq_probes", fallback=""),
-            ),
-            "vchordrq_epsilon": float(
-                os.environ.get(
-                    "POSTGRES_VCHORDRQ_EPSILON",
-                    config.get("postgres", "vchordrq_epsilon", fallback="1.9"),
-                )
-            ),
+            "enable_vector": str(get_config_value("POSTGRES_ENABLE_VECTOR", "postgres", "enable_vector", "true")).lower() in ("true", "1", "yes", "on"),
+            "vector_index_type": get_config_value("POSTGRES_VECTOR_INDEX_TYPE", "postgres", "vector_index_type", "HNSW"),
+            "hnsw_m": int(get_config_value("POSTGRES_HNSW_M", "postgres", "hnsw_m", "16")),
+            "hnsw_ef": int(get_config_value("POSTGRES_HNSW_EF", "postgres", "hnsw_ef", "64")),
+            "ivfflat_lists": int(get_config_value("POSTGRES_IVFFLAT_LISTS", "postgres", "ivfflat_lists", "100")),
+            "vchordrq_build_options": get_config_value("POSTGRES_VCHORDRQ_BUILD_OPTIONS", "postgres", "vchordrq_build_options", ""),
+            "vchordrq_probes": get_config_value("POSTGRES_VCHORDRQ_PROBES", "postgres", "vchordrq_probes", ""),
+            "vchordrq_epsilon": float(get_config_value("POSTGRES_VCHORDRQ_EPSILON", "postgres", "vchordrq_epsilon", "1.9")),
             # Server settings for Supabase
-            "server_settings": os.environ.get(
-                "POSTGRES_SERVER_SETTINGS",
-                config.get("postgres", "server_options", fallback=None),
-            ),
-            "statement_cache_size": os.environ.get(
-                "POSTGRES_STATEMENT_CACHE_SIZE",
-                config.get("postgres", "statement_cache_size", fallback=None),
-            ),
+            "server_settings": get_config_value("POSTGRES_SERVER_SETTINGS", "postgres", "server_options", None),
+            "statement_cache_size": get_config_value("POSTGRES_STATEMENT_CACHE_SIZE", "postgres", "statement_cache_size", None),
             # Connection retry configuration
-            "connection_retry_attempts": min(
-                100,  # Increased from 10 to 100 for long-running operations
-                int(
-                    os.environ.get(
-                        "POSTGRES_CONNECTION_RETRIES",
-                        config.get("postgres", "connection_retries", fallback=10),
-                    )
-                ),
-            ),
-            "connection_retry_backoff": min(
-                300.0,  # Increased from 5.0 to 300.0 (5 minutes) for PG switchover scenarios
-                float(
-                    os.environ.get(
-                        "POSTGRES_CONNECTION_RETRY_BACKOFF",
-                        config.get(
-                            "postgres", "connection_retry_backoff", fallback=3.0
-                        ),
-                    )
-                ),
-            ),
-            "connection_retry_backoff_max": min(
-                600.0,  # Increased from 60.0 to 600.0 (10 minutes) for PG switchover scenarios
-                float(
-                    os.environ.get(
-                        "POSTGRES_CONNECTION_RETRY_BACKOFF_MAX",
-                        config.get(
-                            "postgres",
-                            "connection_retry_backoff_max",
-                            fallback=30.0,
-                        ),
-                    )
-                ),
-            ),
-            "pool_close_timeout": min(
-                30.0,
-                float(
-                    os.environ.get(
-                        "POSTGRES_POOL_CLOSE_TIMEOUT",
-                        config.get("postgres", "pool_close_timeout", fallback=5.0),
-                    )
-                ),
-            ),
+            "connection_retry_attempts": min(100, int(get_config_value("POSTGRES_CONNECTION_RETRIES", "postgres", "connection_retries", 10))),
+            "connection_retry_backoff": min(300.0, float(get_config_value("POSTGRES_CONNECTION_RETRY_BACKOFF", "postgres", "connection_retry_backoff", 3.0))),
+            "connection_retry_backoff_max": min(600.0, float(get_config_value("POSTGRES_CONNECTION_RETRY_BACKOFF_MAX", "postgres", "connection_retry_backoff_max", 30.0))),
+            "pool_close_timeout": min(30.0, float(get_config_value("POSTGRES_POOL_CLOSE_TIMEOUT", "postgres", "pool_close_timeout", 5.0))),
+            
+            # Connection pool idle timeout (0 = disabled)
+            "max_inactive_connection_lifetime": max(0.0, float(get_config_value("POSTGRES_MAX_INACTIVE_CONNECTION_LIFETIME", "postgres", "max_inactive_connection_lifetime", 300.0))),
         }
 
     @classmethod
     async def get_client(cls) -> PostgreSQLDB:
-        ctx = cls._get_ctx()
-        if ctx not in cls._instances:
-            cls._instances[ctx] = {"db": None, "ref_count": 0, "lock": asyncio.Lock()}
-
-        async with cls._instances[ctx]["lock"]:
-            if cls._instances[ctx]["db"] is None:
-                config = ClientManager.get_config()
-                db = PostgreSQLDB(config)
-                await db.initdb()
-                await db.check_tables()
-                cls._instances[ctx]["db"] = db
-                cls._instances[ctx]["ref_count"] = 0
-            cls._instances[ctx]["ref_count"] += 1
-            return cls._instances[ctx]["db"]
+        # Use global shared instance instead of per-event-loop
+        async with cls._shared_instance["lock"]:
+            if cls._shared_instance["db"] is None:
+                try:
+                    config = ClientManager.get_config()
+                    
+                    logger.info(f"Creating shared PostgreSQL connection pool with {config['max_connections']} connections")
+                    logger.info(f"Connecting to PostgreSQL at {config['host']}:{config['port']}/{config['database']} as user '{config['user']}'")
+                    
+                    db = PostgreSQLDB(config)
+                    await db.initdb()
+                    await db.check_tables()
+                    cls._shared_instance["db"] = db
+                    cls._shared_instance["ref_count"] = 0
+                    
+                    logger.info("Shared PostgreSQL connection pool created successfully")
+                except Exception as e:
+                    logger.error(f"Failed to create PostgreSQL connection pool: {e}")
+                    # Reset the instance to allow retry
+                    cls._shared_instance["db"] = None
+                    raise
+            
+            cls._shared_instance["ref_count"] += 1
+            logger.debug(f"PostgreSQL shared pool reference count: {cls._shared_instance['ref_count']}")
+            return cls._shared_instance["db"]
 
     @classmethod
     async def release_client(cls, db: PostgreSQLDB):
-        ctx = cls._get_ctx()
-        if ctx not in cls._instances:
-            return
-
-        async with cls._instances[ctx]["lock"]:
+        # Use global shared instance
+        async with cls._shared_instance["lock"]:
             if db is not None:
-                if db is cls._instances[ctx]["db"]:
-                    cls._instances[ctx]["ref_count"] -= 1
-                    if cls._instances[ctx]["ref_count"] == 0:
-                        if db.pool:
-                            await db.pool.close()
-                        logger.info("Closed PostgreSQL database connection pool")
-                        cls._instances[ctx]["db"] = None
+                if db is cls._shared_instance["db"]:
+                    cls._shared_instance["ref_count"] -= 1
+                    logger.debug(f"PostgreSQL shared pool reference count: {cls._shared_instance['ref_count']}")
+                    
+                    # Don't close pool immediately, let it stay for reuse
+                    # Only close when explicitly requested or during shutdown
+                    if cls._shared_instance["ref_count"] <= 0:
+                        logger.info("All references to shared PostgreSQL pool released")
                 else:
+                    # This shouldn't happen with shared pool, but handle gracefully
                     if db.pool:
                         await db.pool.close()
+                        logger.warning("Closed non-shared PostgreSQL pool (unexpected)")
+    
+    @classmethod
+    async def force_close_shared_pool(cls):
+        """Force close the shared pool during shutdown."""
+        async with cls._shared_instance["lock"]:
+            if cls._shared_instance["db"] is not None:
+                if cls._shared_instance["db"].pool:
+                    await cls._shared_instance["db"].pool.close()
+                logger.info("Force closed shared PostgreSQL connection pool")
+                cls._shared_instance["db"] = None
+                cls._shared_instance["ref_count"] = 0
+    
+    @classmethod
+    def get_pool_stats(cls) -> dict[str, Any]:
+        """Get statistics about the shared connection pool."""
+        if cls._shared_instance["db"] is None or cls._shared_instance["db"].pool is None:
+            return {
+                "status": "not_created",
+                "ref_count": cls._shared_instance["ref_count"]
+            }
+        
+        pool = cls._shared_instance["db"].pool
+        return {
+            "status": "active",
+            "ref_count": cls._shared_instance["ref_count"],
+            "size": pool.get_size(),
+            "min_size": pool.get_min_size(),
+            "max_size": pool.get_max_size(),
+            "idle_size": pool.get_idle_size(),
+        }
+    
+    @classmethod
+    async def test_connection(cls) -> dict[str, Any]:
+        """Test PostgreSQL connection with current configuration."""
+        try:
+            config = cls.get_config()
+            
+            # Test basic connection parameters
+            test_conn = await asyncpg.connect(
+                user=config["user"],
+                password=config["password"],
+                database=config["database"],
+                host=config["host"],
+                port=config["port"],
+                timeout=10.0  # 10 second timeout for test
+            )
+            
+            # Test basic query
+            result = await test_conn.fetchval("SELECT version()")
+            await test_conn.close()
+            
+            return {
+                "status": "success",
+                "message": "Connection successful",
+                "server_version": result,
+                "config": {
+                    "host": config["host"],
+                    "port": config["port"],
+                    "database": config["database"],
+                    "user": config["user"],
+                    "max_connections": config["max_connections"]
+                }
+            }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Connection failed: {str(e)}",
+                "error_type": type(e).__name__
+            }
 
 
 @final
@@ -5677,7 +5764,9 @@ class PGGraphStorage(BaseGraphStorage):
 # Note: Order matters! More specific namespaces (e.g., "full_entities") must come before
 # more general ones (e.g., "entities") because is_namespace() uses endswith() matching
 NAMESPACE_TABLE_MAP = {
-    NameSpace.KV_STORE_FULL_DOCS: "LIGHTRAG_DOC_FULL",
+    # NOTE: LIGHTRAG_DOC_FULL is not used when FULL_DOCS_STORAGE=S3KVStorage (MinIO)
+    # Content is stored as .md files in MinIO instead of PostgreSQL
+    NameSpace.KV_STORE_FULL_DOCS: "LIGHTRAG_DOC_FULL",  # Deprecated when using MinIO
     NameSpace.KV_STORE_TEXT_CHUNKS: "LIGHTRAG_DOC_CHUNKS",
     NameSpace.KV_STORE_FULL_ENTITIES: "LIGHTRAG_FULL_ENTITIES",
     NameSpace.KV_STORE_FULL_RELATIONS: "LIGHTRAG_FULL_RELATIONS",
@@ -5709,6 +5798,9 @@ TABLES = {
                     CONSTRAINT LIGHTRAG_WORKSPACES_PK PRIMARY KEY (workspace, id)
                     )"""
     },
+    # NOTE: LIGHTRAG_DOC_FULL table is deprecated when using MinIO storage
+    # When FULL_DOCS_STORAGE=S3KVStorage, document content is stored as .md files in MinIO
+    # This table definition is kept for backward compatibility but not used
     "LIGHTRAG_DOC_FULL": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_FULL (
                     id VARCHAR(255),
@@ -5804,6 +5896,7 @@ TABLES = {
 	               status varchar(64) NULL,
 	               file_path TEXT NULL,
 	               chunks_list JSONB NULL DEFAULT '[]'::jsonb,
+	               content_hash VARCHAR(32) NULL,
 	               track_id varchar(255) NULL,
 	               metadata JSONB NULL DEFAULT '{}'::jsonb,
 	               error_msg TEXT NULL,
@@ -5811,21 +5904,6 @@ TABLES = {
 	               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	               CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
 	              )"""
-    },
-    "LIGHTRAG_TRACK_STATUS": {
-        "ddl": """CREATE TABLE LIGHTRAG_TRACK_STATUS (
-                   workspace varchar(255) NOT NULL,
-                   track_id varchar(255) NOT NULL,
-                   status varchar(64) NULL,
-                   file_count int4 DEFAULT 0,
-                   processed_count int4 DEFAULT 0,
-                   failed_count int4 DEFAULT 0,
-                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                   metadata JSONB NULL DEFAULT '{}'::jsonb,
-                   error_msg TEXT NULL,
-                   CONSTRAINT LIGHTRAG_TRACK_STATUS_PK PRIMARY KEY (workspace, track_id)
-                  )"""
     },
     "LIGHTRAG_FULL_ENTITIES": {
         "ddl": """CREATE TABLE LIGHTRAG_FULL_ENTITIES (
@@ -5876,6 +5954,9 @@ TABLES = {
 
 SQL_TEMPLATES = {
     # SQL for KVStorage
+    
+    # NOTE: The following queries are for LIGHTRAG_DOC_FULL table
+    # These are deprecated when using MinIO storage (FULL_DOCS_STORAGE=S3KVStorage)
     "get_by_id_full_docs": """SELECT id, COALESCE(content, '') as content,
                                 COALESCE(doc_name, '') as file_path
                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
@@ -5892,6 +5973,7 @@ SQL_TEMPLATES = {
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id=$2
                                """,
+    # NOTE: Deprecated when using MinIO storage
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content,
                                  COALESCE(doc_name, '') as file_path
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
@@ -5949,6 +6031,10 @@ SQL_TEMPLATES = {
                                  FROM LIGHTRAG_RELATION_CHUNKS WHERE workspace=$1 AND id = ANY($2)
                                 """,
     "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
+    
+    # NOTE: The following SQL templates are for LIGHTRAG_DOC_FULL table
+    # These are deprecated when using MinIO storage (FULL_DOCS_STORAGE=S3KVStorage)
+    # Content is stored as .md files in MinIO instead of PostgreSQL
     "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, workspace)
                         VALUES ($1, $2, $3, $4)
                         ON CONFLICT (workspace,id) DO UPDATE

@@ -46,6 +46,188 @@ LightRAG is an advanced Retrieval-Augmented Generation (RAG) framework designed 
 - Configure storage backends through `LIGHTRAG_*` variables and validate them with `docker-compose` services when needed.
 - Treat `lightrag.log*` as local artefacts; purge sensitive information before sharing logs or outputs.
 
+## PostgreSQL Connection Pool Architecture & Troubleshooting
+
+### Architecture Overview
+LightRAG uses a **shared connection pool** architecture for PostgreSQL connections:
+- **One pool per process** (NOT per workspace): `ClientManager._shared_instance` is a class-level singleton
+- All workspaces within a process share the same connection pool
+- Connections are reused across requests (not closed after each query)
+- Pool size determines maximum concurrent connections, not total requests
+
+### Key Configuration Variables
+Located in `.env`:
+- `POSTGRES_MAX_CONNECTIONS`: Client-side pool size (default: 400)
+  - Controls max concurrent connections from application to PostgreSQL
+  - Shared across all workspaces in the same process
+- `POSTGRES_MAX_INACTIVE_CONNECTION_LIFETIME`: Idle timeout in seconds (default: 300)
+  - Automatically closes idle connections after this duration
+  - Prevents connection leaks and reduces resource usage
+- PostgreSQL server `max_connections`: Server-side limit (default: 1000 in docker-compose.yml)
+  - Must be higher than total client connections across all processes
+  - Formula: `num_processes × POSTGRES_MAX_CONNECTIONS ≤ max_connections`
+
+### Connection Pool Behavior
+**Sequential Requests:**
+- 10 sequential requests → 1 connection reused 10 times
+- Connection stays open in pool between requests
+
+**Concurrent Requests:**
+- 10 concurrent requests with `max_size=3` → 3 connections active, 7 requests wait in queue
+- Requests are served as connections become available
+
+**Idle Timeout:**
+- Connections idle for `max_inactive_connection_lifetime` seconds are automatically closed
+- Prevents accumulation of unused connections over time
+
+### Common Issues & Solutions
+
+#### Issue 1: Connection Pool Exhausted
+**Symptoms:**
+- `TooManyConnectionsError` or `asyncpg.exceptions.TooManyConnectionsError`
+- Requests timing out or hanging
+- Error: "sorry, too many clients already"
+
+**Diagnosis:**
+```bash
+# Check current connections
+docker exec -it lightrag-postgres psql -U postgres -d lightrag -c "
+SELECT count(*), state, wait_event_type 
+FROM pg_stat_activity 
+WHERE datname='lightrag' 
+GROUP BY state, wait_event_type;"
+
+# Monitor in real-time
+.kiro/scripts/monitor_pg_connections.sh
+```
+
+**Solutions:**
+1. **Increase pool size** (if server has capacity):
+   ```bash
+   # In .env
+   POSTGRES_MAX_CONNECTIONS=400  # Increase from default
+   ```
+
+2. **Increase server limit** (in docker-compose.yml):
+   ```yaml
+   postgres:
+     command: postgres -c max_connections=1000 -c shared_buffers=512MB
+   ```
+
+3. **Reduce idle timeout** (close unused connections faster):
+   ```bash
+   # In .env
+   POSTGRES_MAX_INACTIVE_CONNECTION_LIFETIME=180  # 3 minutes instead of 5
+   ```
+
+4. **Check for connection leaks**:
+   - Look for long-running idle connections
+   - Verify all async contexts properly close connections
+   - Check for stuck transactions
+
+#### Issue 2: Deprecated Table Schema Errors
+**Symptoms:**
+- `column "id" does not exist` in `LIGHTRAG_TRACK_STATUS` table
+- Upload failures with PostgreSQL errors
+
+**Solution:**
+The `LIGHTRAG_TRACK_STATUS` table has been removed. Ensure it's not in the `TABLES` dictionary in `lightrag/kg/postgres_impl.py`:
+```python
+# WRONG - causes errors
+TABLES = {
+    "LIGHTRAG_TRACK_STATUS": {...},  # Remove this
+    ...
+}
+
+# CORRECT
+TABLES = {
+    "LIGHTRAG_DOC_STATUS": {...},
+    "LIGHTRAG_DOC_CHUNKS": {...},
+    ...
+}
+```
+
+#### Issue 3: Connection Leaks Over Time
+**Symptoms:**
+- Idle connections increasing over time
+- Connections not being released
+- Old connections (age > 30 minutes)
+
+**Diagnosis:**
+```bash
+# Check connection age
+docker exec -it lightrag-postgres psql -U postgres -d lightrag -c "
+SELECT pid, state, 
+       now() - state_change as idle_duration,
+       query
+FROM pg_stat_activity 
+WHERE datname='lightrag' AND state='idle'
+ORDER BY state_change;"
+```
+
+**Solutions:**
+1. Verify `max_inactive_connection_lifetime` is set in pool config
+2. Check for missing `await` statements in async code
+3. Ensure RAG instance cache doesn't create multiple pools per event loop
+4. Restart services to clear leaked connections
+
+#### Issue 4: MinIO/S3 Connection Issues
+**Symptoms:**
+- Upload succeeds but extraction fails
+- Celery worker can't access uploaded files
+- Connection refused to MinIO
+
+**Solutions:**
+1. **Use internal Docker network endpoint**:
+   ```bash
+   # In .env - WRONG
+   S3_ENDPOINT_URL=http://localhost:19000
+   
+   # CORRECT
+   S3_ENDPOINT_URL=http://minio:9000
+   ```
+
+2. **Ensure Celery worker has S3 environment variables** (in docker-compose.yml):
+   ```yaml
+   celery_worker:
+     environment:
+       - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+       - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID}
+       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY}
+       - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+   ```
+
+### Monitoring & Validation Tools
+Located in `.kiro/scripts/`:
+- `monitor_pg_connections.sh`: Real-time connection monitoring
+- `check_pool_contention.py`: Test pool behavior under load
+- `check_connection_config.sh`: Validate configuration (checks `num_processes × pool_size ≤ max_connections`)
+
+### Best Practices
+1. **Capacity Planning**: Set `max_connections` to at least 2× expected concurrent load for headroom
+2. **Idle Timeout**: Use 3-5 minutes for most workloads; shorter for high-churn scenarios
+3. **Pool Size**: Start with 100-200 per process; scale based on actual concurrent query patterns
+4. **Monitoring**: Regularly check connection usage and idle duration
+5. **Shared Pool**: Remember that all workspaces share the pool—don't multiply by workspace count
+6. **Process Count**: In multi-process deployments (Gunicorn), total connections = `num_workers × pool_size`
+
+### Configuration Example
+Recommended settings for production with 1000 concurrent users:
+```bash
+# .env
+POSTGRES_MAX_CONNECTIONS=400
+POSTGRES_MAX_INACTIVE_CONNECTION_LIFETIME=300
+
+# docker-compose.yml
+postgres:
+  command: postgres -c max_connections=1000 -c shared_buffers=512MB -c max_prepared_transactions=100
+```
+
+This configuration supports:
+- 1 API process × 400 pool = 400 client connections
+- 1000 server limit provides 2.5× headroom
+- 5-minute idle timeout prevents connection accumulation
+
 ## Document Identification & Migration (track_id → doc_id + content_hash)
 - **CRITICAL**: The `track_id` system has been completely removed and replaced with UUID-based `doc_id` + `content_hash` for duplicate detection.
 - **Document ID Format**: All documents now use `doc-{uuid4}` format (e.g., `doc-550e8400-e29b-41d4-a716-446655440000`) instead of hash-based `doc-{md5_hash}`.

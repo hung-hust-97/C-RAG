@@ -1209,6 +1209,45 @@ def get_unique_filename_in_enqueued(target_dir: Path, original_name: str) -> str
     return f"{base_name}_{timestamp}{extension}"
 
 
+def _create_markdown_content(content: str, file_path: str, doc_id: str, content_hash: str, extraction_timestamp: str) -> str:
+    """Create markdown content with metadata header for MinIO storage.
+    
+    Args:
+        content: The extracted text content
+        file_path: Original file path/name
+        doc_id: Document ID
+        content_hash: Content hash for duplicate detection
+        extraction_timestamp: When the extraction was performed
+        
+    Returns:
+        Formatted markdown content with YAML frontmatter
+    """
+    # Create YAML frontmatter with metadata
+    frontmatter = f"""---
+doc_id: {doc_id}
+original_file: {file_path}
+content_hash: {content_hash}
+extraction_timestamp: {extraction_timestamp}
+format: markdown
+source: lightrag_extraction
+---
+
+"""
+    
+    # Clean and format the content
+    cleaned_content = content.strip()
+    
+    # If content doesn't start with a header, add the filename as title
+    if not cleaned_content.startswith('#'):
+        title = Path(file_path).stem.replace('_', ' ').replace('-', ' ').title()
+        cleaned_content = f"# {title}\n\n{cleaned_content}"
+    
+    # Combine frontmatter and content
+    markdown_content = frontmatter + cleaned_content
+    
+    return markdown_content
+
+
 # Document processing helper functions (synchronous)
 # These functions run in thread pool via asyncio.to_thread() to avoid blocking the event loop
 
@@ -2092,15 +2131,28 @@ async def pipeline_enqueue_file(
                     }
                 })
                 
-                # Store full document content
+                # Store full document content as markdown file in MinIO
+                # Convert content to markdown format with metadata header
+                markdown_content = _create_markdown_content(
+                    content=content,
+                    file_path=file_path.name,
+                    doc_id=doc_id,
+                    content_hash=content_hash,
+                    extraction_timestamp=datetime.now(timezone.utc).isoformat()
+                )
+                
                 await rag.full_docs.upsert({
                     doc_id: {
-                        "content": content,
+                        "content": markdown_content,
                         "file_path": file_path.name,
+                        "format": "markdown",
+                        "original_filename": file_path.name,
+                        "content_hash": content_hash,
+                        "extraction_timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 })
                 
-                logger.info(f"Successfully extracted and enqueued file: {file_path.name} with doc_id: {doc_id}")
+                logger.info(f"Successfully extracted and stored markdown content in MinIO for: {file_path.name} with doc_id: {doc_id}")
 
                 # Move file to __enqueued__ directory after enqueuing
                 try:

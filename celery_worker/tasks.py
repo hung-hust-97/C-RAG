@@ -117,22 +117,17 @@ def _run_async(coro):
 async def _get_rag(workspace_id: str):
     """
     Build and initialize a LightRAG instance from environment variables.
-    Re-uses cached instances within the same event loop (since storage connections
-    are often bound to the loop they were initialized in).
+    Re-uses cached instances per workspace (shared pool handles multi-loop scenarios).
+    
+    NOTE: We cache by workspace_id only, not by event loop ID, because:
+    1. PostgreSQL shared pool is designed to work across event loops
+    2. Creating new instances per loop wastes connections (each instance = new pool)
+    3. Storage backends properly handle event loop changes internally
     """
-    try:
-        current_loop_id = id(asyncio.get_running_loop())
-    except RuntimeError:
-        current_loop_id = 0
-
     if workspace_id in _rag_cache:
-        rag, loop_id = _rag_cache[workspace_id]
-        if loop_id == current_loop_id:
-            return rag
-        else:
-            logger.debug(
-                f"[Celery] Event loop changed for {workspace_id} ({loop_id} -> {current_loop_id}), recreating instance."
-            )
+        rag, _ = _rag_cache[workspace_id]
+        logger.debug(f"[Celery] Reusing cached RAG instance for workspace: {workspace_id}")
+        return rag
 
     from lightrag.api.config import global_args
     from lightrag.api.lightrag_factory import LLMConfigCache, build_rag_instance
@@ -144,9 +139,11 @@ async def _get_rag(workspace_id: str):
     rag = build_rag_instance(workspace_id, global_args, config_cache)
 
     await rag.initialize_storages()
-    _rag_cache[workspace_id] = (rag, current_loop_id)
+    
+    # Cache without loop_id - shared pool handles cross-loop usage
+    _rag_cache[workspace_id] = (rag, 0)
     logger.info(
-        f"[Celery] Initialized factory-based RAG instance for workspace: {workspace_id} (Loop ID: {current_loop_id})"
+        f"[Celery] Initialized factory-based RAG instance for workspace: {workspace_id}"
     )
     return rag
 

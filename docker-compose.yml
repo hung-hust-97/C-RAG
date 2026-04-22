@@ -187,7 +187,7 @@ services:
       LIGHTRAG_LOG_LEVEL: ${LIGHTRAG_LOG_LEVEL:-INFO}
       LIGHTRAG_ERROR_LOG_LEVEL: ${LIGHTRAG_ERROR_LOG_LEVEL:-ERROR}
       # Storage backend connections - shared with celery_worker
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_HOST: postgres
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       MILVUS_URI: ${MILVUS_URI:-http://milvus:19530}
@@ -202,10 +202,11 @@ services:
         condition: service_started  # Wait for message broker to start
     healthcheck:
       # Verifies FastAPI server is responding to requests
-      test: ["CMD", "curl", "-f", "http://localhost:9621/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:9621/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s  # Allow time for server initialization
 
   # UI - Nginx-based frontend serving React application
   # Serves: static UI files from /webui/
@@ -256,15 +257,35 @@ services:
       # Celery broker and backend configuration
       EMBEDDING_CELERY_BROKER_URL: ${EMBEDDING_CELERY_BROKER_URL:-redis://redis:6379/0}
       EMBEDDING_CELERY_RESULT_BACKEND: ${EMBEDDING_CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      EMBEDDING_USE_CELERY: ${EMBEDDING_USE_CELERY:-true}
       # Worker concurrency - number of parallel task processes
       CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-2}
       # Logging configuration
       LIGHTRAG_LOG_DIR: ${LIGHTRAG_LOG_DIR:-/app/data/logs}
+      # LLM configuration - required for entity extraction
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_API_BASE: ${LLM_API_BASE}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_API_BASE: ${OPENAI_API_BASE}
+      # Embedding configuration - required for vector operations
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      # DeepSeek OCR configuration - required for document extraction
+      DEEPSEEK_OCR_ENGINE: ${DEEPSEEK_OCR_ENGINE:-auto}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL}
+      DEEPSEEK_OCR_TIMEOUT: ${DEEPSEEK_OCR_TIMEOUT:-600}
+      DEEPSEEK_OCR_FALLBACK: ${DEEPSEEK_OCR_FALLBACK:-true}
       # Storage backend connections - must match lightrag API configuration
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       MILVUS_URI: ${MILVUS_URI:-http://milvus:19530}
+      # PostgreSQL connection pool configuration for Celery workers
+      # Reduced from default 400 to prevent connection exhaustion
+      # Formula: workers × max_connections ≤ server max_connections
+      # Current: 2 workers × 50 = 100 connections (well within 1000 limit)
+      POSTGRES_MAX_CONNECTIONS: ${CELERY_POSTGRES_MAX_CONNECTIONS:-50}
       # S3/MinIO configuration for full document storage
       FULL_DOCS_STORAGE: ${FULL_DOCS_STORAGE:-S3KVStorage}
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
@@ -281,13 +302,13 @@ services:
       redis:
         condition: service_started  # Wait for message broker to start
     healthcheck:
-      # Verifies worker can connect to broker and process tasks
-      # Uses hostname variable to check specific worker instance
-      test: ["CMD-SHELL", "celery -A celery_worker.app inspect ping -d celery@$HOSTNAME"]
+      # Verifies worker can connect to broker and is ready to process tasks
+      # Uses 'stats' command which is more reliable than 'ping' for checking worker health
+      test: ["CMD-SHELL", "celery -A celery_worker.app inspect stats --timeout=10 || exit 1"]
       interval: 30s
-      timeout: 10s
+      timeout: 15s
       retries: 3
-      start_period: 40s  # Allow extra time for worker initialization
+      start_period: 60s  # Allow extra time for worker initialization
 
 # All data is now stored in local bind mounts under ./data/volumes/
 # This makes data easier to access, backup, and manage

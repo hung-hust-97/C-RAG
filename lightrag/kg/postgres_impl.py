@@ -188,8 +188,8 @@ class PostgreSQLDB:
         except (ValueError, TypeError):
             raise ValueError(f"Invalid port number: {self.port}")
 
-        # Guard concurrent pool resets
-        self._pool_reconnect_lock = asyncio.Lock()
+        # Guard concurrent pool resets (lazy-initialized to avoid event loop binding)
+        self._pool_reconnect_lock = None
 
         self._transient_exceptions = (
             asyncio.TimeoutError,
@@ -261,6 +261,18 @@ class PostgreSQLDB:
             },
         )
         self._registered_workspaces[normalized_workspace_id] = normalized_workspace_name
+
+    @property
+    def pool_reconnect_lock(self) -> asyncio.Lock:
+        """Lazy-initialize pool reconnect lock to avoid event loop binding issues.
+        
+        This property ensures the lock is created in the current event loop,
+        preventing "Lock is bound to a different event loop" errors when
+        RAG instances are cached and reused across different event loops.
+        """
+        if self._pool_reconnect_lock is None:
+            self._pool_reconnect_lock = asyncio.Lock()
+        return self._pool_reconnect_lock
 
     def _create_ssl_context(self) -> ssl.SSLContext | None:
         """Create SSL context based on configuration parameters."""
@@ -463,7 +475,7 @@ class PostgreSQLDB:
     async def _ensure_pool(self) -> None:
         """Ensure the connection pool is initialised and healthy."""
         if self.pool is None:
-            async with self._pool_reconnect_lock:
+            async with self.pool_reconnect_lock:
                 if self.pool is None:
                     await self.initdb()
         else:
@@ -473,12 +485,12 @@ class PostgreSQLDB:
                     await conn.execute("SELECT 1")
             except Exception as e:
                 logger.warning(f"PostgreSQL pool health check failed: {e}, reinitializing pool")
-                async with self._pool_reconnect_lock:
+                async with self.pool_reconnect_lock:
                     await self._reset_pool()
                     await self.initdb()
 
     async def _reset_pool(self) -> None:
-        async with self._pool_reconnect_lock:
+        async with self.pool_reconnect_lock:
             if self.pool is not None:
                 try:
                     await asyncio.wait_for(
@@ -4039,17 +4051,18 @@ class PGDocStatusStorage(DocStatusStorage):
             created_at = parse_datetime(v.get("created_at"))
             updated_at = parse_datetime(v.get("updated_at"))
 
-            # chunks_count, chunks_list, content_hash, metadata, and error_msg are optional
+            # chunks_count, chunks_list, content_hash, metadata, error_msg, content_summary, and file_path are optional
+            # Use safe defaults for missing required fields to prevent KeyError in exception handlers
             await self.db.execute(
                 sql,
                 {
                     "workspace": self.workspace,
                     "id": k,
-                    "content_summary": v["content_summary"],
-                    "content_length": v["content_length"],
-                    "chunks_count": v["chunks_count"] if "chunks_count" in v else -1,
-                    "status": v["status"],
-                    "file_path": v["file_path"],
+                    "content_summary": v.get("content_summary", ""),  # Default to empty string if missing
+                    "content_length": v.get("content_length", 0),  # Default to 0 if missing
+                    "chunks_count": v.get("chunks_count", -1),  # Default to -1 if missing
+                    "status": v["status"],  # Status is always required
+                    "file_path": v.get("file_path", "unknown_source"),  # Default to sentinel value if missing
                     "chunks_list": json.dumps(v.get("chunks_list", [])),
                     "content_hash": v.get("content_hash"),  # Add content_hash support
                     "metadata": json.dumps(

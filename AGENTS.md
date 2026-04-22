@@ -78,7 +78,9 @@ Located in `.env`:
 
 **Idle Timeout:**
 - Connections idle for `max_inactive_connection_lifetime` seconds are automatically closed
-- Prevents accumulation of unused connections over time
+- **IMPORTANT**: asyncpg only marks connections for closure; actual cleanup happens on next `acquire()`
+- Without active traffic or explicit pool closure, idle connections persist indefinitely
+- Celery workers now implement `worker_process_shutdown` signal to explicitly close pools on exit
 
 ### Common Issues & Solutions
 
@@ -120,10 +122,17 @@ GROUP BY state, wait_event_type;"
    POSTGRES_MAX_INACTIVE_CONNECTION_LIFETIME=180  # 3 minutes instead of 5
    ```
 
-4. **Check for connection leaks**:
+4. **Reduce Celery worker pool size** (prevent worker connection exhaustion):
+   ```bash
+   # In .env or docker-compose.yml
+   CELERY_POSTGRES_MAX_CONNECTIONS=50  # Reduce from default 400
+   ```
+
+5. **Check for connection leaks**:
    - Look for long-running idle connections
    - Verify all async contexts properly close connections
    - Check for stuck transactions
+   - Ensure Celery workers have `worker_process_shutdown` cleanup handlers
 
 #### Issue 2: Deprecated Table Schema Errors
 **Symptoms:**
@@ -200,6 +209,7 @@ ORDER BY state_change;"
 ### Monitoring & Validation Tools
 Located in `.kiro/scripts/`:
 - `monitor_pg_connections.sh`: Real-time connection monitoring
+- `diagnose_pg_connections.sh`: Comprehensive connection diagnostic with recommendations
 - `check_pool_contention.py`: Test pool behavior under load
 - `check_connection_config.sh`: Validate configuration (checks `num_processes × pool_size ≤ max_connections`)
 
@@ -279,6 +289,291 @@ UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
 - Stuck `EXTRACTING` documents with content are automatically reset to `EXTRACTED`
 - Stuck `EXTRACTING` documents without content trigger re-extraction if file exists
 - Documents are validated for consistency before reprocessing
+
+## Celery Worker Architecture & Troubleshooting
+
+### Worker Overview
+LightRAG uses Celery workers for asynchronous document processing. The worker implementation is in `celery_worker/tasks.py` and handles:
+- Document extraction (OCR/Docling)
+- Chunking and entity extraction
+- Graph construction
+- Async query execution
+
+### Worker Tasks
+Located in `celery_worker/tasks.py`:
+
+1. **task_extract_and_enqueue**: OCR & Markdown extraction for a single file
+   - Picks up files from disk
+   - Runs DeepSeek/Docling to produce Markdown text
+   - Updates document status to `EXTRACTED`
+   - Automatically triggers `task_chunk_and_graph`
+
+2. **task_chunk_and_graph**: Chunking and graph building
+   - Processes ALL documents in `EXTRACTED`, `PENDING`, `PROCESSING`, `FAILED` statuses
+   - Performs chunking → entity extraction → graph upsert
+   - Mirrors logic of `lightrag.py:apipeline_process_enqueue_documents()`
+
+3. **task_process_all_extracted**: Process all workspaces with EXTRACTED documents
+   - Queries database for all workspaces with EXTRACTED documents
+   - Triggers `task_chunk_and_graph` for each workspace automatically
+   - Use this to process stuck documents across all workspaces
+
+4. **task_execute_query**: Offline async query execution
+   - Executes RAG queries outside request-response cycle
+   - Stores results in Redis for later retrieval
+
+5. **apipeline_process_enqueue_documents_task**: Multi-workspace pipeline processing
+   - Processes/enqueues documents for specific workspace
+   - Supports `reprocess_failed` parameter for reprocessing stuck documents
+
+### Worker Status Handling
+**CRITICAL**: Workers must use `DocStatus` enum from `lightrag.base`, NOT hardcoded strings.
+
+```python
+# CORRECT - Use enum
+from lightrag.base import DocStatus
+
+status = DocStatus.EXTRACTED
+if doc_status == DocStatus.PROCESSED:
+    ...
+
+# WRONG - Hardcoded strings
+status = "extracted"  # Will cause validation errors
+if doc_status == "processed":  # Inconsistent with enum
+    ...
+```
+
+**Status Values**: All status values are UPPERCASE:
+- `DocStatus.UPLOADING` = "UPLOADING"
+- `DocStatus.EXTRACTING` = "EXTRACTING"
+- `DocStatus.EXTRACTED` = "EXTRACTED"
+- `DocStatus.CHUNKING` = "CHUNKING"
+- `DocStatus.PROCESSED` = "PROCESSED"
+- `DocStatus.FAILED` = "FAILED"
+- `DocStatus.DUPLICATED` = "DUPLICATED"
+
+### Worker Initialization & Cleanup
+The worker implements critical lifecycle hooks:
+
+**Process Initialization** (`worker_process_init` signal):
+- Resets asyncio locks after fork to prevent event loop binding issues
+- Called when a new worker process is forked
+- Clears lock caches so new locks are created in child's event loop
+
+**Process Shutdown** (`worker_process_shutdown` signal):
+- Closes all PostgreSQL connection pools to prevent connection leaks
+- Critical for preventing idle connection accumulation
+- Closes pools for: KV storage, doc status storage, graph storage, vector storage
+- Clears RAG instance cache
+
+### Common Worker Issues
+
+#### Issue 1: Documents Stuck in EXTRACTED Status
+**Symptoms:**
+- Documents remain in `EXTRACTED` status indefinitely
+- Worker is running but not processing documents
+- Worker logs show "No documents to process"
+
+**Diagnosis:**
+```bash
+# Check worker status
+docker logs --tail 50 c-rag_celery_worker_1
+
+# Check document statuses
+docker exec c-rag_postgres_1 psql -U postgres -d crag -c \
+  "SELECT status, COUNT(*) FROM lightrag_doc_status GROUP BY status;"
+
+# Check if EXTRACTED documents have content
+docker exec c-rag_postgres_1 psql -U postgres -d crag -c "
+SELECT COUNT(*) as total,
+       SUM(CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END) as with_content,
+       SUM(CASE WHEN f.id IS NULL THEN 1 ELSE 0 END) as without_content
+FROM lightrag_doc_status d
+LEFT JOIN lightrag_doc_full f ON d.id = f.id AND d.workspace = f.workspace
+WHERE d.status = 'EXTRACTED';"
+```
+
+**Root Cause:**
+- Documents marked as `EXTRACTED` but have no content in `lightrag_doc_full` table
+- This can happen during status migration or if extraction failed silently
+- Worker skips documents without content (line 1881 in lightrag.py: `if content_data:`)
+
+**Solutions:**
+1. **Fix EXTRACTED documents without content** - mark them as FAILED:
+   ```bash
+   docker exec c-rag_postgres_1 psql -U postgres -d crag -c "
+   UPDATE lightrag_doc_status 
+   SET status = 'FAILED',
+       error_msg = 'No content found - extraction may have failed',
+       updated_at = NOW()
+   WHERE id IN (
+       SELECT d.id
+       FROM lightrag_doc_status d
+       LEFT JOIN lightrag_doc_full f ON d.id = f.id AND d.workspace = f.workspace
+       WHERE d.status = 'EXTRACTED' AND f.id IS NULL
+   );"
+   ```
+
+2. **Manual trigger for all workspaces**: Use the new task to process all workspaces:
+   ```bash
+   # Trigger processing for ALL workspaces with EXTRACTED documents
+   docker exec c-rag_celery_worker_1 python -c "
+   from celery_worker.tasks import task_process_all_extracted
+   result = task_process_all_extracted.delay()
+   print(f'Task queued: {result.id}')
+   "
+   ```
+
+3. **Manual trigger for specific workspace**:
+   ```bash
+   # Via Python
+   docker exec c-rag_celery_worker_1 python -c "
+   from celery_worker.tasks import task_chunk_and_graph
+   task_chunk_and_graph.delay('workspace_id')
+   "
+   ```
+
+4. **Check worker connectivity**:
+   - Verify Redis connection: `docker logs c-rag_redis_1`
+   - Verify worker can reach PostgreSQL: Check `POSTGRES_HOST` in worker environment
+   - Inside Docker, use service names (e.g., `postgres`, `redis`), not `localhost`
+
+5. **Restart worker** to clear any stuck state:
+   ```bash
+   docker-compose restart celery_worker
+   ```
+
+#### Issue 2: Pydantic Validation Errors
+**Symptoms:**
+- Error: `Input should be 'uploading', 'extracting', 'extracted'... [type=enum, input_value='EXTRACTED']`
+- API returns 500 errors when querying documents
+
+**Root Cause:**
+- Database has uppercase status values (e.g., `EXTRACTED`)
+- Code expects lowercase values (e.g., `extracted`)
+- Mismatch between `DocStatus` enum definition and database values
+
+**Solution:**
+1. **Update database statuses** to uppercase:
+   ```bash
+   python .kiro/scripts/update_document_statuses.py
+   ```
+
+2. **Rebuild Docker images** to get latest code:
+   ```bash
+   docker-compose down
+   docker-compose build --no-cache lightrag celery_worker
+   docker-compose up -d
+   ```
+
+3. **Verify enum consistency** in `lightrag/base.py`:
+   ```python
+   class DocStatus(str, Enum):
+       UPLOADING = "UPLOADING"      # Must be uppercase
+       EXTRACTING = "EXTRACTING"
+       EXTRACTED = "EXTRACTED"
+       # ... etc
+   ```
+
+#### Issue 3: Worker Can't Connect to PostgreSQL
+**Symptoms:**
+- Worker logs show: `OSError("Multiple exceptions: [Errno 111] Connect call failed")`
+- Connection refused to localhost:5432
+
+**Root Cause:**
+- Worker is trying to connect to `localhost` instead of Docker service name
+- `.env` file has `POSTGRES_HOST=localhost` which works for host but not Docker
+
+**Solution:**
+1. **Update docker-compose.yml** to force correct hostname:
+   ```yaml
+   celery_worker:
+     environment:
+       POSTGRES_HOST: postgres  # Force Docker service name
+   ```
+
+2. **Or use separate .env for Docker**:
+   ```bash
+   # In .env for host development
+   POSTGRES_HOST=localhost
+   
+   # In docker-compose.yml override
+   environment:
+     POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+   ```
+
+#### Issue 4: Event Loop Binding Errors
+**Symptoms:**
+- Error: `RuntimeError: Task <Task> attached to a different loop`
+- Worker crashes after processing some documents
+
+**Root Cause:**
+- Asyncio locks inherited from parent process after fork
+- Locks bound to parent's event loop can't be used in child
+
+**Solution:**
+- Already implemented in `celery_worker/tasks.py`
+- `worker_process_init` signal resets all locks after fork
+- If adding new async locks, ensure they're reset in `_reset_locks_after_fork()`
+
+### Worker Monitoring Commands
+
+```bash
+# Check worker status
+docker-compose ps | grep celery
+
+# View worker logs
+docker logs --tail 100 -f c-rag_celery_worker_1
+
+# Check active Celery tasks
+docker exec c-rag_celery_worker_1 celery -A celery_worker.app inspect active
+
+# Check registered tasks
+docker exec c-rag_celery_worker_1 celery -A celery_worker.app inspect registered
+
+# Check worker stats
+docker exec c-rag_celery_worker_1 celery -A celery_worker.app inspect stats
+
+# Restart worker
+docker-compose restart celery_worker
+
+# View Redis queue length
+docker exec c-rag_redis_1 redis-cli LLEN celery
+```
+
+### Worker Configuration
+Key environment variables in `docker-compose.yml`:
+
+```yaml
+celery_worker:
+  environment:
+    # Storage connections - must use Docker service names
+    POSTGRES_HOST: postgres
+    NEO4J_URI: bolt://neo4j:7687
+    MILVUS_URI: http://milvus:19530
+    
+    # Redis for task queue
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    
+    # S3/MinIO for file access
+    S3_ENDPOINT_URL: http://minio:9000
+    
+    # Worker pool configuration
+    CELERY_POSTGRES_MAX_CONNECTIONS: 50  # Lower than API to prevent exhaustion
+```
+
+### Best Practices
+1. **Status Consistency**: Always use `DocStatus` enum, never hardcoded strings
+2. **Connection Management**: Ensure `worker_process_shutdown` closes all pools
+3. **Docker Networking**: Use service names (`postgres`, `redis`) not `localhost`
+4. **Manual Triggering**: Workers don't auto-pickup; trigger via API or Celery task
+5. **Monitoring**: Regularly check worker logs and task queue length
+6. **Graceful Shutdown**: Use `docker-compose stop` (not `kill`) to allow cleanup
+7. **Reprocess Failed Documents**: Use `/documents/reprocess_failed` endpoint (no `/api` prefix)
+   - Without `workspace_id`: processes ALL workspaces with FAILED documents
+   - With `workspace_id`: processes only specified workspace
+   - Example: `curl -X POST "http://localhost:9621/documents/reprocess_failed"`
 
 ## Automation & Agent Workflow
 - Use repo-relative `workdir` arguments for every shell command and prefer `rg`/`rg --files` for searches since they are faster under the CLI harness.

@@ -731,21 +731,23 @@ class DocStatus(str, Enum):
     - PROCESSED: Hoàn thành tất cả - final state
     - FAILED: Lỗi ở bất kỳ stage nào - can be reprocessed
     - DUPLICATED: Tài liệu trùng lặp về nội dung - detected via content_hash
+    
+    NOTE: All status values are UPPERCASE for consistency across the system.
     """
 
-    UPLOADING = "uploading"           # File đang được upload
-    EXTRACTING = "extracting"         # Đang extract full text (OCR/Docling)
-    EXTRACTED = "extracted"           # Đã extract xong, chờ chunking + KG
-    CHUNKING = "chunking"             # Đang chunking + extract entities
-    PROCESSED = "processed"           # Hoàn thành tất cả
-    FAILED = "failed"                 # Lỗi ở bất kỳ stage nào
-    DUPLICATED = "duplicated"         # Tài liệu trùng lặp về nội dung
+    UPLOADING = "UPLOADING"           # File đang được upload
+    EXTRACTING = "EXTRACTING"         # Đang extract full text (OCR/Docling)
+    EXTRACTED = "EXTRACTED"           # Đã extract xong, chờ chunking + KG
+    CHUNKING = "CHUNKING"             # Đang chunking + extract entities
+    PROCESSED = "PROCESSED"           # Hoàn thành tất cả
+    FAILED = "FAILED"                 # Lỗi ở bất kỳ stage nào
+    DUPLICATED = "DUPLICATED"         # Tài liệu trùng lặp về nội dung
     
     # Legacy statuses for backward compatibility (deprecated, will be removed)
-    PENDING = "pending"               # Legacy: mapped to EXTRACTED
-    PROCESSING = "processing"         # Legacy: mapped to CHUNKING
-    PREPROCESSED = "preprocessed"     # Legacy: deprecated
-    CHUNKED = "chunked"               # Legacy: deprecated
+    PENDING = "PENDING"               # Legacy: mapped to EXTRACTED
+    PROCESSING = "PROCESSING"         # Legacy: mapped to CHUNKING
+    PREPROCESSED = "PREPROCESSED"     # Legacy: deprecated
+    CHUNKED = "CHUNKED"               # Legacy: deprecated
 
 
 @dataclass

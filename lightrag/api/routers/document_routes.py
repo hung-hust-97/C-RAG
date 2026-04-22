@@ -837,6 +837,14 @@ class DocumentsRequest(BaseModel):
         default=None, description="Workspace identifier for this request"
     )
 
+    @field_validator('status_filter', mode='before')
+    @classmethod
+    def normalize_status(cls, v):
+        """Normalize status_filter to uppercase for backward compatibility"""
+        if v is not None and isinstance(v, str):
+            return v.upper()
+        return v
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
@@ -2465,7 +2473,7 @@ async def run_scanning_process(
                 filename = file_path.name
                 existing_doc_data = await rag.doc_status.get_doc_by_file_path(filename)
 
-                if existing_doc_data and existing_doc_data.get("status") == "processed":
+                if existing_doc_data and existing_doc_data.get("status") == DocStatus.PROCESSED:
                     # File is already PROCESSED, skip it with warning
                     processed_files.append(filename)
                     logger.warning(f"Skipping already processed file: {filename}")
@@ -3012,6 +3020,19 @@ def create_document_routes(
                             get_namespace_data,
                             get_namespace_lock,
                         )
+                        import time
+
+                        # Check file age - don't delete files created in last 60 seconds
+                        # to avoid race condition with background task creating doc_status
+                        file_age_seconds = time.time() - file_path.stat().st_mtime
+                        if file_age_seconds < 60:
+                            logger.info(
+                                f"[File Extraction]Skipping orphan check for recently created file: {safe_filename} (age: {file_age_seconds:.1f}s)"
+                            )
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"File '{safe_filename}' is being processed. Please wait a moment and try again.",
+                            )
 
                         pipeline_status = await get_namespace_data(
                             "pipeline_status", workspace=current_rag.workspace
@@ -3096,10 +3117,26 @@ def create_document_routes(
                     detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
                 )
 
-            # Generate doc_id and add to background tasks
+            # Generate doc_id and create doc_status record immediately
             from lightrag.utils import generate_doc_id
+            from lightrag.base import DocStatus
+            from datetime import datetime, timezone
+            
             doc_id = generate_doc_id("doc-")
             
+            # Create doc_status record immediately to prevent orphan file cleanup
+            await current_rag.doc_status.upsert(
+                {
+                    doc_id: {
+                        "status": DocStatus.EXTRACTING,
+                        "file_path": safe_filename,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                }
+            )
+            
+            # Add extraction task to background
             background_tasks.add_task(
                 pipeline_index_file, current_rag, file_path, doc_id
             )

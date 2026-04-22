@@ -1208,6 +1208,20 @@ class LightRAG:
             storage_class = lazy_external_import(import_path, storage_name)
             return storage_class
 
+    def _invalidate_suggestion_cache(self) -> None:
+        """Invalidate suggestion cache when workspace content changes.
+        
+        This method should be called after document operations that modify
+        the knowledge graph (insert, delete) to ensure users receive fresh
+        suggestions based on updated content.
+        
+        Checks if _suggestion_generator attribute exists before calling,
+        handling the case where the generator hasn't been created yet.
+        """
+        if hasattr(self, '_suggestion_generator') and self._suggestion_generator is not None:
+            self._suggestion_generator.invalidate_cache()
+            logger.debug(f"Invalidated suggestion cache for workspace {self.workspace}")
+
     def insert(
         self,
         input: str | list[str],
@@ -1276,6 +1290,9 @@ class LightRAG:
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
+
+        # Invalidate suggestion cache after document insertion
+        self._invalidate_suggestion_cache()
 
         return track_id
 
@@ -4033,12 +4050,17 @@ class LightRAG:
         """
         from lightrag.utils_graph import adelete_by_entity
 
-        return await adelete_by_entity(
+        result = await adelete_by_entity(
             self.chunk_entity_relation_graph,
             self.entities_vdb,
             self.relationships_vdb,
             entity_name,
         )
+
+        # Invalidate suggestion cache after entity deletion
+        self._invalidate_suggestion_cache()
+
+        return result
 
     def delete_by_entity(self, entity_name: str) -> DeletionResult:
         """Synchronously delete an entity and all its relationships.

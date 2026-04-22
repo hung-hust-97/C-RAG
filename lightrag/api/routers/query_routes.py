@@ -220,6 +220,38 @@ class StreamChunkResponse(BaseModel):
     )
 
 
+class SuggestionRequest(BaseModel):
+    """Request model for question suggestions endpoint"""
+
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="Target workspace ID. Overrides LIGHTRAG-WORKSPACE-ID header when set.",
+    )
+    count: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of suggestions to return (1-20)",
+    )
+
+
+class SuggestionResponse(BaseModel):
+    """Response model for question suggestions endpoint"""
+
+    suggestions: List[str] = Field(
+        description="List of generated question suggestions"
+    )
+    workspace_id: str = Field(
+        description="Workspace identifier"
+    )
+    count: int = Field(
+        description="Number of suggestions returned"
+    )
+    metadata: Dict[str, Any] = Field(
+        description="Generation metadata including timestamp, language, and generation method"
+    )
+
+
 def create_query_routes(
     rag,
     api_key: Optional[str] = None,
@@ -1308,5 +1340,353 @@ def create_query_routes(
         except Exception as e:
             logger.error(f"Error checking async query status: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/query/suggestions",
+        response_model=SuggestionResponse,
+        dependencies=[Depends(combined_auth)],
+        responses={
+            200: {
+                "description": "Successful question suggestions response",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "suggestions": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "List of generated question suggestions",
+                                },
+                                "workspace_id": {
+                                    "type": "string",
+                                    "description": "Workspace identifier",
+                                },
+                                "count": {
+                                    "type": "integer",
+                                    "description": "Number of suggestions returned",
+                                },
+                                "metadata": {
+                                    "type": "object",
+                                    "properties": {
+                                        "timestamp": {
+                                            "type": "string",
+                                            "description": "Generation timestamp in ISO 8601 format",
+                                        },
+                                        "language": {
+                                            "type": "string",
+                                            "description": "Language used for question generation",
+                                        },
+                                        "generation_method": {
+                                            "type": "string",
+                                            "enum": ["llm", "template", "generic"],
+                                            "description": "Method used to generate suggestions",
+                                        },
+                                    },
+                                    "description": "Generation metadata",
+                                },
+                            },
+                            "required": ["suggestions", "workspace_id", "count", "metadata"],
+                        },
+                        "examples": {
+                            "vietnamese_workspace": {
+                                "summary": "Vietnamese workspace suggestions",
+                                "description": "Example suggestions for a Vietnamese workspace with content",
+                                "value": {
+                                    "suggestions": [
+                                        "Machine learning là gì?",
+                                        "Mối quan hệ giữa AI và deep learning là gì?",
+                                        "Cho tôi biết thêm về neural networks",
+                                        "Tóm tắt nội dung chính",
+                                        "So sánh supervised và unsupervised learning"
+                                    ],
+                                    "workspace_id": "my-workspace",
+                                    "count": 5,
+                                    "metadata": {
+                                        "timestamp": "2024-01-01T12:00:00Z",
+                                        "language": "Vietnamese",
+                                        "generation_method": "llm"
+                                    }
+                                }
+                            },
+                            "english_workspace": {
+                                "summary": "English workspace suggestions",
+                                "description": "Example suggestions for an English workspace with content",
+                                "value": {
+                                    "suggestions": [
+                                        "What is machine learning?",
+                                        "How does AI relate to deep learning?",
+                                        "Tell me more about neural networks",
+                                        "Summarize the main content",
+                                        "Compare supervised and unsupervised learning"
+                                    ],
+                                    "workspace_id": "my-workspace",
+                                    "count": 5,
+                                    "metadata": {
+                                        "timestamp": "2024-01-01T12:00:00Z",
+                                        "language": "English",
+                                        "generation_method": "llm"
+                                    }
+                                }
+                            },
+                            "empty_workspace": {
+                                "summary": "Empty workspace suggestions",
+                                "description": "Generic suggestions for a workspace with no documents",
+                                "value": {
+                                    "suggestions": [
+                                        "What does this workspace contain?",
+                                        "Are there any documents in this workspace?",
+                                        "What can I ask about this workspace?",
+                                        "How do I get started with this workspace?",
+                                        "What types of documents should I upload?"
+                                    ],
+                                    "workspace_id": "empty-workspace",
+                                    "count": 5,
+                                    "metadata": {
+                                        "timestamp": "2024-01-01T12:00:00Z",
+                                        "language": "English",
+                                        "generation_method": "generic"
+                                    }
+                                }
+                            },
+                            "template_fallback": {
+                                "summary": "Template-based suggestions",
+                                "description": "Suggestions generated using templates when LLM is unavailable",
+                                "value": {
+                                    "suggestions": [
+                                        "What is Python?",
+                                        "Tell me more about Django",
+                                        "What is the relationship between Flask and web development?",
+                                        "How does REST API relate to HTTP?",
+                                        "Summarize the main content"
+                                    ],
+                                    "workspace_id": "my-workspace",
+                                    "count": 5,
+                                    "metadata": {
+                                        "timestamp": "2024-01-01T12:00:00Z",
+                                        "language": "English",
+                                        "generation_method": "template"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            400: {
+                "description": "Bad Request - Invalid input parameters",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "examples": {
+                            "missing_workspace": {
+                                "summary": "Missing workspace ID",
+                                "value": {"detail": "Workspace ID is required"}
+                            },
+                            "invalid_count": {
+                                "summary": "Invalid count parameter",
+                                "value": {"detail": "Count must be between 1 and 20"}
+                            }
+                        }
+                    }
+                }
+            },
+            404: {
+                "description": "Not Found - Workspace does not exist",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "example": {"detail": "Workspace 'my-workspace' not found"}
+                    }
+                }
+            },
+            504: {
+                "description": "Gateway Timeout - Suggestion generation timed out",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "example": {"detail": "Suggestion generation timed out after 10 seconds"}
+                    }
+                }
+            },
+            500: {
+                "description": "Internal Server Error - Unexpected error",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "example": {"detail": "Failed to generate suggestions"}
+                    }
+                }
+            }
+        }
+    )
+    async def get_question_suggestions(
+        http_request: Request,
+        request: SuggestionRequest
+    ):
+        """
+        Generate contextually relevant question suggestions for a workspace.
+
+        This endpoint analyzes a workspace's knowledge graph (entities and relationships)
+        to generate natural language questions that help users discover what they can ask.
+        It's designed to reduce the cold-start problem when users don't know what to query.
+
+        **Key Features:**
+        - **Intelligent Generation**: Uses LLM to create natural, contextually relevant questions
+        - **Multi-Language Support**: Generates questions in Vietnamese or English based on workspace settings
+        - **Diverse Question Types**: Includes factual queries, relationship questions, summaries, and comparisons
+        - **Performance Optimized**: 1-hour caching with thundering herd prevention
+        - **Resilient Fallback**: Template-based generation when LLM is unavailable
+        - **Empty Workspace Support**: Generic exploratory questions for workspaces without documents
+
+        **Generation Methods:**
+        - **llm**: Natural language generation using workspace's configured LLM (preferred)
+        - **template**: Template-based questions with entity/relationship substitution (fallback)
+        - **generic**: Predefined exploratory questions for empty workspaces
+
+        **Caching Behavior:**
+        - Suggestions are cached for 1 hour per workspace
+        - Cache is automatically invalidated when documents are added or removed
+        - Concurrent requests share the same cached result (thundering herd prevention)
+        - Different count values are served from the same cache entry
+
+        **Usage Examples:**
+
+        Get 5 suggestions (default):
+        ```json
+        {
+            "workspace_id": "my-workspace"
+        }
+        ```
+
+        Get 10 suggestions:
+        ```json
+        {
+            "workspace_id": "my-workspace",
+            "count": 10
+        }
+        ```
+
+        Using workspace header instead of body:
+        ```bash
+        curl -X POST /query/suggestions \\
+          -H "LIGHTRAG-WORKSPACE-ID: my-workspace" \\
+          -H "Content-Type: application/json" \\
+          -d '{"count": 5}'
+        ```
+
+        **Response Structure:**
+        - **suggestions**: Array of question strings ready to use with /query endpoint
+        - **workspace_id**: Identifier of the workspace
+        - **count**: Number of suggestions returned
+        - **metadata**: Generation details including:
+          - **timestamp**: When suggestions were generated (ISO 8601)
+          - **language**: Language used (Vietnamese/English)
+          - **generation_method**: How suggestions were created (llm/template/generic)
+
+        **Integration with Query Endpoint:**
+        All generated suggestions are compatible with the `/query` endpoint and can be
+        submitted directly as query text. The questions are validated to ensure they:
+        - Are between 10-150 characters in length
+        - Don't contain special characters that would cause parsing errors
+        - Leverage the workspace's available query modes
+
+        Args:
+            http_request (Request): FastAPI request object for header access
+            request (SuggestionRequest): Request body containing:
+                - **workspace_id**: Target workspace (optional if header provided)
+                - **count**: Number of suggestions to return (1-20, default: 5)
+
+        Returns:
+            SuggestionResponse: JSON response containing:
+                - **suggestions**: List of question strings
+                - **workspace_id**: Workspace identifier
+                - **count**: Number of suggestions returned
+                - **metadata**: Generation metadata
+
+        Raises:
+            HTTPException:
+                - 400: Invalid parameters (missing workspace_id, invalid count)
+                - 404: Workspace not found
+                - 504: Generation timeout (LLM took too long)
+                - 500: Unexpected internal error
+
+        Note:
+            This endpoint requires the same authentication as other query endpoints.
+            Workspace resolution follows the standard pattern: body parameter overrides
+            LIGHTRAG-WORKSPACE-ID header.
+        """
+        try:
+            # Resolve workspace and RAG instance
+            resolved_ws, current_rag = await resolve_request_context(
+                http_request, request.workspace_id
+            )
+            
+            # Validate workspace_id (return 400 if missing/empty)
+            if not resolved_ws or not resolved_ws.strip():
+                logger.error("Workspace ID is missing or empty")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Workspace ID is required"
+                )
+            
+            # Check if workspace exists (return 404 if not found)
+            # The workspace existence is implicitly validated by get_rag_for_workspace
+            # If it returns successfully, the workspace exists
+            if current_rag is None:
+                logger.error(f"Workspace '{resolved_ws}' not found")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Workspace '{resolved_ws}' not found"
+                )
+            
+            # Create or retrieve SuggestionGenerator instance for RAG
+            # Store generator as an attribute on the RAG instance for reuse
+            if not hasattr(current_rag, '_suggestion_generator'):
+                from lightrag.suggestion_generator import SuggestionGenerator
+                current_rag._suggestion_generator = SuggestionGenerator(current_rag)
+                logger.debug(f"Created new SuggestionGenerator for workspace {resolved_ws}")
+            
+            generator = current_rag._suggestion_generator
+            
+            # Call generator.generate_suggestions(count=request.count)
+            # Wrap in try-except for error handling
+            result = await generator.generate_suggestions(count=request.count)
+            
+            # Return SuggestionResponse with suggestions and metadata
+            return SuggestionResponse(
+                suggestions=result["questions"],
+                workspace_id=resolved_ws,
+                count=len(result["questions"]),
+                metadata=result["metadata"]
+            )
+            
+        except HTTPException:
+            # Re-raise HTTP exceptions (they already have proper status codes)
+            raise
+            
+        except Exception as e:
+            # Log all errors with sufficient context using logger.error
+            logger.error(
+                f"Error generating suggestions for workspace {request.workspace_id}: {str(e)}",
+                exc_info=True
+            )
+            # Ensure no internal details exposed in error messages
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate suggestions"
+            )
 
     return router

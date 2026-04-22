@@ -72,7 +72,7 @@ def _reset_locks_after_fork():
 
 
 # Register worker process init signal
-from celery.signals import worker_process_init
+from celery.signals import worker_process_init, worker_process_shutdown
 
 @worker_process_init.connect
 def init_worker_process(**kwargs):
@@ -82,6 +82,70 @@ def init_worker_process(**kwargs):
     """
     logger.info("[Celery] Worker process initialized, resetting locks...")
     _reset_locks_after_fork()
+
+
+@worker_process_shutdown.connect
+def shutdown_worker_process(**kwargs):
+    """
+    Called when a worker process is shutting down.
+    Close all PostgreSQL connection pools to prevent connection leaks.
+    
+    This is critical for preventing idle connection accumulation:
+    - asyncpg's max_inactive_connection_lifetime only marks connections for closure
+    - Connections are only closed on next acquire() call
+    - Without explicit cleanup, worker processes keep connections open indefinitely
+    """
+    logger.info("[Celery] Worker process shutting down, closing connection pools...")
+    
+    # Close all cached RAG instances and their connection pools
+    closed_count = 0
+    for workspace_id, (rag, _) in list(_rag_cache.items()):
+        try:
+            # Close PostgreSQL pools in storage backends
+            async def _close_pools():
+                # Close KV storage pool
+                if hasattr(rag, 'key_string_value_json_storage_cls'):
+                    kv_storage = rag.key_string_value_json_storage_cls
+                    if hasattr(kv_storage, 'db') and hasattr(kv_storage.db, 'pool'):
+                        if kv_storage.db.pool is not None:
+                            await kv_storage.db.pool.close()
+                            logger.debug(f"[Celery] Closed KV storage pool for workspace: {workspace_id}")
+                
+                # Close doc status storage pool
+                if hasattr(rag, 'doc_status_storage_cls'):
+                    doc_storage = rag.doc_status_storage_cls
+                    if hasattr(doc_storage, 'db') and hasattr(doc_storage.db, 'pool'):
+                        if doc_storage.db.pool is not None:
+                            await doc_storage.db.pool.close()
+                            logger.debug(f"[Celery] Closed doc status storage pool for workspace: {workspace_id}")
+                
+                # Close graph storage pool (if PostgreSQL)
+                if hasattr(rag, 'graph_storage_cls'):
+                    graph_storage = rag.graph_storage_cls
+                    if hasattr(graph_storage, 'db') and hasattr(graph_storage.db, 'pool'):
+                        if graph_storage.db.pool is not None:
+                            await graph_storage.db.pool.close()
+                            logger.debug(f"[Celery] Closed graph storage pool for workspace: {workspace_id}")
+                
+                # Close vector storage pool (if PostgreSQL)
+                if hasattr(rag, 'vector_db_storage_cls'):
+                    vector_storage = rag.vector_db_storage_cls
+                    if hasattr(vector_storage, 'db') and hasattr(vector_storage.db, 'pool'):
+                        if vector_storage.db.pool is not None:
+                            await vector_storage.db.pool.close()
+                            logger.debug(f"[Celery] Closed vector storage pool for workspace: {workspace_id}")
+            
+            # Run the cleanup coroutine
+            asyncio.run(_close_pools())
+            closed_count += 1
+            logger.info(f"[Celery] Closed connection pools for workspace: {workspace_id}")
+            
+        except Exception as e:
+            logger.warning(f"[Celery] Failed to close pools for workspace {workspace_id}: {e}")
+    
+    # Clear the cache
+    _rag_cache.clear()
+    logger.info(f"[Celery] Worker shutdown complete. Closed {closed_count} workspace connection pools.")
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +250,27 @@ def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, doc_id
     except Exception as exc:
         logger.exception(f"[Celery/OCR] Unexpected error for {file_path_str}: {exc}")
         raise self.retry(exc=exc)
+    finally:
+        # Clean up RAG instance and close connection pools after task completes
+        if workspace_id in _rag_cache:
+            try:
+                rag, _ = _rag_cache.pop(workspace_id)
+                # Close pools asynchronously
+                async def _cleanup():
+                    # Close PostgreSQL pools if they exist
+                    if hasattr(rag, 'key_string_value_json_storage_cls'):
+                        storage = rag.key_string_value_json_storage_cls
+                        if hasattr(storage, 'db') and hasattr(storage.db, 'pool') and storage.db.pool:
+                            await storage.db.pool.close()
+                    if hasattr(rag, 'doc_status_storage_cls'):
+                        storage = rag.doc_status_storage_cls
+                        if hasattr(storage, 'db') and hasattr(storage.db, 'pool') and storage.db.pool:
+                            await storage.db.pool.close()
+                
+                _run_async(_cleanup())
+                logger.debug(f"[Celery/OCR] Cleaned up connection pools for workspace={workspace_id}")
+            except Exception as e:
+                logger.warning(f"[Celery/OCR] Failed to cleanup pools for workspace={workspace_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +297,105 @@ def task_chunk_and_graph(self, workspace_id: str):
         logger.info(f"[Celery/Graph] Finished for workspace={workspace_id}")
     except Exception as exc:
         logger.exception(f"[Celery/Graph] Error for workspace={workspace_id}: {exc}")
+        raise self.retry(exc=exc)
+    finally:
+        # Clean up RAG instance and close connection pools after task completes
+        if workspace_id in _rag_cache:
+            try:
+                rag, _ = _rag_cache.pop(workspace_id)
+                # Close pools asynchronously
+                async def _cleanup():
+                    # Close PostgreSQL pools if they exist
+                    if hasattr(rag, 'key_string_value_json_storage_cls'):
+                        storage = rag.key_string_value_json_storage_cls
+                        if hasattr(storage, 'db') and hasattr(storage.db, 'pool') and storage.db.pool:
+                            await storage.db.pool.close()
+                    if hasattr(rag, 'doc_status_storage_cls'):
+                        storage = rag.doc_status_storage_cls
+                        if hasattr(storage, 'db') and hasattr(storage.db, 'pool') and storage.db.pool:
+                            await storage.db.pool.close()
+                
+                _run_async(_cleanup())
+                logger.debug(f"[Celery/Graph] Cleaned up connection pools for workspace={workspace_id}")
+            except Exception as e:
+                logger.warning(f"[Celery/Graph] Failed to cleanup pools for workspace={workspace_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Task: Process All Workspaces with EXTRACTED Documents
+# ---------------------------------------------------------------------------
+
+@celery_app.task(bind=True, max_retries=1, default_retry_delay=30)
+def task_process_all_extracted(self):
+    """
+    Process all workspaces that have EXTRACTED documents.
+    
+    This task queries the database for all workspaces with EXTRACTED documents
+    and triggers task_chunk_and_graph for each workspace.
+    """
+    logger.info("[Celery/ProcessAll] Starting to process all workspaces with EXTRACTED documents")
+
+    async def _run():
+        import asyncpg
+        import os
+        
+        # Get PostgreSQL connection details from environment
+        host = os.getenv("POSTGRES_HOST", "postgres")
+        port = int(os.getenv("POSTGRES_PORT", "5432"))
+        user = os.getenv("POSTGRES_USER", "postgres")
+        password = os.getenv("POSTGRES_PASSWORD", "postgres")
+        database = os.getenv("POSTGRES_DATABASE", "crag")
+        
+        # Connect to PostgreSQL
+        conn = await asyncpg.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database
+        )
+        
+        try:
+            # Get all workspaces with EXTRACTED documents
+            workspaces = await conn.fetch(
+                """
+                SELECT workspace, COUNT(*) as count 
+                FROM lightrag_doc_status 
+                WHERE status = 'EXTRACTED'
+                GROUP BY workspace
+                ORDER BY count DESC
+                """
+            )
+            
+            if not workspaces:
+                logger.info("[Celery/ProcessAll] No workspaces with EXTRACTED documents found")
+                return 0
+            
+            logger.info(f"[Celery/ProcessAll] Found {len(workspaces)} workspaces with EXTRACTED documents")
+            
+            triggered_count = 0
+            for row in workspaces:
+                workspace = row['workspace']
+                count = row['count']
+                
+                try:
+                    task_chunk_and_graph.delay(workspace)
+                    logger.info(f"[Celery/ProcessAll] Triggered task for workspace '{workspace}' ({count} docs)")
+                    triggered_count += 1
+                except Exception as e:
+                    logger.error(f"[Celery/ProcessAll] Failed to trigger task for workspace '{workspace}': {e}")
+            
+            return triggered_count
+            
+        finally:
+            await conn.close()
+
+    try:
+        triggered = _run_async(_run())
+        logger.info(f"[Celery/ProcessAll] Successfully triggered {triggered} workspace tasks")
+        return triggered
+    except Exception as exc:
+        logger.exception(f"[Celery/ProcessAll] Error: {exc}")
         raise self.retry(exc=exc)
 
 

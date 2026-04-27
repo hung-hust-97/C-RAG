@@ -88,7 +88,17 @@ def init_worker_process(**kwargs):
 # LightRAG instance factory for Celery workers
 # ---------------------------------------------------------------------------
 
-_rag_cache: dict[str, tuple[object, int]] = {}
+_rag_cache: dict[tuple[str, int], tuple[object, int]] = {}
+
+
+def _get_rag_key(workspace_id: str) -> tuple[str, int]:
+    """Get a cache key that is both workspace and event-loop aware."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    return (workspace_id, loop_id)
 
 
 def _run_async(coro):
@@ -117,16 +127,12 @@ def _run_async(coro):
 async def _get_rag(workspace_id: str):
     """
     Build and initialize a LightRAG instance from environment variables.
-    Re-uses cached instances per workspace (shared pool handles multi-loop scenarios).
-    
-    NOTE: We cache by workspace_id only, not by event loop ID, because:
-    1. PostgreSQL shared pool is designed to work across event loops
-    2. Creating new instances per loop wastes connections (each instance = new pool)
-    3. Storage backends properly handle event loop changes internally
+    Re-uses cached instances per workspace and event loop.
     """
-    if workspace_id in _rag_cache:
-        rag, _ = _rag_cache[workspace_id]
-        logger.debug(f"[Celery] Reusing cached RAG instance for workspace: {workspace_id}")
+    cache_key = _get_rag_key(workspace_id)
+    if cache_key in _rag_cache:
+        rag, _ = _rag_cache[cache_key]
+        logger.debug(f"[Celery] Reusing cached RAG instance for workspace: {workspace_id} (loop: {cache_key[1]})")
         return rag
 
     from lightrag.api.config import global_args
@@ -140,10 +146,10 @@ async def _get_rag(workspace_id: str):
 
     await rag.initialize_storages()
     
-    # Cache without loop_id - shared pool handles cross-loop usage
-    _rag_cache[workspace_id] = (rag, 0)
+    # Cache with loop_id to prevent loop-binding issues
+    _rag_cache[cache_key] = (rag, 0)
     logger.info(
-        f"[Celery] Initialized factory-based RAG instance for workspace: {workspace_id}"
+        f"[Celery] Initialized factory-based RAG instance for workspace: {workspace_id} (loop: {cache_key[1]})"
     )
     return rag
 
@@ -173,7 +179,7 @@ def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, doc_id
             logger.error(f"[Celery/OCR] File not found: {file_path_str}")
             return False
 
-        success, _ = await pipeline_enqueue_file(rag, file_path, doc_id)
+        success, _ = await pipeline_enqueue_file(rag, file_path, doc_id, task_id=self.request.id)
         return success
 
     try:
@@ -205,7 +211,7 @@ def task_chunk_and_graph(self, workspace_id: str):
 
     async def _run():
         rag = await _get_rag(workspace_id)
-        await rag.apipeline_process_enqueue_documents()
+        await rag.apipeline_process_enqueue_documents(task_id=self.request.id)
 
     try:
         _run_async(_run())
@@ -272,7 +278,7 @@ def apipeline_process_enqueue_documents_task(self, workspace_id: str, reprocess_
     async def _run():
         rag = await _get_rag(workspace_id)
         # Use our modified apipeline_process_enqueue_documents that supports reprocess_failed
-        await rag.apipeline_process_enqueue_documents(reprocess_failed=reprocess_failed)
+        await rag.apipeline_process_enqueue_documents(reprocess_failed=reprocess_failed, task_id=self.request.id)
 
     try:
         _run_async(_run())

@@ -137,6 +137,10 @@ class PostgreSQLDB:
         self.max = int(config["max_connections"])
         self.increment = 1
         self.pool: Pool | None = None
+        self._pool_loop: asyncio.AbstractEventLoop | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
+        self._health_check_lock: asyncio.Lock | None = None
+        self._health_check_lock_loop: asyncio.AbstractEventLoop | None = None
 
         # SSL configuration
         self.ssl_mode = config.get("ssl_mode")
@@ -188,8 +192,8 @@ class PostgreSQLDB:
         except (ValueError, TypeError):
             raise ValueError(f"Invalid port number: {self.port}")
 
-        # Guard concurrent pool resets
-        self._pool_reconnect_lock = asyncio.Lock()
+        # Guard concurrent pool resets - initialized lazily to avoid loop affinity issues
+        self._pool_reconnect_lock: asyncio.Lock | None = None
 
         self._transient_exceptions = (
             asyncio.TimeoutError,
@@ -438,6 +442,7 @@ class PostgreSQLDB:
                 init=_init_connection,  # Register pgvector codec on every connection (if enabled)
             )  # type: ignore
             self.pool = pool
+            self._pool_loop = asyncio.get_event_loop()
 
         try:
             async for attempt in AsyncRetrying(
@@ -460,25 +465,39 @@ class PostgreSQLDB:
             )
             raise
 
+    def _get_health_check_lock(self) -> asyncio.Lock:
+        """Get or create a loop-aware lock for pool health check."""
+        current_loop = asyncio.get_event_loop()
+        if self._health_check_lock is None or self._health_check_lock_loop is not current_loop or self._health_check_lock_loop.is_closed():
+            self._health_check_lock = asyncio.Lock()
+            self._health_check_lock_loop = current_loop
+        return self._health_check_lock
+
+    def _get_reconnect_lock(self) -> asyncio.Lock:
+        """Get or create a loop-aware lock for pool reconnection."""
+        current_loop = asyncio.get_event_loop()
+        if self._pool_reconnect_lock is None or self._lock_loop is not current_loop or self._lock_loop.is_closed():
+            self._pool_reconnect_lock = asyncio.Lock()
+            self._lock_loop = current_loop
+        return self._pool_reconnect_lock
+
     async def _ensure_pool(self) -> None:
         """Ensure the connection pool is initialised and healthy."""
+        current_loop = asyncio.get_event_loop()
+        
+        # Check if loop changed (common in Celery prefork or multi-loop environments)
+        if self.pool is not None and (self._pool_loop is not current_loop or self._pool_loop.is_closed()):
+            logger.info("PostgreSQL, Event loop changed or closed, reinitializing pool")
+            self._pool_loop = None
+            self.pool = None
+
         if self.pool is None:
-            async with self._pool_reconnect_lock:
+            async with self._get_reconnect_lock():
                 if self.pool is None:
-                    await self.initdb()
-        else:
-            # Health check for existing pool
-            try:
-                async with self.pool.acquire() as conn:
-                    await conn.execute("SELECT 1")
-            except Exception as e:
-                logger.warning(f"PostgreSQL pool health check failed: {e}, reinitializing pool")
-                async with self._pool_reconnect_lock:
-                    await self._reset_pool()
                     await self.initdb()
 
     async def _reset_pool(self) -> None:
-        async with self._pool_reconnect_lock:
+        async with self._get_reconnect_lock():
             if self.pool is not None:
                 try:
                     await asyncio.wait_for(
@@ -1850,7 +1869,16 @@ class PostgreSQLDB:
 
 class ClientManager:
     # Change to global singleton instead of per-event-loop
-    _shared_instance: dict[str, Any] = {"db": None, "ref_count": 0, "lock": asyncio.Lock()}
+    _shared_instance: dict[str, Any] = {"db": None, "ref_count": 0, "lock": None, "lock_loop": None}
+
+    @classmethod
+    def _get_shared_lock(cls) -> asyncio.Lock:
+        """Get or create a loop-aware shared lock."""
+        current_loop = asyncio.get_event_loop()
+        if cls._shared_instance["lock"] is None or cls._shared_instance["lock_loop"] is not current_loop or cls._shared_instance["lock_loop"].is_closed():
+            cls._shared_instance["lock"] = asyncio.Lock()
+            cls._shared_instance["lock_loop"] = current_loop
+        return cls._shared_instance["lock"]
 
     @classmethod
     def _get_ctx(cls) -> int:
@@ -1924,7 +1952,7 @@ class ClientManager:
     @classmethod
     async def get_client(cls) -> PostgreSQLDB:
         # Use global shared instance instead of per-event-loop
-        async with cls._shared_instance["lock"]:
+        async with cls._get_shared_lock():
             if cls._shared_instance["db"] is None:
                 try:
                     config = ClientManager.get_config()
@@ -1952,7 +1980,7 @@ class ClientManager:
     @classmethod
     async def release_client(cls, db: PostgreSQLDB):
         # Use global shared instance
-        async with cls._shared_instance["lock"]:
+        async with cls._get_shared_lock():
             if db is not None:
                 if db is cls._shared_instance["db"]:
                     cls._shared_instance["ref_count"] -= 1
@@ -1971,7 +1999,7 @@ class ClientManager:
     @classmethod
     async def force_close_shared_pool(cls):
         """Force close the shared pool during shutdown."""
-        async with cls._shared_instance["lock"]:
+        async with cls._get_shared_lock():
             if cls._shared_instance["db"] is not None:
                 if cls._shared_instance["db"].pool:
                     await cls._shared_instance["db"].pool.close()
@@ -3595,6 +3623,7 @@ class PGDocStatusStorage(DocStatusStorage):
             updated_at = self._format_datetime_with_timezone(row["updated_at"])
 
             processed_map[str(row.get("id"))] = {
+                "id": str(row.get("id")),
                 "content_length": row["content_length"],
                 "content_summary": row["content_summary"],
                 "status": row["status"],

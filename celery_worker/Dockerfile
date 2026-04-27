@@ -13,6 +13,8 @@ RUN apt-get update \
         tesseract-ocr \
         tesseract-ocr-vie \
         poppler-utils \
+        libgl1 \
+        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files and source code (needed for editable install)

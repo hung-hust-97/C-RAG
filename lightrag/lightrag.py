@@ -1627,12 +1627,59 @@ class LightRAG:
         inconsistent_docs = []
         failed_docs_to_preserve = []
         successful_deletions = 0
+        
+        # Get active Celery tasks to avoid marking active tasks as FAILED
+        active_task_ids = set()
+        workspace_is_being_chunked = False
+        docs_being_extracted = set()
+
+        try:
+            from celery_worker.app import celery_app
+            i = celery_app.control.inspect()
+            
+            # Combine all task states
+            all_tasks_data = []
+            active_data = i.active() or {}
+            reserved_data = i.reserved() or {}
+            scheduled_data = i.scheduled() or {}
+            for d in [active_data, reserved_data, scheduled_data]:
+                for worker_tasks in d.values():
+                    all_tasks_data.extend(worker_tasks)
+            
+            for t in all_tasks_data:
+                # Get task ID safely
+                t_id = t.get("id") or (t.get("request", {}).get("id") if isinstance(t.get("request"), dict) else None)
+                if t_id:
+                    active_task_ids.add(t_id)
+                
+                t_name = t.get("name")
+                t_args = t.get("args") or []
+                
+                # Detect if any task is processing THIS workspace
+                if t_name == "celery_worker.tasks.task_chunk_and_graph":
+                    if len(t_args) > 0 and t_args[0] == self.workspace:
+                        workspace_is_being_chunked = True
+                
+                if t_name == "celery_worker.tasks.task_extract_and_enqueue":
+                    if len(t_args) > 2 and t_args[0] == self.workspace:
+                        docs_being_extracted.add(t_args[2]) # doc_id is the 3rd argument
+            
+            logger.info(f"[Reprocess] Celery status: workspace_busy={workspace_is_being_chunked}, active_tasks={len(active_task_ids)}, docs_extracting={len(docs_being_extracted)}")
+        except ImportError:
+            logger.warning("[Reprocess] Celery not available, cannot check active tasks")
+        except Exception as e:
+            logger.warning(f"[Reprocess] Failed to check Celery active tasks: {e}")
 
         # Check each document's data consistency
         docs_to_reextract = []  # Documents that need re-extraction
         docs_to_mark_failed: dict[str, dict[str, Any]] = {}
+        docs_to_skip = []  # Documents to skip from current processing loop
         
-        for doc_id, status_doc in to_process_docs.items():
+        doc_ids_to_check = list(to_process_docs.keys())
+        for doc_id in doc_ids_to_check:
+            status_doc = to_process_docs.get(doc_id)
+            if not status_doc:
+                continue
             # Check if corresponding content exists in full_docs
             content_data = await self.full_docs.get_by_id(doc_id)
 
@@ -1643,6 +1690,49 @@ class LightRAG:
                 DocStatus.EXTRACTING,
                 DocStatus.CHUNKING,
             ]:
+                # Check if task is still running in Celery
+                metadata = getattr(status_doc, "metadata", {}) or {}
+                task_id = metadata.get("task_id")
+                
+                status_label = (
+                    status_doc.status.value 
+                    if hasattr(status_doc.status, "value") 
+                    else status_doc.status
+                )
+                # If the task is still visible in the active pool, skip it
+                # We skip if:
+                # 1. The specific task_id is in Celery's active/reserved pool
+                # 2. There is a general CHUNKING task for this workspace
+                # 3. There is an EXTRACTION task for this specific document
+                is_active = (
+                    (task_id and task_id in active_task_ids) or 
+                    (status_doc.status == DocStatus.CHUNKING and workspace_is_being_chunked) or
+                    (status_doc.status == DocStatus.EXTRACTING and doc_id in docs_being_extracted)
+                )
+                
+                if is_active:
+                    logger.info(f"[Reprocess] Document {doc_id} is in {status_label} but task is still active (task_id={task_id}, ws_busy={workspace_is_being_chunked}). Skipping.")
+                    docs_to_skip.append(doc_id)
+                    continue
+                
+                # Check grace period (10 minutes) before marking as FAILED
+                import time
+                current_time = int(time.time())
+                processing_start_time = metadata.get("processing_start_time", 0)
+                # If processing_start_time is completely missing, we check created_at
+                if not processing_start_time and hasattr(status_doc, "created_at") and status_doc.created_at:
+                    try:
+                        dt = datetime.fromisoformat(status_doc.created_at.replace("Z", "+00:00"))
+                        processing_start_time = int(dt.timestamp())
+                    except Exception:
+                        processing_start_time = current_time - 601  # Force timeout
+                
+                grace_period = 600  # 10 minutes (visibility_timeout)
+                if current_time - processing_start_time < grace_period:
+                    logger.info(f"[Reprocess] Document {doc_id} is in {status_label} and task is missing, but within {grace_period}s grace period. Skipping.")
+                    docs_to_skip.append(doc_id)
+                    continue
+
                 preserved_chunks_list, preserved_chunks_count = (
                     _chunk_fields_from_status_doc(status_doc)
                 )
@@ -1651,6 +1741,15 @@ class LightRAG:
                     if status_doc.status == DocStatus.EXTRACTING
                     else "chunking"
                 )
+                error_msg = getattr(status_doc, "error_msg", None)
+                if not error_msg:
+                    status_label = (
+                        status_doc.status.value
+                        if hasattr(status_doc.status, "value")
+                        else status_doc.status
+                    )
+                    error_msg = f"Task {task_id or 'unknown'} timed out after {grace_period}s in {status_label}"
+
                 docs_to_mark_failed[doc_id] = {
                     "status": DocStatus.FAILED,
                     "content_summary": status_doc.content_summary,
@@ -1662,15 +1761,14 @@ class LightRAG:
                     "file_path": getattr(status_doc, "file_path", None)
                     or "unknown_source",
                     "track_id": getattr(status_doc, "track_id", ""),
-                    "error_msg": getattr(status_doc, "error_msg", None)
-                    or f"Document stayed in {status_doc.status.value} and was marked failed",
+                    "error_msg": error_msg,
                     "error_stage": error_stage,
-                    "metadata": getattr(status_doc, "metadata", {}) or {},
+                    "metadata": metadata,
                 }
                 status_doc.status = DocStatus.FAILED
                 failed_docs_to_preserve.append(doc_id)
                 logger.warning(
-                    f"[Reprocess] {status_doc.status.value} document {doc_id} will be marked as FAILED"
+                    f"[Reprocess] {status_label} document {doc_id} will be marked as FAILED"
                 )
                 continue
             
@@ -1687,7 +1785,8 @@ class LightRAG:
                     if reprocess_failed and file_path:
                         # Check if file exists in inputs or __enqueued__ directory
                         from pathlib import Path
-                        input_dir = Path(self.working_dir) / "inputs"
+                        base_input_dir = Path(os.getenv("INPUT_DIR", "/app/data/inputs"))
+                        input_dir = base_input_dir / self.workspace
                         enqueued_dir = input_dir / "__enqueued__"
                         
                         file_exists = False
@@ -1819,12 +1918,9 @@ class LightRAG:
                         pipeline_status["latest_message"] = error_message
                         pipeline_status["history_messages"].append(error_message)
 
-        # Final summary log
-        # async with pipeline_status_lock:
-        #     final_message = f"Successfully deleted {successful_deletions} inconsistent entries, preserved {len(failed_docs_to_preserve)} failed documents"
-        #     logger.info(final_message)
-        #     pipeline_status["latest_message"] = final_message
-        #     pipeline_status["history_messages"].append(final_message)
+        # Remove skipped documents from processing list
+        for doc_id in docs_to_skip:
+            to_process_docs.pop(doc_id, None)
 
         return to_process_docs
 
@@ -1833,6 +1929,7 @@ class LightRAG:
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
         reprocess_failed: bool = False,
+        task_id: str | None = None,
     ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
@@ -1858,8 +1955,9 @@ class LightRAG:
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
-                processing_docs, failed_docs, pending_docs, extracted_docs, extracting_docs = await asyncio.gather(
+                processing_docs, chunking_docs, failed_docs, pending_docs, extracted_docs, extracting_docs = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+                    self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
                     self.doc_status.get_docs_by_status(DocStatus.PENDING),
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
@@ -1868,14 +1966,22 @@ class LightRAG:
 
                 to_process_docs: dict[str, DocProcessingStatus] = {}
                 to_process_docs.update(processing_docs)
+                to_process_docs.update(chunking_docs)
                 to_process_docs.update(failed_docs)
                 to_process_docs.update(pending_docs)
                 to_process_docs.update(extracted_docs)
                 to_process_docs.update(extracting_docs)  # Include stuck EXTRACTING documents
 
-                if not to_process_docs:
+                # Create a static copy to avoid RuntimeError: dictionary changed size during iteration
+                to_process_docs_static = dict(to_process_docs)
+
+                if not to_process_docs_static:
                     logger.info("No documents to process")
                     return
+                
+                # Use the static copy for the rest of the function
+                to_process_docs = to_process_docs_static
+
 
                 pipeline_status.update(
                     {
@@ -2180,7 +2286,9 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                             "metadata": {
-                                                "processing_start_time": processing_start_time
+                                                **getattr(status_doc, "metadata", {}),
+                                                "processing_start_time": processing_start_time,
+                                                **({"task_id": task_id} if task_id else {})
                                             },
                                         }
                                     }
@@ -2376,7 +2484,7 @@ class LightRAG:
 
                 # Create processing tasks for all documents
                 doc_tasks = []
-                for doc_id, status_doc in to_process_docs.items():
+                for doc_id, status_doc in list(to_process_docs.copy().items()):
                     doc_tasks.append(
                         process_document(
                             doc_id,
@@ -2421,18 +2529,22 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
                 # Check for pending documents again
-                processing_docs, failed_docs, pending_docs, extracted_docs = await asyncio.gather(
+                processing_docs, chunking_docs, failed_docs, pending_docs, extracted_docs, extracting_docs = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+                    self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
                     self.doc_status.get_docs_by_status(DocStatus.PENDING),
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
+                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTING),
                 )
 
                 to_process_docs = {}
                 to_process_docs.update(processing_docs)
+                to_process_docs.update(chunking_docs)
                 to_process_docs.update(failed_docs)
                 to_process_docs.update(pending_docs)
                 to_process_docs.update(extracted_docs)
+                to_process_docs.update(extracting_docs)
 
         finally:
             log_message = "Enqueued document processing pipeline stopped"

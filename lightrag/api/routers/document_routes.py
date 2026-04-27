@@ -823,6 +823,14 @@ class DocumentsRequest(BaseModel):
     status_filter: Optional[DocStatus] = Field(
         default=None, description="Filter by document status, None for all statuses"
     )
+
+    @field_validator("status_filter", mode="before")
+    @classmethod
+    def normalize_status(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.upper()
+        return v
+
     page: int = Field(default=1, ge=1, description="Page number (1-based)")
     page_size: int = Field(
         default=50, ge=10, le=200, description="Number of documents per page (10-200)"
@@ -1641,7 +1649,7 @@ async def _extract_text_for_preview(file_path: Path) -> str:
 
 
 async def pipeline_enqueue_file(
-    rag: LightRAG, file_path: Path, doc_id: str = None
+    rag: LightRAG, file_path: Path, doc_id: str = None, task_id: str = None
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -1674,7 +1682,7 @@ async def pipeline_enqueue_file(
                     "file_path": file_path.name,
                     "chunks_list": [],
                     "content_hash": None,  # Will be set after extraction
-                    "metadata": {"file_name": file_path.name},
+                    "metadata": {"file_name": file_path.name, "task_id": task_id} if task_id else {"file_name": file_path.name},
                     "error_msg": None,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -2475,7 +2483,7 @@ async def run_scanning_process(
 
             # Process valid files (new files + non-PROCESSED status files)
             if valid_files:
-                doc_ids = await pipeline_index_files(rag, valid_files, resolved_workspace_id)
+                doc_ids = await pipeline_index_files(rag, valid_files, rag.workspace)
                 if processed_files:
                     logger.info(
                         f"Scanning process completed: {len(valid_files)} files Processed {len(processed_files)} skipped."
@@ -4597,7 +4605,9 @@ def create_document_routes(
                         status_counts.get(DocStatus.FAILED.value, 0) +
                         status_counts.get(DocStatus.PENDING.value, 0) +
                         status_counts.get(DocStatus.PROCESSING.value, 0) +
-                        status_counts.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
+                        status_counts.get(DocStatus.CHUNKING.value, 0) +     # Include CHUNKING docs
+                        status_counts.get(DocStatus.EXTRACTING.value, 0) + # Include stuck EXTRACTING docs
+                        status_counts.get(DocStatus.EXTRACTED.value, 0)    # Include stuck EXTRACTED docs
                     )
                     if documents_count > 0:
                         workspaces_to_process = [current_rag.workspace]
@@ -4611,7 +4621,9 @@ def create_document_routes(
                             ws_stats.get(DocStatus.FAILED.value, 0) +
                             ws_stats.get(DocStatus.PENDING.value, 0) +
                             ws_stats.get(DocStatus.PROCESSING.value, 0) +
-                            ws_stats.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
+                            ws_stats.get(DocStatus.CHUNKING.value, 0) +     # Include CHUNKING docs
+                            ws_stats.get(DocStatus.EXTRACTING.value, 0) + # Include stuck EXTRACTING docs
+                            ws_stats.get(DocStatus.EXTRACTED.value, 0)    # Include stuck EXTRACTED docs
                         )
                         if ws_failed_count > 0:
                             workspaces_to_process.append(ws_id)

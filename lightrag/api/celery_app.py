@@ -36,6 +36,9 @@ celery_app.conf.update(
     worker_concurrency=CELERY_CONCURRENCY,
     task_track_started=True,
     worker_prefetch_multiplier=1, # process 1 task at a time per worker to prevent hogging LLM limits
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    broker_transport_options={"visibility_timeout": 600},
 )
 
 logger.info(f"Initialized Celery App with broker {CELERY_BROKER_URL} and concurrency {CELERY_CONCURRENCY}")

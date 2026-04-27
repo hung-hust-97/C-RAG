@@ -247,6 +247,9 @@ services:
       - ./data/logs:/app/data/logs                # Application logs
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
+      - ./lightrag:/app/lightrag
+      - ./scripts:/app/scripts
+      - ./celery_worker:/app/celery_worker
     environment:
       # Document processing engine selection
       DOCUMENT_LOADING_ENGINE: "DOCLING"

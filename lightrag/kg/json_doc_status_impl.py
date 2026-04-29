@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+import asyncio
 from typing import Any, Union, final
 
 from lightrag.base import (
@@ -402,6 +403,21 @@ class JsonDocStatusStorage(DocStatusStorage):
                     return doc_data
 
         return None
+    async def check_duplicate_by_content_hash(
+        self, content_hash: str, exclude_doc_id: str | None = None
+    ) -> tuple[bool, str | None]:
+        """Check if a document with the same content_hash already exists in the workspace."""
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonDocStatusStorage")
+
+        async with self._storage_lock:
+            for doc_id, doc_data in self._data.items():
+                if exclude_doc_id and doc_id == exclude_doc_id:
+                    continue
+                if doc_data.get("content_hash") == content_hash:
+                    return True, doc_id
+
+        return False, None
 
     async def drop(self) -> dict[str, str]:
         """Drop all document status data from storage and clean up resources

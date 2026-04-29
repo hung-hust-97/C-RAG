@@ -131,7 +131,7 @@ def example_custom_configuration():
     
     print(f"Text: {text}")
     print(f"Detected: {result.value}")
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  Cache Size: {service.config.cache_size}")
     print(f"  Vietnamese Threshold: {service.config.vietnamese_threshold}")
     print(f"  FastText Enabled: {service.config.enabled}")
@@ -157,7 +157,7 @@ def example_integration_with_prompt_manager():
     
     print(f"User Input: {user_input}")
     print(f"Detected Language: {detected_language.value}")
-    print(f"Would select prompt variant: entity_extraction_system_prompt_vi")
+    print("Would select prompt variant: entity_extraction_system_prompt_vi")
     print()
     
     # The PromptManager would then use this to select the appropriate prompt:
@@ -185,7 +185,7 @@ def example_fasttext_disabled():
     print(f"Text: {text}")
     print(f"Detected: {result.value}")
     print(f"FastText Available: {service.is_fasttext_available()}")
-    print(f"Using Unicode detection only")
+    print("Using Unicode detection only")
     print()
 
 

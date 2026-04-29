@@ -80,14 +80,14 @@ class S3KVStorage(BaseKVStorage):
                         if metadata.get('is_b64', 'false') == 'true':
                             try:
                                 fp = base64.b64decode(fp).decode("utf-8")
-                            except:
+                            except Exception:
                                 pass
                                 
                         orig_fn = metadata.get("original_filename", fp)
                         if metadata.get("orig_fn_is_b64", "false") == "true":
                             try:
                                 orig_fn = base64.b64decode(orig_fn).decode("utf-8")
-                            except:
+                            except Exception:
                                 pass
                                 
                         result = {

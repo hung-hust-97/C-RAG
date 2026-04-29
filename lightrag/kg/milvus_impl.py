@@ -1478,30 +1478,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         self._validate_embedding_func()
 
         # Extract MilvusIndexConfig parameters from vector_db_storage_cls_kwargs
-        #
-        # IMPORTANT: This approach allows Milvus index configuration via vector_db_storage_cls_kwargs,
-        # which is the RECOMMENDED method for framework integration (e.g., RAGAnything).
-        #
-        # All 11 index configuration parameters can be passed through vector_db_storage_cls_kwargs:
-        #   - index_type, metric_type
-        #   - hnsw_m, hnsw_ef_construction, hnsw_ef
-        #   - sq_type, sq_refine, sq_refine_type, sq_refine_k
-        #   - ivf_nlist, ivf_nprobe
-        #
-        # Example:
-        #   LightRAG(
-        #       vector_storage="MilvusVectorDBStorage",
-        #       vector_db_storage_cls_kwargs={
-        #           "cosine_better_than_threshold": 0.2,
-        #           "index_type": "HNSW",
-        #           "metric_type": "COSINE",
-        #           "hnsw_m": 32,
-        #           "hnsw_ef_construction": 256,
-        #       }
-        #   )
-        #
-        # Use MilvusIndexConfig.get_config_field_names() to dynamically extract valid parameters.
-        # This ensures we always stay in sync with the MilvusIndexConfig dataclass definition.
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
         index_config_keys = MilvusIndexConfig.get_config_field_names()
         index_config_params = {
@@ -1509,47 +1485,37 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         }
 
         # Initialize index configuration (if not already set)
-        # Configuration priority: init params from kwargs > environment variables > defaults
         if not hasattr(self, "index_config") or self.index_config is None:
             self.index_config = MilvusIndexConfig(**index_config_params)
 
+        # Ensure self.workspace is a string (dataclasses might pass None)
+        if self.workspace is None:
+            self.workspace = ""
+
         # Check for MILVUS_WORKSPACE environment variable first (higher priority)
-        # This allows administrators to force a specific workspace for all Milvus storage instances
-        milvus_workspace = os.environ.get("MILVUS_WORKSPACE")
-        if milvus_workspace and milvus_workspace.strip():
-            # Use environment variable value, overriding the passed workspace parameter
-            effective_workspace = milvus_workspace.strip()
+        milvus_workspace_env = os.environ.get("MILVUS_WORKSPACE")
+        if milvus_workspace_env and milvus_workspace_env.strip():
+            effective_workspace = milvus_workspace_env.strip()
             logger.info(
-                f"Using MILVUS_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
+                f"[{self.workspace}] Using MILVUS_WORKSPACE environment variable: '{effective_workspace}' (overriding initialized workspace '{self.workspace}')"
             )
         else:
-            # Use the workspace parameter passed during initialization
             effective_workspace = self.workspace
-            if effective_workspace:
-                logger.debug(
-                    f"Using passed workspace parameter: '{effective_workspace}'"
-                )
 
         # Build final_namespace with workspace prefix for data isolation
-        # Keep original namespace unchanged for type detection logic
-        if effective_workspace:
+        if effective_workspace and str(effective_workspace).strip():
             workspace_for_collection = self._sanitize_workspace_for_collection(
                 effective_workspace
             )
             self.final_namespace = f"{workspace_for_collection}_{self.namespace}"
-            if workspace_for_collection != effective_workspace:
-                logger.info(
-                    f"[{self.workspace}] Normalized workspace prefix for Milvus collection: "
-                    f"'{effective_workspace}' -> '{workspace_for_collection}'"
-                )
             logger.debug(
-                f"Final namespace with workspace prefix: '{self.final_namespace}'"
+                f"[{self.workspace}] Initialized Milvus storage for namespace '{self.namespace}' in workspace '{effective_workspace}' -> collection '{self.final_namespace}'"
             )
         else:
             # When workspace is empty, final_namespace equals original namespace
             self.final_namespace = self.namespace
             self.workspace = ""
-            logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
+            logger.debug(f"[{self.workspace}] Initialized Milvus storage for namespace '{self.namespace}' without workspace isolation -> collection '{self.final_namespace}'")
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
         if cosine_threshold is None:
             raise ValueError(
@@ -1627,10 +1593,24 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
+        import re
+        
+        # Helper to strip HTML tags for cleaner embeddings
+        def clean_for_embedding(text: str) -> str:
+            if not isinstance(text, str):
+                return text
+            # Replace HTML tags with spaces to avoid joining words
+            cleaned = re.sub(r'<[^>]+>', ' ', text)
+            # Remove extra spaces
+            return re.sub(r'\s+', ' ', cleaned).strip()
+
         contents = [v["content"] for v in data.values()]
+        # Create cleaned contents for embedding generation only
+        embedding_contents = [clean_for_embedding(c) for c in contents]
+        
         batches = [
-            contents[i : i + self._max_batch_size]
-            for i in range(0, len(contents), self._max_batch_size)
+            embedding_contents[i : i + self._max_batch_size]
+            for i in range(0, len(embedding_contents), self._max_batch_size)
         ]
 
         embedding_tasks = [self.embedding_func(batch) for batch in batches]
@@ -1667,39 +1647,25 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Build search params from index config
         search_params_base = self.index_config.build_search_params()
 
-        # Merge with metric type and radius threshold
+        # Do NOT use radius in search_params: Milvus radius filter is too
+        # aggressive and can return 0 results when embeddings have low cosine
+        # similarity (e.g. documents with heavy HTML table content).
+        # Instead, we apply cosine_better_than_threshold as a post-filter below.
         search_params = {
             "metric_type": self.index_config.metric_type,
             "params": {
                 **search_params_base.get("params", {}),
-                "radius": self.cosine_better_than_threshold,
             },
         }
 
-        # Build workspace filter for multi-tenant isolation
-        workspace_filter = (
-            f'workspace_id == "{self.workspace}"' if self.workspace else None
+        # No workspace_id filter needed: the collection is already workspace-scoped
+        # via final_namespace (e.g., ws_<uuid>_relationships). Double-filtering by
+        # workspace_id breaks queries when legacy data has workspace_id="".
+        logger.info(
+            f"[{self.workspace}] Querying Milvus collection: {self.final_namespace}, "
+            f"top_k: {top_k}, threshold: {self.cosine_better_than_threshold}"
         )
 
-        logger.info(f"[{self.workspace}] Querying Milvus collection: {self.final_namespace}, filter: {workspace_filter}, top_k: {top_k}, threshold: {self.cosine_better_than_threshold}")
-        
-        # Try query without filter first for debugging
-        results_no_filter = self._milvus_call(
-            "search",
-            lambda client: client.search(
-                collection_name=self.final_namespace,
-                data=embedding,
-                limit=top_k,
-                output_fields=output_fields,
-                filter=None,  # No filter
-                search_params={
-                    "metric_type": "COSINE",
-                    "params": {},  # No radius filter
-                },
-            ),
-        )
-        logger.info(f"[{self.workspace}] Query WITHOUT filter returned {len(results_no_filter[0]) if results_no_filter and len(results_no_filter) > 0 else 0} results")
-        
         results = self._milvus_call(
             "search",
             lambda client: client.search(
@@ -1707,17 +1673,17 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 data=embedding,
                 limit=top_k,
                 output_fields=output_fields,
-                filter=workspace_filter,
-                search_params={
-                    "metric_type": "COSINE",
-                    "params": {"radius": self.cosine_better_than_threshold},
-                },
+                search_params=search_params,
             ),
         )
-        
-        logger.info(f"[{self.workspace}] Query WITH filter returned {len(results[0]) if results and len(results) > 0 else 0} results")
-        
-        return [
+
+        # Post-filter by cosine similarity threshold.
+        # NOTE: We apply threshold as a post-filter rather than via Milvus
+        # radius param, because Milvus radius filtering is too aggressive
+        # and returns 0 results for Vietnamese/HTML-heavy content where
+        # cosine similarities tend to be lower (0.3-0.4 range).
+        raw_count = len(results[0]) if results and len(results) > 0 else 0
+        filtered = [
             {
                 **dp["entity"],
                 "id": dp["id"],
@@ -1725,7 +1691,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "created_at": dp.get("created_at"),
             }
             for dp in results[0]
+            if dp["distance"] >= self.cosine_better_than_threshold
         ]
+
+        logger.info(
+            f"[{self.workspace}] Query returned {raw_count} raw results, "
+            f"{len(filtered)} after threshold filter ({self.cosine_better_than_threshold})"
+        )
+
+        return filtered
 
     async def index_done_callback(self) -> None:
         # Milvus handles persistence automatically

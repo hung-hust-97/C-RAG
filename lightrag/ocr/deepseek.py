@@ -105,15 +105,17 @@ class DeepSeekOCRExtractor:
             )
             
             # Check for error status codes
-            if response.status_code >= 500:
-                error_msg = f"DeepSeek OCR API server error: {response.status_code}"
-                logger.error(error_msg)
-                raise DeepSeekOCRError(error_msg)
-            
             if response.status_code >= 400:
-                error_msg = f"DeepSeek OCR API client error: {response.status_code}"
+                try:
+                    response_text = response.text
+                except Exception:
+                    response_text = "Could not read response text"
+                
+                error_type = "server" if response.status_code >= 500 else "client"
+                error_msg = f"DeepSeek OCR API {error_type} error: {response.status_code}, Response: {response_text}"
                 logger.error(error_msg)
                 raise DeepSeekOCRError(error_msg)
+
             
             # Parse response to extract text and page_count
             response_data = response.json()
@@ -197,15 +199,17 @@ class DeepSeekOCRExtractor:
             )
             
             # Check for error status codes
-            if response.status_code >= 500:
-                error_msg = f"DeepSeek OCR API server error: {response.status_code}"
-                logger.error(error_msg)
-                raise DeepSeekOCRError(error_msg)
-            
             if response.status_code >= 400:
-                error_msg = f"DeepSeek OCR API client error: {response.status_code}"
+                try:
+                    response_text = response.text
+                except Exception:
+                    response_text = "Could not read response text"
+                
+                error_type = "server" if response.status_code >= 500 else "client"
+                error_msg = f"DeepSeek OCR API {error_type} error: {response.status_code}, Response: {response_text}"
                 logger.error(error_msg)
                 raise DeepSeekOCRError(error_msg)
+
             
             # Parse response to extract text
             response_data = response.json()

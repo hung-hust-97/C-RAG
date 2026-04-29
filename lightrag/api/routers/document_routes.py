@@ -823,14 +823,6 @@ class DocumentsRequest(BaseModel):
     status_filter: Optional[DocStatus] = Field(
         default=None, description="Filter by document status, None for all statuses"
     )
-
-    @field_validator("status_filter", mode="before")
-    @classmethod
-    def normalize_status(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            return v.upper()
-        return v
-
     page: int = Field(default=1, ge=1, description="Page number (1-based)")
     page_size: int = Field(
         default=50, ge=10, le=200, description="Number of documents per page (10-200)"
@@ -844,6 +836,17 @@ class DocumentsRequest(BaseModel):
     workspace_id: Optional[str] = Field(
         default=None, description="Workspace identifier for this request"
     )
+
+    @field_validator("status_filter", mode="before")
+    @classmethod
+    def validate_status_filter(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v_upper = v.upper().strip()
+            # Special handling for common UI values if needed
+            return v_upper
+        return v
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -1911,7 +1914,13 @@ async def pipeline_enqueue_file(
                         
                         # Check if extraction failed
                         if not content.strip():
-                            if _is_docling_available():
+                            # Strictly avoid fallback to Docling for PDFs and Images to prevent CPU/Memory exhaustion and low quality results
+                            # as per AGENTS.md guidelines.
+                            is_binary_doc = ext.lower() in [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"]
+                            
+                            if is_binary_doc:
+                                logger.warning(f"[File Extraction] DeepSeek OCR returned no content for {file_path.name}. Skipping fallback for binary document.")
+                            elif _is_docling_available():
                                 logger.info(f"[File Extraction] Fallback to Docling for {file_path.name}")
                                 try:
                                     content = await asyncio.to_thread(_convert_with_docling, file_path)
@@ -1922,7 +1931,7 @@ async def pipeline_enqueue_file(
                             if ocr_result and ocr_result.error:
                                 error_msg = f"[File Extraction]Document extraction failed: {ocr_result.error}"
                             else:
-                                error_msg = "[File Extraction]Document extraction returned no content"
+                                error_msg = "[File Extraction]Document extraction returned no content (DeepSeek OCR)"
                             
                             await rag.doc_status.upsert({
                                 doc_id: {
@@ -1934,6 +1943,7 @@ async def pipeline_enqueue_file(
                             })
                             logger.error(f"[File Extraction]{error_msg} for {file_path.name}")
                             return False, doc_id
+
                             
                     except Exception as e:
                         error_msg = f"[File Extraction]Document processing error: Failed to extract text from Document: {str(e)}"
@@ -1948,47 +1958,42 @@ async def pipeline_enqueue_file(
                         logger.error(f"[File Extraction]Error processing Document {file_path.name}: {str(e)}")
                         return False, doc_id
 
-                case ".docx":
+                case ".docx" | ".pptx" | ".xlsx":
                     try:
-                        # Try DOCLING first if available, bypassing global_args for better defaults
+                        # Try DOCLING first if available
                         if _is_docling_available():
+                            logger.info(f"[File Extraction] Attempting Docling for {file_path.name}")
                             content = await asyncio.to_thread(
                                 _convert_with_docling, file_path
                             )
-                        else:
-                            logger.warning(
-                                f"Docling not available for {file_path.name}. Falling back to python-docx."
+                        
+                        if not content or not content.strip():
+                            # Fallback to OCR as requested
+                            logger.info(f"[File Extraction] Docling failed/empty for {file_path.name}, falling back to OCR")
+                            ocr_config = OCRConfig.from_global_args(global_args)
+                            ocr_result = await process_document_with_ocr(
+                                file_bytes=file,
+                                ocr_config=ocr_config,
+                                file_extension=ext.lower()
                             )
-                            # Use python-docx (non-blocking via to_thread)
-                            content = await asyncio.to_thread(_extract_docx, file)
+                            content = ocr_result.text
+                            
                     except Exception as e:
-                        error_msg = f"[File Extraction]DOCX processing error: Failed to extract text from DOCX: {str(e)}"
-                        await rag.doc_status.upsert({
-                            doc_id: {
-                                "status": DocStatus.FAILED,
-                                "error_msg": error_msg,
-                                "content_length": file_size,
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                        })
-                        logger.error(f"[File Extraction]Error processing DOCX {file_path.name}: {str(e)}")
-                        return False, doc_id
+                        logger.warning(f"[File Extraction] Primary extraction for {file_path.name} failed: {e}. Trying OCR fallback.")
+                        try:
+                            ocr_config = OCRConfig.from_global_args(global_args)
+                            ocr_result = await process_document_with_ocr(
+                                file_bytes=file,
+                                ocr_config=ocr_config,
+                                file_extension=ext.lower()
+                            )
+                            content = ocr_result.text
+                        except Exception as ocr_e:
+                            logger.error(f"[File Extraction] OCR fallback also failed for {file_path.name}: {ocr_e}")
+                            content = ""
 
-                case ".pptx":
-                    try:
-                        # Try DOCLING first if available, bypassing global_args for better defaults
-                        if _is_docling_available():
-                            content = await asyncio.to_thread(
-                                _convert_with_docling, file_path
-                            )
-                        else:
-                            logger.warning(
-                                f"Docling not available for {file_path.name}. Falling back to python-pptx."
-                            )
-                            # Use python-pptx (non-blocking via to_thread)
-                            content = await asyncio.to_thread(_extract_pptx, file)
-                    except Exception as e:
-                        error_msg = f"[File Extraction]PPTX processing error: Failed to extract text from PPTX: {str(e)}"
+                    if not content or not content.strip():
+                        error_msg = f"[File Extraction] All extraction methods failed for {file_path.name}"
                         await rag.doc_status.upsert({
                             doc_id: {
                                 "status": DocStatus.FAILED,
@@ -1997,33 +2002,7 @@ async def pipeline_enqueue_file(
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
                             }
                         })
-                        logger.error(f"[File Extraction]Error processing PPTX {file_path.name}: {str(e)}")
-                        return False, doc_id
-
-                case ".xlsx":
-                    try:
-                        # Try DOCLING first if available, bypassing global_args for better defaults
-                        if _is_docling_available():
-                            content = await asyncio.to_thread(
-                                _convert_with_docling, file_path
-                            )
-                        else:
-                            logger.warning(
-                                f"Docling not available for {file_path.name}. Falling back to openpyxl."
-                            )
-                            # Use openpyxl (non-blocking via to_thread)
-                            content = await asyncio.to_thread(_extract_xlsx, file)
-                    except Exception as e:
-                        error_msg = f"[File Extraction]XLSX processing error: Failed to extract text from XLSX: {str(e)}"
-                        await rag.doc_status.upsert({
-                            doc_id: {
-                                "status": DocStatus.FAILED,
-                                "error_msg": error_msg,
-                                "content_length": file_size,
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                        })
-                        logger.error(f"[File Extraction]Error processing XLSX {file_path.name}: {str(e)}")
+                        logger.error(f"[File Extraction]{error_msg}")
                         return False, doc_id
 
                 case _:
@@ -2483,7 +2462,7 @@ async def run_scanning_process(
 
             # Process valid files (new files + non-PROCESSED status files)
             if valid_files:
-                doc_ids = await pipeline_index_files(rag, valid_files, rag.workspace)
+                doc_ids = await pipeline_index_files(rag, valid_files, resolved_workspace_id)
                 if processed_files:
                     logger.info(
                         f"Scanning process completed: {len(valid_files)} files Processed {len(processed_files)} skipped."
@@ -4605,9 +4584,7 @@ def create_document_routes(
                         status_counts.get(DocStatus.FAILED.value, 0) +
                         status_counts.get(DocStatus.PENDING.value, 0) +
                         status_counts.get(DocStatus.PROCESSING.value, 0) +
-                        status_counts.get(DocStatus.CHUNKING.value, 0) +     # Include CHUNKING docs
-                        status_counts.get(DocStatus.EXTRACTING.value, 0) + # Include stuck EXTRACTING docs
-                        status_counts.get(DocStatus.EXTRACTED.value, 0)    # Include stuck EXTRACTED docs
+                        status_counts.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
                     )
                     if documents_count > 0:
                         workspaces_to_process = [current_rag.workspace]
@@ -4621,9 +4598,7 @@ def create_document_routes(
                             ws_stats.get(DocStatus.FAILED.value, 0) +
                             ws_stats.get(DocStatus.PENDING.value, 0) +
                             ws_stats.get(DocStatus.PROCESSING.value, 0) +
-                            ws_stats.get(DocStatus.CHUNKING.value, 0) +     # Include CHUNKING docs
-                            ws_stats.get(DocStatus.EXTRACTING.value, 0) + # Include stuck EXTRACTING docs
-                            ws_stats.get(DocStatus.EXTRACTED.value, 0)    # Include stuck EXTRACTED docs
+                            ws_stats.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
                         )
                         if ws_failed_count > 0:
                             workspaces_to_process.append(ws_id)

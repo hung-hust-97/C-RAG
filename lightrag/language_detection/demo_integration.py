@@ -29,11 +29,11 @@ def demo_initialization():
     
     print("✓ LanguageDetectionService initialized")
     print(f"  - FastText available: {service.is_fasttext_available()}")
-    print(f"  - Unicode detector: Available")
+    print("  - Unicode detector: Available")
     print(f"  - Hybrid strategy: {'Available' if hasattr(service, 'hybrid_strategy') and service.hybrid_strategy else 'N/A'}")
-    print(f"  - Error handler: Configured")
-    print(f"  - Metrics collector: Active")
-    print(f"  - Rate limiter: Enabled")
+    print("  - Error handler: Configured")
+    print("  - Metrics collector: Active")
+    print("  - Rate limiter: Enabled")
     
     return service
 
@@ -83,7 +83,7 @@ def demo_detailed_detection(service):
     result = service.get_detection_details(text)
     
     print(f"Text: '{text}'")
-    print(f"\nDetection Results:")
+    print("\nDetection Results:")
     print(f"  Language: {result.language.value}")
     print(f"  Confidence: {result.confidence:.3f}")
     print(f"  Method Used: {result.method_used}")
@@ -137,7 +137,7 @@ def demo_caching(service):
     # Show cache statistics
     if service.is_fasttext_available():
         cache_stats = service.fasttext_detector.get_cache_stats()
-        print(f"\nFastText Cache Statistics:")
+        print("\nFastText Cache Statistics:")
         print(f"  Hits: {cache_stats['hits']}")
         print(f"  Misses: {cache_stats['misses']}")
         print(f"  Hit Rate: {cache_stats['efficiency']['hit_rate_percent']:.1f}%")
@@ -166,7 +166,7 @@ def demo_error_handling(service):
     # Show error handler status
     if hasattr(service, 'error_handler') and service.error_handler:
         error_stats = service.error_handler.get_error_stats()
-        print(f"\nError Handler Status:")
+        print("\nError Handler Status:")
         print(f"  Circuit Breaker: {'Open' if service.error_handler.is_circuit_open() else 'Closed'}")
         print(f"  Health Status: {service.error_handler.get_health_status()}")
 
@@ -213,7 +213,7 @@ def demo_resource_cleanup(service):
     
     # Get initial metrics
     initial_metrics = service.get_performance_metrics()
-    print(f"Before cleanup:")
+    print("Before cleanup:")
     print(f"  Total detections: {initial_metrics['total_detections']}")
     
     # Perform cleanup
@@ -222,13 +222,13 @@ def demo_resource_cleanup(service):
     
     # Verify cleanup
     reset_metrics = service.get_performance_metrics()
-    print(f"\nAfter cleanup:")
+    print("\nAfter cleanup:")
     print(f"  Total detections: {reset_metrics['total_detections']}")
-    print(f"  ✓ Metrics reset successfully")
+    print("  ✓ Metrics reset successfully")
     
     # Verify service still works
     result = service.detect_language("Test after cleanup")
-    print(f"\n✓ Service still functional after cleanup")
+    print("\n✓ Service still functional after cleanup")
     print(f"  Test detection: {result.value}")
 
 

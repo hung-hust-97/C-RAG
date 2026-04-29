@@ -25,7 +25,6 @@ from typing import (
     Union,
 )
 from lightrag.prompt import PROMPTS
-from lightrag.prompt_manager import PromptManager
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
@@ -89,6 +88,7 @@ from lightrag.base import (
 from lightrag.namespace import NameSpace
 from lightrag.operate import (
     chunking_by_token_size,
+    semantic_chunking_markdown,
     extract_entities,
     merge_nodes_and_edges,
     kg_query,
@@ -107,7 +107,8 @@ from lightrag.utils import (
     get_content_summary,
     sanitize_text_for_encoding,
     check_storage_env_vars,
-    generate_track_id,
+    generate_doc_id,
+    compute_content_hash,
     convert_to_user_format,
     logger,
     subtract_source_ids,
@@ -304,7 +305,7 @@ class LightRAG:
             int,
         ],
         Union[List[Dict[str, Any]], Awaitable[List[Dict[str, Any]]]],
-    ] = field(default_factory=lambda: chunking_by_token_size)
+    ] = field(default_factory=lambda: semantic_chunking_markdown)
     """
     Custom chunking function for splitting text into chunks before processing.
 
@@ -326,7 +327,7 @@ class LightRAG:
         - `content` (str): The text content of the chunk.
         - `chunk_order_index` (int): Zero-based index indicating the chunk's order in the document.
 
-    Defaults to `chunking_by_token_size` if not specified.
+    Defaults to `semantic_chunking_markdown` if not specified.
     """
 
     # Embedding
@@ -1215,8 +1216,7 @@ class LightRAG:
         split_by_character_only: bool = False,
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
-        track_id: str | None = None,
-    ) -> str:
+    ) -> list[str]:
         """Sync Insert documents with checkpoint support
 
         Args:
@@ -1225,12 +1225,11 @@ class LightRAG:
             chunk_token_size, it will be split again by token size.
             split_by_character_only: if split_by_character_only is True, split the string by character only, when
             split_by_character is None, this parameter is ignored.
-            ids: single string of the document ID or list of unique document IDs, if not provided, MD5 hash IDs will be generated
+            ids: single string of the document ID or list of unique document IDs, if not provided, UUID IDs will be generated
             file_paths: single string of the file path or list of file paths, used for citation
-            track_id: tracking ID for monitoring processing status, if not provided, will be generated
 
         Returns:
-            str: tracking ID for monitoring processing status
+            list[str]: list of unique document IDs
         """
         loop = always_get_an_event_loop()
         return loop.run_until_complete(
@@ -1240,7 +1239,6 @@ class LightRAG:
                 split_by_character_only,
                 ids,
                 file_paths,
-                track_id,
             )
         )
 
@@ -1251,8 +1249,7 @@ class LightRAG:
         split_by_character_only: bool = False,
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
-        track_id: str | None = None,
-    ) -> str:
+    ) -> list[str]:
         """Async Insert documents with checkpoint support
 
         Args:
@@ -1261,23 +1258,18 @@ class LightRAG:
             chunk_token_size, it will be split again by token size.
             split_by_character_only: if split_by_character_only is True, split the string by character only, when
             split_by_character is None, this parameter is ignored.
-            ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
+            ids: list of unique document IDs, if not provided, UUID IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
-            track_id: tracking ID for monitoring processing status, if not provided, will be generated
 
         Returns:
-            str: tracking ID for monitoring processing status
+            list[str]: list of unique document IDs
         """
-        # Generate track_id if not provided
-        if track_id is None:
-            track_id = generate_track_id("insert")
-
-        await self.apipeline_enqueue_documents(input, ids, file_paths, track_id)
+        doc_ids = await self.apipeline_enqueue_documents(input, ids, file_paths)
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
 
-        return track_id
+        return doc_ids
 
     # TODO: deprecated, use insert instead
     def insert_custom_chunks(
@@ -1356,28 +1348,23 @@ class LightRAG:
         input: str | list[str],
         ids: list[str] | None = None,
         file_paths: str | list[str] | None = None,
-        track_id: str | None = None,
-    ) -> str:
+    ) -> list[str]:
         """
         Pipeline for Processing Documents
 
-        1. Validate ids if provided or generate MD5 hash IDs and remove duplicate contents
+        1. Validate ids if provided or generate UUID IDs and remove duplicate contents
         2. Generate document initial status
-        3. Filter out already processed documents
+        3. Filter out already processed documents using content_hash
         4. Enqueue document in status
 
         Args:
             input: Single document string or list of document strings
-            ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
+            ids: list of unique document IDs, if not provided, UUID IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
-            track_id: tracking ID for monitoring processing status, if not provided, will be generated with "enqueue" prefix
 
         Returns:
-            str: tracking ID for monitoring processing status
+            list[str]: list of document IDs
         """
-        # Generate track_id if not provided
-        if track_id is None or track_id.strip() == "":
-            track_id = generate_track_id("enqueue")
         if isinstance(input, str):
             input = [input]
         if isinstance(ids, str):
@@ -1401,7 +1388,7 @@ class LightRAG:
             # If no file paths provided, use placeholder
             file_paths = ["unknown_source"] * len(input)
 
-        # 1. Validate ids if provided or generate MD5 hash IDs and remove duplicate contents
+        # 1. Validate ids if provided or generate UUID IDs and remove duplicate contents
         if ids is not None:
             # Check if the number of IDs matches the number of documents
             if len(ids) != len(input):
@@ -1431,9 +1418,9 @@ class LightRAG:
                 if cleaned_content not in unique_content_with_paths:
                     unique_content_with_paths[cleaned_content] = path
 
-            # Generate contents dict of MD5 hash IDs and documents with paths
+            # Generate contents dict of UUID IDs and documents with paths
             contents = {
-                compute_mdhash_id(content, prefix="doc-"): {
+                generate_doc_id("doc-"): {
                     "content": content,
                     "file_path": path,
                 }
@@ -1444,110 +1431,92 @@ class LightRAG:
         new_docs: dict[str, Any] = {}
         for id_, content_data in contents.items():
             # Compute content_hash for each document
-            from lightrag.utils import compute_content_hash
             content_hash = compute_content_hash(content_data["content"], self.workspace)
             
             new_docs[id_] = {
-                "status": DocStatus.EXTRACTED,  # Changed from PENDING to EXTRACTED (full text extraction done)
+                "status": DocStatus.EXTRACTED,  # Initial status for direct text input
                 "content_summary": get_content_summary(content_data["content"]),
                 "content_length": len(content_data["content"]),
-                "content_hash": content_hash,  # Store content_hash
+                "content_hash": content_hash,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-                "file_path": content_data[
-                    "file_path"
-                ],  # Store file path in document status
-                "track_id": track_id,  # Store track_id in document status
-                "error_msg": None,  # Initialize error fields
+                "file_path": content_data["file_path"],
+                "error_msg": None,
                 "error_stage": None,
             }
 
-        # 3. Filter out already processed documents
-        # Get docs ids
-        all_new_doc_ids = set(new_docs.keys())
-        # Exclude IDs of documents that are already enqueued
-        unique_new_doc_ids = await self.doc_status.filter_keys(all_new_doc_ids)
-
-        # Handle duplicate documents - create trackable records with current track_id
-        ignored_ids = list(all_new_doc_ids - unique_new_doc_ids)
-        if ignored_ids:
-            duplicate_docs: dict[str, Any] = {}
-            for doc_id in ignored_ids:
-                file_path = (
-                    new_docs.get(doc_id, {}).get("file_path") or "unknown_source"
-                )
-                logger.warning(f"Duplicate document detected: {doc_id} ({file_path})")
-
-                # Get existing document info for reference
-                existing_doc = await self.doc_status.get_by_id(doc_id)
-                existing_status = (
-                    existing_doc.get("status", "unknown") if existing_doc else "unknown"
-                )
-                existing_track_id = (
-                    existing_doc.get("track_id", "") if existing_doc else ""
-                )
-
-                # Create a new record with unique ID for this duplicate attempt
-                dup_record_id = compute_mdhash_id(f"{doc_id}-{track_id}", prefix="dup-")
+        # 3. Filter out already processed documents using content_hash
+        # For batch operations, we check each doc for existing content_hash
+        all_doc_ids = list(new_docs.keys())
+        final_ids = []
+        unique_new_doc_ids = []
+        duplicate_docs: dict[str, Any] = {}
+        
+        for doc_id in all_doc_ids:
+            doc_info = new_docs[doc_id]
+            is_dup, existing_id = await self.doc_status.check_duplicate_by_content_hash(doc_info["content_hash"])
+            
+            if is_dup:
+                logger.warning(f"Duplicate document detected by content_hash: {doc_id} matches {existing_id} ({doc_info['file_path']})")
+                
+                # Create a record for the duplicate attempt with DUPLICATED status
+                dup_record_id = generate_doc_id("dup-")
+                final_ids.append(dup_record_id)
                 duplicate_docs[dup_record_id] = {
-                    "status": DocStatus.FAILED,
-                    "content_summary": f"[DUPLICATE] Original document: {doc_id}",
-                    "content_length": new_docs.get(doc_id, {}).get("content_length", 0),
+                    "status": DocStatus.DUPLICATED,
+                    "content_summary": f"[DUPLICATE] Original document: {existing_id}",
+                    "content_length": doc_info["content_length"],
                     "chunks_count": 0,
                     "chunks_list": [],
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "file_path": file_path,
-                    "track_id": track_id,  # Use current track_id for tracking
-                    "error_msg": f"Content already exists. Original doc_id: {doc_id}, Status: {existing_status}",
+                    "file_path": doc_info["file_path"],
+                    "content_hash": doc_info["content_hash"],
+                    "error_msg": f"Content already exists. Original doc_id: {existing_id}",
                     "metadata": {
                         "is_duplicate": True,
-                        "original_doc_id": doc_id,
-                        "original_track_id": existing_track_id,
+                        "original_doc_id": existing_id,
                     },
                 }
+            else:
+                final_ids.append(doc_id)
+                unique_new_doc_ids.append(doc_id)
 
-            # Store duplicate records in doc_status
-            if duplicate_docs:
-                await self.doc_status.upsert(duplicate_docs)
-                logger.info(
-                    f"Created {len(duplicate_docs)} duplicate document records with track_id: {track_id}"
-                )
+        # Store duplicate records in doc_status
+        if duplicate_docs:
+            await self.doc_status.upsert(duplicate_docs)
+            logger.info(f"Created {len(duplicate_docs)} duplicate document records")
 
-        # Filter new_docs to only include documents with unique IDs
-        new_docs = {
+        # Filter new_docs to only include documents with unique content
+        final_new_docs = {
             doc_id: new_docs[doc_id]
             for doc_id in unique_new_doc_ids
-            if doc_id in new_docs
         }
 
-        if not new_docs:
+        if not final_new_docs:
             logger.warning("No new unique documents were found.")
-            return
+            return final_ids
 
         # 4. Store document content in full_docs and status in doc_status
-        #    Store full document content separately
         full_docs_data = {
             doc_id: {
                 "content": contents[doc_id]["content"],
                 "file_path": contents[doc_id]["file_path"],
             }
-            for doc_id in new_docs.keys()
+            for doc_id in final_new_docs.keys()
         }
         await self.full_docs.upsert(full_docs_data)
-        # Persist data to disk immediately
         await self.full_docs.index_done_callback()
 
         # Store document status (without content)
-        await self.doc_status.upsert(new_docs)
-        logger.debug(f"Stored {len(new_docs)} new unique documents")
+        await self.doc_status.upsert(final_new_docs)
+        logger.debug(f"Stored {len(final_new_docs)} new unique documents")
 
-        return track_id
+        return final_ids
 
     async def apipeline_enqueue_error_documents(
         self,
         error_files: list[dict[str, Any]],
-        track_id: str | None = None,
     ) -> None:
         """
         Record file extraction errors in doc_status storage.
@@ -1563,7 +1532,6 @@ class LightRAG:
                 - error_description: Brief error description (for content_summary)
                 - original_error: Full error message (for error_msg)
                 - file_size: File size in bytes (for content_length, 0 if unknown)
-            track_id: Optional tracking ID for grouping related operations
 
         Returns:
             None
@@ -1571,10 +1539,6 @@ class LightRAG:
         if not error_files:
             logger.debug("No error files to record")
             return
-
-        # Generate track_id if not provided
-        if track_id is None or track_id.strip() == "":
-            track_id = generate_track_id("error")
 
         error_docs: dict[str, Any] = {}
         current_time = datetime.now(timezone.utc).isoformat()
@@ -1587,9 +1551,8 @@ class LightRAG:
             original_error = error_file.get("original_error", "Unknown error")
             file_size = error_file.get("file_size", 0)
 
-            # Generate unique doc_id with "error-" prefix
-            doc_id_content = f"{file_path}-{error_description}"
-            doc_id = compute_mdhash_id(doc_id_content, prefix="error-")
+            # Generate unique doc_id for the error document
+            doc_id = generate_doc_id("error-")
 
             error_docs[doc_id] = {
                 "status": DocStatus.FAILED,
@@ -1601,7 +1564,6 @@ class LightRAG:
                 "created_at": current_time,
                 "updated_at": current_time,
                 "file_path": file_path,
-                "track_id": track_id,
                 "metadata": {
                     "error_type": "file_extraction_error",
                 },
@@ -1760,7 +1722,6 @@ class LightRAG:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "file_path": getattr(status_doc, "file_path", None)
                     or "unknown_source",
-                    "track_id": getattr(status_doc, "track_id", ""),
                     "error_msg": error_msg,
                     "error_stage": error_stage,
                     "metadata": metadata,
@@ -1936,7 +1897,7 @@ class LightRAG:
         each chunk for entity and relation extraction, and updating the
         document status.
 
-        1. Get all pending, failed, and abnormally terminated processing documents.
+        1. Get all extracted, chunking, and failed documents.
         2. Validate document data consistency and fix any issues
         3. Split document content into chunks
         4. Process each chunk for entity and relation extraction
@@ -1955,21 +1916,20 @@ class LightRAG:
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
-                processing_docs, chunking_docs, failed_docs, pending_docs, extracted_docs, extracting_docs = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+                # Pick up documents in all states that need processing or recovery
+                # DocProcessingStatus.__post_init__ handles backward compatibility mapping
+                # for PENDING -> EXTRACTED and PROCESSING -> CHUNKING
+                extracted_docs, chunking_docs, failed_docs, extracting_docs = await asyncio.gather(
+                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                     self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
-                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTING),
                 )
 
                 to_process_docs: dict[str, DocProcessingStatus] = {}
-                to_process_docs.update(processing_docs)
+                to_process_docs.update(extracted_docs)
                 to_process_docs.update(chunking_docs)
                 to_process_docs.update(failed_docs)
-                to_process_docs.update(pending_docs)
-                to_process_docs.update(extracted_docs)
                 to_process_docs.update(extracting_docs)  # Include stuck EXTRACTING documents
 
                 # Create a static copy to avoid RuntimeError: dictionary changed size during iteration
@@ -2129,9 +2089,6 @@ class LightRAG:
                                         timezone.utc
                                     ).isoformat(),
                                     "file_path": file_path,
-                                    "track_id": getattr(
-                                        status_doc, "track_id", ""
-                                    ),
                                     "metadata": {
                                         "processing_start_time": processing_start_time,
                                         "processing_end_time": processing_end_time,
@@ -2139,25 +2096,6 @@ class LightRAG:
                                 }
                             }
                         )
-
-                        track_id = getattr(status_doc, "track_id", None)
-                        if track_id:
-                            try:
-                                await self.doc_status.upsert_track_status(
-                                    track_id=track_id,
-                                    status=DocStatus.FAILED,
-                                    metadata={
-                                        "file_name": file_path,
-                                        "error_stage": error_stage,
-                                    },
-                                )
-                                logger.debug(
-                                    f"[Track] Set FAILED status for track_id: {track_id}"
-                                )
-                            except Exception as track_error:
-                                logger.warning(
-                                    f"[Track] Failed to set FAILED status: {track_error}"
-                                )
 
                     async with semaphore:
                         nonlocal processed_count
@@ -2255,19 +2193,6 @@ class LightRAG:
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
                             
-                            # Update track status to CHUNKING
-                            track_id = getattr(status_doc, "track_id", None)
-                            if track_id:
-                                try:
-                                    await self.doc_status.upsert_track_status(
-                                        track_id=track_id,
-                                        status=DocStatus.CHUNKING,
-                                        metadata={"file_name": file_path}
-                                    )
-                                    logger.debug(f"[Track] Set CHUNKING status for track_id: {track_id}")
-                                except Exception as e:
-                                    logger.warning(f"[Track] Failed to set CHUNKING status: {e}")
-                            
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
                                     {
@@ -2284,7 +2209,6 @@ class LightRAG:
                                                 timezone.utc
                                             ).isoformat(),
                                             "file_path": file_path,
-                                            "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                             "metadata": {
                                                 **getattr(status_doc, "metadata", {}),
                                                 "processing_start_time": processing_start_time,
@@ -2413,7 +2337,6 @@ class LightRAG:
                                                 timezone.utc
                                             ).isoformat(),
                                             "file_path": file_path,
-                                            "track_id": getattr(status_doc, "track_id", ""),  # Preserve existing track_id if present
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
@@ -2421,19 +2344,6 @@ class LightRAG:
                                         }
                                     }
                                 )
-                                
-                                # Update track status to PROCESSED
-                                track_id = getattr(status_doc, "track_id", None)
-                                if track_id:
-                                    try:
-                                        await self.doc_status.upsert_track_status(
-                                            track_id=track_id,
-                                            status=DocStatus.PROCESSED,
-                                            metadata={"file_name": file_path}
-                                        )
-                                        logger.debug(f"[Track] Set PROCESSED status for track_id: {track_id}")
-                                    except Exception as e:
-                                        logger.warning(f"[Track] Failed to set PROCESSED status: {e}")
 
                                 # Call _insert_done after processing each file
                                 await self._insert_done()
@@ -2529,21 +2439,17 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
                 # Check for pending documents again
-                processing_docs, chunking_docs, failed_docs, pending_docs, extracted_docs, extracting_docs = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+                extracted_docs, chunking_docs, failed_docs, extracting_docs = await asyncio.gather(
+                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                     self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
-                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTING),
                 )
 
                 to_process_docs = {}
-                to_process_docs.update(processing_docs)
+                to_process_docs.update(extracted_docs)
                 to_process_docs.update(chunking_docs)
                 to_process_docs.update(failed_docs)
-                to_process_docs.update(pending_docs)
-                to_process_docs.update(extracted_docs)
                 to_process_docs.update(extracting_docs)
 
         finally:

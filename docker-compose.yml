@@ -202,7 +202,8 @@ services:
         condition: service_started  # Wait for message broker to start
     healthcheck:
       # Verifies FastAPI server is responding to requests
-      test: ["CMD", "curl", "-f", "http://localhost:9621/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9621/health')"]
+
       interval: 30s
       timeout: 10s
       retries: 3

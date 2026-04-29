@@ -872,6 +872,19 @@ class DocStatusStorage(BaseKVStorage, ABC):
             Returns the same format as get_by_ids method
         """
 
+    @abstractmethod
+    async def check_duplicate_by_content_hash(
+        self, content_hash: str, exclude_doc_id: str | None = None
+    ) -> tuple[bool, str | None]:
+        """Check if a document with the same content_hash already exists in the workspace.
+
+        Args:
+            content_hash: MD5 hash of document content
+            exclude_doc_id: Optional doc_id to exclude from search
+
+        Returns:
+            tuple[bool, str | None]: (is_duplicate, existing_doc_id)
+        """
 
 class StoragesStatus(str, Enum):
     """Storages status"""

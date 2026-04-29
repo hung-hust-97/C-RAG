@@ -52,129 +52,92 @@ async def process_document_with_ocr(
     ocr_config: Optional[OCRConfig] = None,
     file_extension: str = ".pdf",
 ) -> OCRResult:
-    """Process document with intelligent OCR routing.
+    """Process document with prioritized OCR routing.
     
-    This function implements the main document processing workflow:
-    1. Try standard text extraction using pypdf first
-    2. If text found, return immediately without OCR
-    3. If no text (scanned PDF), select OCR engine using OCREngineSelector
-    4. Process with selected engine (deepseek or tesseract)
-    5. Implement fallback chain: deepseek -> tesseract -> error
-    6. Log all extraction attempts and results
-    7. Return OCRResult with text and metadata
+    New Logic (User Optimized):
+    1. For PDF/Images: Use DeepSeek OCR directly.
+    2. For other formats (fallback): Try DeepSeek OCR if requested.
+    3. If DeepSeek OCR fails or returns no content: Return FAILED (no local fallback).
     
     Args:
-        file_bytes: PDF file content as bytes
+        file_bytes: File content as bytes
         password: Optional password for encrypted PDFs
-        ocr_config: OCR configuration (if None, uses default config)
+        ocr_config: OCR configuration
+        file_extension: extension of the file
         
     Returns:
-        OCRResult: Result object containing extracted text and metadata
-        
-    Raises:
-        PDFProcessingError: If all extraction methods fail
-        ValueError: If file_bytes is empty or invalid
-        
-    Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 6.1, 6.2, 6.3, 6.6, 9.2, 9.3
+        OCRResult: Result object with text or error
     """
     if not file_bytes:
         raise ValueError("file_bytes cannot be empty")
     
     start_time = time.time()
-    
-    # Use default config if not provided
     if ocr_config is None:
         ocr_config = OCRConfig()
     
-    logger.info("Starting PDF processing with intelligent OCR routing")
+    logger.info(f"Processing {file_extension} with prioritized OCR routing")
     
-    # Step 4: Select OCR engine based on config and availability
+    # Select engine
     selector = OCREngineSelector(ocr_config)
     engine = selector.select_engine()
     
-    logger.info(f"Selected OCR engine: {engine}")
-    
-    # Hybrid Extraction Logic (Docling + DeepSeek Refinement)
-    if ocr_config.use_hybrid_mode and (engine in ["auto", "docling", "hybrid"]):
+    # Primary path: DeepSeek OCR (supports PDF and images, and potentially others via API)
+    if engine == "deepseek":
         try:
-            logger.info("Attempting Hybrid extraction (Docling + DeepSeek Refinement)")
-            result = await _hybrid_extract(file_bytes, ocr_config, start_time)
-            if result.text.strip():
-                return result
-            logger.warning("Hybrid extraction returned no content.")
-        except Exception as e:
-            logger.warning(f"Hybrid extraction failed: {e}")
-
-    # Hierarchical Extraction Logic (Fallback if Hybrid disabled or failed)
-    # 1. Try DeepSeek (High Quality OCR/Markdown)
-    if engine == "deepseek" or ocr_config.enable_fallback:
-        try:
-            logger.info("Attempting extraction with DeepSeek OCR")
+            logger.info(f"Attempting direct DeepSeek OCR for {file_extension}")
             result = await _extract_with_deepseek(file_bytes, ocr_config, start_time, file_extension)
             if result.text.strip():
                 return result
-            logger.warning("DeepSeek OCR returned empty result.")
+            
+            logger.warning(f"DeepSeek OCR returned empty result for {file_extension}.")
+            return OCRResult(
+                text="",
+                engine_used="deepseek",
+                processing_time=time.time() - start_time,
+                page_count=0,
+                error="DeepSeek OCR returned no content",
+            )
         except Exception as e:
-            logger.warning(f"DeepSeek OCR failed: {e}")
-
-    # 2. Try Docling (Structural Extraction)
-    if engine == "docling" or ocr_config.enable_fallback:
-        try:
-            logger.info("Attempting extraction with Docling")
+            logger.error(f"DeepSeek OCR failed for {file_extension}: {e}")
+            return OCRResult(
+                text="",
+                engine_used="deepseek",
+                processing_time=time.time() - start_time,
+                page_count=0,
+                error=f"DeepSeek OCR failed: {str(e)}",
+            )
+    
+    # If engine is docling (explicitly requested)
+    elif engine == "docling":
+         try:
+            logger.info(f"Attempting Docling extraction for {file_extension}")
             result = await _extract_with_docling(file_bytes, ocr_config, start_time)
             if result.text.strip():
                 return result
-            logger.warning("Docling extraction returned empty result.")
-        except Exception as e:
-            logger.warning(f"Docling extraction failed: {e}")
-
-    # 3. Try Tesseract (Local OCR Fallback)
-    if engine == "tesseract" or ocr_config.enable_fallback:
-        try:
-            logger.info("Attempting extraction with Tesseract OCR")
-            result = await _extract_with_tesseract(file_bytes, ocr_config, start_time)
-            if result.text.strip():
-                return result
-            logger.warning("Tesseract OCR returned empty result.")
-        except Exception as e:
-            logger.error(f"Tesseract OCR failed: {e}")
-
-    # 4. Final Fallback: pypdf (Basic Text Extraction)
-    # Only attempted if all above failed or were skipped.
-    try:
-        logger.info("All advanced engines failed/skipped. Attempting basic pypdf extraction as last resort.")
-        import pypdf
-        reader = pypdf.PdfReader(BytesIO(file_bytes))
-        page_count = len(reader.pages)
-        extracted_text = []
-
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                extracted_text.append(text)
-        
-        full_text = "\n".join(extracted_text)
-        if full_text.strip():
-            logger.info(f"pypdf last-resort extraction successful: {len(full_text)} chars")
             return OCRResult(
-                text=full_text,
-                engine_used="pypdf",
+                text="",
+                engine_used="docling",
                 processing_time=time.time() - start_time,
-                page_count=page_count,
-                format="plain",
+                page_count=0,
+                error="Docling returned no content",
             )
-    except Exception as e:
-        logger.error(f"pypdf last-resort extraction also failed: {e}")
+         except Exception as e:
+            return OCRResult(
+                text="",
+                engine_used="docling",
+                processing_time=time.time() - start_time,
+                page_count=0,
+                error=f"Docling failed: {str(e)}",
+            )
 
-    # If we reach here, everything failed
+    # Final fallback if they reached here
     processing_time = time.time() - start_time
     return OCRResult(
         text="",
         engine_used="none",
         processing_time=processing_time,
         page_count=0,
-        format="plain",
-        error="All extraction methods (DeepSeek, Docling, Tesseract, pypdf) failed or returned no content",
+        error=f"No suitable extraction method for {file_extension} or primary engine failed",
     )
 
 

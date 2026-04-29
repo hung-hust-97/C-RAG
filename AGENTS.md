@@ -274,11 +274,31 @@ UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
 - **Extraction Worker** (`celery_worker/tasks.py`): Picks up documents in `EXTRACTING` status, performs OCR/Docling extraction, updates to `EXTRACTED` or `FAILED`
 - **Chunking/KG Worker** (`lightrag.py:apipeline_process_enqueue_documents`): Picks up documents in `EXTRACTED`, `CHUNKING`, `FAILED`, `PENDING`, `PROCESSING` statuses, performs chunking and entity extraction, updates to `PROCESSED` or `FAILED`
 
+**Chunking Configuration:**
+- Default chunking method is `semantic_chunking_markdown`.
+  - Splits content logically by paragraphs and headers.
+  - Strictly avoids splitting HTML or Markdown tables across chunks.
+  - If a section is split, its parent header is prepended to subsequent chunks to preserve context.
+- Token boundaries follow `CHUNK_SIZE` and `CHUNK_OVERLAP_SIZE`.
+
 **Reprocess Behavior:**
 - `/documents/reprocess_failed` endpoint picks up: `FAILED`, `EXTRACTING`, `EXTRACTED`, `PENDING`, `PROCESSING`
 - Stuck `EXTRACTING` documents with content are automatically reset to `EXTRACTED`
 - Stuck `EXTRACTING` documents without content trigger re-extraction if file exists
 - Documents are validated for consistency before reprocessing
+
+**Extraction Strategy & Fallback Logic:**
+- **PDF & Images (.pdf, .jpg, .png, etc.)**:
+  - **Priority**: Direct DeepSeek OCR (Full document). Skip Docling and Hybrid mode for optimal speed on CPU.
+  - **Failure Handling**: If DeepSeek OCR fails or returns no content, the status is set to `FAILED` immediately. No fallback to local Tesseract/pypdf to avoid low-quality results and heavy CPU usage.
+- **Office Formats (.docx, .pptx, .xlsx)**:
+  - **Primary**: Docling (Local structural extraction).
+  - **Fallback**: If Docling fails or returns no content, fallback to DeepSeek OCR.
+  - **Failure Handling**: If both Docling and OCR fail, the status is set to `FAILED`.
+- **General Rules**:
+  - Extraction runs on **CPU** by default (GPU not required for current worker deployment).
+  - All extracted content is converted to **Markdown** before being passed to the chunking pipeline.
+  - Any total failure in extraction MUST result in a `FAILED` status with an appropriate error message in the database.
 
 ## Automation & Agent Workflow
 - Use repo-relative `workdir` arguments for every shell command and prefer `rg`/`rg --files` for searches since they are faster under the CLI harness.

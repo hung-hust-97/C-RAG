@@ -219,6 +219,122 @@ def chunking_by_token_size(
     return results
 
 
+def semantic_chunking_markdown(
+    tokenizer: Tokenizer,
+    content: str,
+    split_by_character: str | None = None,
+    split_by_character_only: bool = False,
+    chunk_overlap_token_size: int = 100,
+    chunk_token_size: int = 1200,
+) -> list[dict[str, Any]]:
+    """Semantic chunking for Markdown content, prioritizing headers and tables.
+    
+    This splits Markdown text logically by paragraphs and headers. It strictly avoids
+    splitting HTML or Markdown tables across chunks. If a section is split, its parent
+    header is prepended to subsequent chunks to preserve context.
+    """
+    import re
+    
+    # 1. Protect HTML tables by replacing them with placeholders
+    table_pattern = re.compile(r"<table.*?>.*?</table>", re.IGNORECASE | re.DOTALL)
+    tables = {}
+    
+    def replace_table(match):
+        placeholder = f"__TABLE_PLACEHOLDER_{len(tables)}__"
+        tables[placeholder] = match.group(0)
+        return placeholder
+
+    content_with_placeholders = table_pattern.sub(replace_table, content)
+    
+    # 2. Split into blocks
+    split_char = '\n\n' if not split_by_character else split_by_character
+    raw_blocks = content_with_placeholders.split(split_char)
+    
+    blocks = []
+    for raw_block in raw_blocks:
+        raw_block = raw_block.strip()
+        if not raw_block:
+            continue
+        # Restore tables
+        for placeholder, table_html in tables.items():
+            if placeholder in raw_block:
+                raw_block = raw_block.replace(placeholder, table_html)
+        blocks.append(raw_block)
+
+    results = []
+    current_chunk_blocks = []
+    current_chunk_tokens = 0
+    chunk_index = 0
+    current_context = ""
+
+    def save_chunk(blocks_to_save):
+        nonlocal chunk_index
+        if not blocks_to_save:
+            return
+        chunk_content = "\n\n".join(blocks_to_save)
+        results.append({
+            "tokens": len(tokenizer.encode(chunk_content)),
+            "content": chunk_content.strip(),
+            "chunk_order_index": chunk_index
+        })
+        chunk_index += 1
+
+    for block in blocks:
+        # Check if block is a header
+        header_match = re.match(r"^(#{1,6})\s+(.*)", block)
+        if header_match:
+            current_context = block
+            
+        block_tokens = len(tokenizer.encode(block))
+        
+        # If adding this block exceeds limit AND we already have blocks
+        if current_chunk_tokens + block_tokens > chunk_token_size and current_chunk_blocks:
+            save_chunk(current_chunk_blocks)
+            
+            # Start new chunk, carrying over the current header context
+            current_chunk_blocks = []
+            current_chunk_tokens = 0
+            if current_context and current_context != block:
+                current_chunk_blocks.append(current_context)
+                current_chunk_tokens += len(tokenizer.encode(current_context))
+        
+        # If the block itself is larger than the limit
+        if block_tokens > chunk_token_size:
+            # If it's a table, we keep it intact despite the size
+            if "<table" in block.lower():
+                if current_chunk_blocks:
+                    save_chunk(current_chunk_blocks)
+                    current_chunk_blocks = []
+                    current_chunk_tokens = 0
+                
+                # Add context if any
+                table_block = f"{current_context}\n\n{block}" if current_context and not block.startswith(current_context) else block
+                save_chunk([table_block])
+                continue
+            else:
+                # Fallback to token-based splitting for long paragraphs
+                if current_chunk_blocks:
+                    save_chunk(current_chunk_blocks)
+                    current_chunk_blocks = []
+                    current_chunk_tokens = 0
+                
+                # Split block by tokens with overlap
+                block_encoded = tokenizer.encode(block)
+                for start in range(0, len(block_encoded), chunk_token_size - chunk_overlap_token_size):
+                    chunk_content = tokenizer.decode(block_encoded[start : start + chunk_token_size])
+                    chunk_content = f"{current_context}\n\n{chunk_content}" if current_context else chunk_content
+                    save_chunk([chunk_content])
+                continue
+        
+        current_chunk_blocks.append(block)
+        current_chunk_tokens += block_tokens
+
+    if current_chunk_blocks:
+        save_chunk(current_chunk_blocks)
+
+    return results
+
+
 async def _handle_entity_relation_summary(
     description_type: str,
     entity_or_relation_name: str,
@@ -3245,7 +3361,7 @@ async def correct_query_spelling(
                 logger.info(f"[Spell Correction] Original: '{query}' → Corrected: '{corrected.strip()}'")
             return corrected.strip()
         else:
-            logger.warning(f"[Spell Correction] Empty result, using original query")
+            logger.warning("[Spell Correction] Empty result, using original query")
             return query
             
     except Exception as e:

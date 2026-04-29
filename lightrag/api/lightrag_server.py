@@ -777,7 +777,10 @@ def create_app(args):
             )
         else:
             # For other endpoints, return the default FastAPI validation error
+            # but also log it for debugging purposes (helps with 422 errors)
+            logger.error(f"Validation error for {request.method} {request.url.path}: {exc.errors()}")
             return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
     def get_cors_origins():
         """Get allowed origins from global_args

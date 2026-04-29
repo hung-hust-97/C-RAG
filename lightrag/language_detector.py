@@ -465,3 +465,21 @@ class LanguageDetector:
             'cache_efficiency': cache_stats['hit_rate_percent'],
             'cache_utilization': (cache_stats['size'] / cache_stats['max_size'] * 100) if cache_stats['max_size'] > 0 else 0.0
         }
+
+
+# Global singleton instance for easy access
+_global_detector = LanguageDetector()
+
+
+def detect_language(text: str, threshold: Optional[float] = None) -> str:
+    """
+    Convenience function for language detection.
+    
+    Args:
+        text: Input text to analyze
+        threshold: Detection threshold
+        
+    Returns:
+        String name of the detected language ("Vietnamese" or "English")
+    """
+    return _global_detector.detect(text, threshold).value

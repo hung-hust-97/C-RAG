@@ -3157,79 +3157,77 @@ def create_document_routes(
                     ),
                 )
 
-            # We want to return Markdown format instead of rendering to PDF
-            content_bytes: bytes | None = None
-            is_markdown = False
+            # --- PRIMARY FILE CONTENT (DISK) ---
+            # Always load the original file for base64 encoding
+            original_content_bytes: bytes | None = None
+            async with aiofiles.open(safe_file_path, "rb") as f:
+                original_content_bytes = await f.read()
             
-            # --- DB-FIRST PREVIEW STRATEGY (S3/MINIO FULL_DOCS SUPPORT) ---
-            # Attempt to find the document in DocStatusStorage to get its ID and status
-            found_doc_id = None
-            found_status = None
-            try:
-                for status in DocStatus:
-                    docs_dict = await current_rag.doc_status.get_docs_by_status(status)
-                    if hasattr(docs_dict, "items"):
-                        for d_id, d_info in docs_dict.items():
-                            # d_info might be a dict or a dataclass DocProcessingStatus
-                            f_path = d_info.get("file_path", "") if isinstance(d_info, dict) else getattr(d_info, "file_path", "")
-                            # Also check basename because sometimes paths are stored relatively
-                            if f_path == normalized_file_path or Path(f_path).name == Path(normalized_file_path).name:
-                                found_doc_id = d_id
-                                found_status = status
-                                break
-                    if found_doc_id:
-                        break
-            except Exception as e:
-                logger.warning(f"Could not scan doc status for file_path: {e}")
+            if original_content_bytes is None:
+                raise HTTPException(status_code=500, detail="Failed to load original document content")
+            
+            data_base64 = base64.b64encode(original_content_bytes).decode("ascii")
+            
+            # --- OPTIONAL TEXT PREVIEW (DB or SIBLING FILE) ---
+            data_text: str | None = None
+            # Default to original file info
+            output_name = safe_file_path.name
+            
+            # Use mimetypes library for better coverage of original file formats
+            import mimetypes
+            mime_type, _ = mimetypes.guess_type(safe_file_path.name)
+            if mime_type is None:
+                # Manual fallbacks for common types if guess_type fails (common in some Linux/Docker envs)
+                extension = safe_file_path.suffix.lower()
+                mapping = {
+                    ".pdf": "application/pdf",
+                    ".md": "text/markdown",
+                    ".txt": "text/plain",
+                    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    ".xls": "application/vnd.ms-excel",
+                    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ".doc": "application/msword",
+                    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    ".ppt": "application/vnd.ms-powerpoint",
+                    ".json": "application/json",
+                    ".csv": "text/csv",
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg"
+                }
+                mime_type = mapping.get(extension, "application/octet-stream")
+            
+            if not download:
+                # 1. Try DB-first for markdown (S3/MINIO FULL_DOCS SUPPORT)
+                try:
+                    existing_doc_data = await current_rag.doc_status.get_doc_by_file_path(
+                        normalized_file_path
+                    )
+                    if existing_doc_data:
+                        raw_full_doc = await current_rag.full_docs.get_by_id(existing_doc_data["id"])
+                        if raw_full_doc and "content" in raw_full_doc:
+                            data_text = raw_full_doc["content"]
+                            logger.info(f"Loaded Markdown preview from full_docs (S3/DB) for doc_id: {existing_doc_data['id']}")
+                except Exception as e:
+                    logger.warning(f"Could not lookup doc status for file_path '{normalized_file_path}': {e}")
 
-            if found_status in [DocStatus.EXTRACTED, DocStatus.CHUNKING]:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Tài liệu đang được xử lý (Chunking/Extracted). Vui lòng chờ cho đến khi hoàn thành để xem nội dung."
-                )
-
-            if found_doc_id:
-                # Try fetching from full_docs (which will hit MinIO S3KVStorage if configured)
-                raw_full_doc = await current_rag.full_docs.get_by_id(found_doc_id)
-                if raw_full_doc and "content" in raw_full_doc:
-                    content_bytes = raw_full_doc["content"].encode("utf-8")
-                    is_markdown = True
-                    logger.info(f"Loaded Markdown preview from full_docs (S3/DB) for doc_id: {found_doc_id}")
-
-            # --- FALLBACK STRATEGY (DISK) ---
-            if content_bytes is None:
-                # If it's a PDF, attempt to load the OCR/Docling generated .md file if it exists on disk
-                if safe_file_path.suffix.lower() == ".pdf":
+                # 2. Try sibling .md file if still no text and it's a PDF
+                if data_text is None and safe_file_path.suffix.lower() == ".pdf":
                     md_candidate = safe_file_path.with_suffix(".md")
                     if md_candidate.exists() and md_candidate.is_file():
-                        safe_file_path = md_candidate
-                        is_markdown = True
-                    
-                if safe_file_path.suffix.lower() in [".md", ".txt", ".json", ".csv"]:
-                    is_markdown = True
-                    async with aiofiles.open(safe_file_path, "rb") as f:
-                        content_bytes = await f.read()
-                elif not is_markdown and safe_file_path.suffix.lower() == ".pdf":
-                    # Directly return the raw PDF if no text markdown was found.
-                    async with aiofiles.open(safe_file_path, "rb") as f:
-                        content_bytes = await f.read()
-                else:
-                    async with aiofiles.open(safe_file_path, "rb") as f:
-                        content_bytes = await f.read()
+                        async with aiofiles.open(md_candidate, "r", encoding="utf-8") as f:
+                            data_text = await f.read()
+                        logger.info(f"Loaded Markdown preview from sibling file: {md_candidate.name}")
 
-            if content_bytes is None:
-                 raise HTTPException(status_code=500, detail="Failed to load document content")
-
-            if is_markdown:
-                output_name = f"{safe_file_path.stem}.md"
-                mime_type = "text/markdown"
-                data_text = content_bytes.decode("utf-8")
-                data_base64 = None
-            else:
-                output_name = f"{safe_file_path.stem}.pdf"
-                mime_type = "application/pdf"
-                data_text = None
-                data_base64 = base64.b64encode(content_bytes).decode("ascii")
+                # 3. If the original file itself is a text-based file
+                if data_text is None and safe_file_path.suffix.lower() in [".md", ".txt", ".json", ".csv"]:
+                    try:
+                        data_text = original_content_bytes.decode("utf-8")
+                    except Exception:
+                        data_text = original_content_bytes.decode("latin-1", errors="replace")
+                
+                # (Removed auto-override of mime_type to markdown to keep original file format)
+                pass
 
             return PreviewDocumentResponse(
                 workspace_id=resolved_workspace_id,

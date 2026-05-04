@@ -1101,3 +1101,57 @@ Truy vấn Gốc: Lợi ích của điện toán đám mây là gì?
 Truy vấn Đã sửa: Lợi ích của điện toán đám mây là gì?
 """,
 ]
+
+PROMPTS["query_analysis"] = """---Role---
+You are an expert query analyzer for a Retrieval-Augmented Generation (RAG) system. Your task is to normalize, classify, and extract keywords from the user's query in a single step.
+
+---Goal---
+Analyze the user query and return a single JSON object containing:
+1. **normalized_query**: The query with spelling errors, typos, and OCR artifacts (e.g., "0" -> "O", "Al" -> "AI") corrected, while preserving original intent and technical terms/IDs.
+2. **intent**: Classify the query intent into one of three categories:
+   - 'BYPASS': General conversation, greetings, or questions about the assistant's capabilities.
+   - 'GLOBAL': Questions asking for summaries, broad overviews, or general themes across documents.
+   - 'SEARCH': Questions asking for specific facts, details, entities, or comparisons.
+3. **high_level_keywords**: Overarching concepts, themes, or subject areas.
+4. **low_level_keywords**: Specific entities, proper nouns, technical terms, or concrete items.
+
+---Instructions---
+1. **Output Format**: MUST be a valid JSON object. Do not include any explanatory text or markdown fences.
+2. **Language**: Use the language of the query. Preserve proper nouns/technical terms in their original language.
+3. **Context**: Use the provided Conversation History to resolve pronouns or implicit references.
+
+---Data---
+Conversation History:
+{history}
+
+User Query: {query}
+
+---Output---
+"""
+
+PROMPTS["query_analysis_vi"] = """---Vai trò---
+Bạn là chuyên gia phân tích truy vấn cấp cao cho hệ thống RAG (Tạo sinh Tăng cường Truy xuất). Nhiệm vụ của bạn là chuẩn hóa, phân loại và trích xuất từ khóa từ truy vấn của người dùng trong một bước duy nhất.
+
+---Mục tiêu---
+Phân tích truy vấn người dùng và trả về một đối tượng JSON duy nhất chứa:
+1. **normalized_query**: Truy vấn đã được sửa lỗi chính tả, lỗi gõ phím và lỗi OCR (ví dụ: "0" -> "O", "Al" -> "AI") và chuẩn hóa dấu tiếng Việt, nhưng vẫn giữ nguyên ý định và các thuật ngữ kỹ thuật/mã số.
+2. **intent**: Phân loại ý định truy vấn vào một trong ba loại:
+   - 'BYPASS': Các câu chào hỏi, giao tiếp thông thường, hoặc câu hỏi về khả năng của trợ lý (không cần tra cứu tài liệu).
+   - 'GLOBAL': Các câu hỏi yêu cầu tóm tắt toàn bộ tài liệu, tìm chủ đề chung, hoặc cái nhìn tổng quan.
+   - 'SEARCH': Các câu hỏi yêu cầu tìm kiếm sự thật, chi tiết, hoặc thực thể cụ thể trong tài liệu.
+3. **high_level_keywords**: Các khái niệm, chủ đề hoặc lĩnh vực cốt lõi của câu hỏi.
+4. **low_level_keywords**: Các thực thể cụ thể, danh từ riêng, thuật ngữ chuyên ngành hoặc chi tiết cụ thể.
+
+---Hướng dẫn---
+1. **Định dạng Đầu ra**: BẮT BUỘC là một đối tượng JSON hợp lệ. Không có văn bản giải thích hay ký hiệu markdown.
+2. **Ngôn ngữ**: Sử dụng ngôn ngữ của truy vấn (thường là tiếng Việt). Giữ nguyên danh từ riêng/thuật ngữ tiếng Anh.
+3. **Ngữ cảnh**: Sử dụng Lịch sử cuộc trò chuyện để giải quyết các đại từ hoặc tham chiếu ẩn dụ.
+
+---Dữ liệu---
+Lịch sử cuộc trò chuyện:
+{history}
+
+Truy vấn người dùng: {query}
+
+---Đầu ra---
+"""

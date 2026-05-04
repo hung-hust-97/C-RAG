@@ -9,33 +9,11 @@ from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
+from dataclasses import asdict
+from lightrag.operate import analyze_query
 
 router = APIRouter(tags=["query"])
 
-async def _classify_query_intent(query: str, current_rag) -> str:
-    """Classifies the query into 'bypass', 'global', or 'search'."""
-    system_prompt = "You are an intelligent query router for a Retrieval-Augmented Generation (RAG) system."
-    prompt = f"""Analyze the user's query and determine the most appropriate processing mode from the following options:
-
-1. 'BYPASS': Use this if the query is a general conversation, greeting, pleasantry, or a question about your capabilities (e.g., 'Hello', 'Xin chào', 'What can you do?', 'Bạn làm được gì?'). These don't require searching the knowledge base.
-2. 'GLOBAL': Use this if the query asks for a high-level summary, overview, or broad conceptual understanding of the documents/knowledge base as a whole, without focusing on specific entities (e.g., 'Tóm tắt các tài liệu', 'What are the main themes of the documents?', 'Tổng quan về dữ liệu', 'Danh sách các văn bản').
-3. 'SEARCH': Use this for all other queries that ask for specific facts, details, entities, or relationships that require searching the knowledge base (e.g., 'Who is John Doe?', 'Khi nào dự án A bắt đầu?', 'So sánh X và Y').
-
-User query: "{query}"
-
-Reply STRICTLY with exactly ONE word: 'BYPASS', 'GLOBAL', or 'SEARCH'."""
-    try:
-        response = await current_rag.llm_model_func(prompt, system_prompt=system_prompt)
-        content = response.strip().upper() if isinstance(response, str) else ""
-        if "BYPASS" in content:
-            return "bypass"
-        elif "GLOBAL" in content:
-            return "global"
-        else:
-            return "search"
-    except Exception as e:
-        logger.warning(f"Intent classification failed, defaulting to SEARCH mode: {e}")
-        return "search"
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -463,7 +441,25 @@ def create_query_routes(
             param.stream = False
 
             if request.mode != "bypass":
-                intent_mode = await _classify_query_intent(request.query, current_rag)
+                # Consolidate normalization, classification, and keyword extraction
+                analysis = await analyze_query(
+                    request.query,
+                    param,
+                    asdict(current_rag),
+                    hashing_kv=current_rag.llm_response_cache
+                )
+
+                # Update query with normalized version
+                request.query = analysis.get("normalized_query", request.query)
+
+                # Pre-populate keywords to avoid redundant extraction in kg_query
+                param.hl_keywords = analysis.get("high_level_keywords", [])
+                param.ll_keywords = analysis.get("low_level_keywords", [])
+
+                # Disable redundant spell correction since we just did it
+                param.enable_spell_correction = False
+
+                intent_mode = analysis.get("intent", "SEARCH").lower()
                 if intent_mode == "bypass":
                     request.mode = "bypass"
                     param.mode = "bypass"
@@ -739,7 +735,25 @@ def create_query_routes(
             from fastapi.responses import StreamingResponse
 
             if request.mode != "bypass":
-                intent_mode = await _classify_query_intent(request.query, current_rag)
+                # Consolidate normalization, classification, and keyword extraction
+                analysis = await analyze_query(
+                    request.query,
+                    param,
+                    asdict(current_rag),
+                    hashing_kv=current_rag.llm_response_cache
+                )
+
+                # Update query with normalized version
+                request.query = analysis.get("normalized_query", request.query)
+
+                # Pre-populate keywords to avoid redundant extraction in kg_query
+                param.hl_keywords = analysis.get("high_level_keywords", [])
+                param.ll_keywords = analysis.get("low_level_keywords", [])
+
+                # Disable redundant spell correction since we just did it
+                param.enable_spell_correction = False
+
+                intent_mode = analysis.get("intent", "SEARCH").lower()
                 if intent_mode == "bypass":
                     request.mode = "bypass"
                     param.mode = "bypass"

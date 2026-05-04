@@ -3638,6 +3638,83 @@ async def get_keywords_from_query(
     return hl_keywords, ll_keywords
 
 
+async def analyze_query(
+    query: str,
+    param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+) -> dict[str, Any]:
+    """
+    Consolidate normalization, classification, and entity extraction into a single LLM call.
+    Returns a JSON object with:
+    - normalized_query: Corrected query
+    - intent: 'BYPASS', 'GLOBAL', or 'SEARCH'
+    - high_level_keywords: List of broad concepts
+    - low_level_keywords: List of specific entities
+    """
+    # Initialize PromptManager for language-aware prompt retrieval
+    prompt_manager = PromptManager(PROMPTS)
+    
+    # Build history string
+    history_str = ""
+    if param.conversation_history:
+        # Use last 5 turns for context to avoid token bloat
+        history_str = "\n".join(
+            [
+                f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}"
+                for m in param.conversation_history[-5:]
+            ]
+        )
+
+    # Build the analysis prompt using PromptManager
+    analysis_prompt = prompt_manager.get_prompt(
+        "query_analysis", auto_detect_text=query
+    ).format(
+        query=query,
+        history=history_str
+    )
+
+    tokenizer: Tokenizer = global_config["tokenizer"]
+    len_of_prompts = len(tokenizer.encode(analysis_prompt))
+    logger.info(
+        f"[analyze_query] Analyzing query: '{query[:50]}...' ({len_of_prompts:,} tokens)"
+    )
+
+    # Call the LLM for unified analysis
+    if param.model_func:
+        use_model_func = param.model_func
+    else:
+        use_model_func = global_config["llm_model_func"]
+        # Apply higher priority (5) to query analysis
+        use_model_func = partial(use_model_func, _priority=5)
+
+    result = await use_model_func(
+        analysis_prompt,
+        system_prompt="You are a query analyzer. Output ONLY a valid JSON object.",
+        history_messages=param.conversation_history,
+    )
+
+    # Parse JSON result
+    result = remove_think_tags(result)
+    try:
+        analysis_data = json_repair.loads(result)
+        if not analysis_data:
+            logger.error("No JSON-like structure found in the LLM response.")
+            raise ValueError("Empty LLM response")
+    except Exception as e:
+        logger.error(f"JSON parsing error in analyze_query: {e}")
+        logger.error(f"LLM response: {result}")
+        # Return safe fallback
+        return {
+            "normalized_query": query,
+            "intent": "SEARCH",
+            "high_level_keywords": [],
+            "low_level_keywords": []
+        }
+
+    return analysis_data
+
+
 async def extract_keywords_only(
     text: str,
     param: QueryParam,

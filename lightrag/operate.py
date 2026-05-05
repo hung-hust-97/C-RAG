@@ -4703,6 +4703,15 @@ async def _build_query_context(
         f"[_build_query_context] Raw data entities: {len(raw_data.get('data', {}).get('entities', []))}, relationships: {len(raw_data.get('data', {}).get('relationships', []))}, chunks: {len(raw_data.get('data', {}).get('chunks', []))}"
     )
 
+    # CRITICAL: Check if context is too weak/empty to prevent hallucination
+    # If context is very short (< 100 chars of actual content), it's likely irrelevant
+    if context:
+        # Remove markdown headers and whitespace to get actual content length
+        content_only = context.replace("# Knowledge Graph Data", "").replace("## Entities", "").replace("## Relationships", "").replace("# Document Chunks", "").strip()
+        if len(content_only) < 100:
+            logger.warning(f"[_build_query_context] Context too short ({len(content_only)} chars), likely irrelevant. Returning None to prevent hallucination.")
+            return None
+
     return QueryContextResult(context=context, raw_data=raw_data)
 
 

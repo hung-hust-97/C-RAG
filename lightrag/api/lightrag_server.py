@@ -1106,6 +1106,10 @@ def create_app(args):
     # Initialize RAG with unified configuration
     try:
         rag = build_rag_instance(args.workspace)
+        # Register the initial instance in the workspace cache
+        startup_workspace = (args.workspace or "").strip()
+        rag_instances[startup_workspace] = rag
+        logger.info(f"Initialized default RAG instance for workspace: '{startup_workspace}'")
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
@@ -1708,23 +1712,23 @@ def configure_logging():
                 # Configure all uvicorn related loggers
                 "uvicorn": {
                     "handlers": ["console", "file"],
-                    "level": "INFO",
+                    "level": global_args.log_level,
                     "propagate": False,
                 },
                 "uvicorn.access": {
                     "handlers": ["console", "file"],
-                    "level": "INFO",
+                    "level": global_args.log_level,
                     "propagate": False,
                     "filters": ["path_filter"],
                 },
                 "uvicorn.error": {
                     "handlers": ["console", "file"],
-                    "level": "INFO",
+                    "level": global_args.log_level,
                     "propagate": False,
                 },
                 "lightrag": {
                     "handlers": ["console", "file"],
-                    "level": "INFO",
+                    "level": global_args.log_level,
                     "propagate": False,
                     "filters": ["path_filter"],
                 },

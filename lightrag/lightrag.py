@@ -25,6 +25,7 @@ from typing import (
     Union,
 )
 from lightrag.prompt import PROMPTS
+from lightrag.prompt_manager import PromptManager
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
@@ -2198,6 +2199,8 @@ class LightRAG:
                                     {
                                         doc_id: {
                                             "status": DocStatus.CHUNKING,
+                                            "error_msg": None,
+                                            "error_stage": None,
                                             "chunks_count": len(chunks),
                                             "chunks_list": list(
                                                 chunks.keys()
@@ -2328,6 +2331,8 @@ class LightRAG:
                                     {
                                         doc_id: {
                                             "status": DocStatus.PROCESSED,
+                                            "error_msg": None,
+                                            "error_stage": None,
                                             "chunks_count": len(chunks),
                                             "chunks_list": list(chunks.keys()),
                                             "content_summary": status_doc.content_summary,
@@ -3034,6 +3039,14 @@ class LightRAG:
                 use_llm_func = param.model_func or global_config["llm_model_func"]
                 # Apply higher priority (8) to entity/relation summary tasks
                 use_llm_func = partial(use_llm_func, _priority=8)
+
+                # Use bypass system prompt if no custom system_prompt provided
+                if not system_prompt:
+                    prompt_manager = PromptManager(PROMPTS)
+                    system_prompt = prompt_manager.get_prompt(
+                        "bypass_system_prompt",
+                        auto_detect_text=query.strip()
+                    )
 
                 param.stream = True if param.stream is None else param.stream
                 response = await use_llm_func(

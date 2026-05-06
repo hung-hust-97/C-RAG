@@ -252,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workspace",
         type=str,
-        default=get_env_value("WORKSPACE", ""),
+        default=get_env_value("WORKSPACE", "default"),
         help="Default workspace for all storage",
     )
 

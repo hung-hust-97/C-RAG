@@ -3118,7 +3118,18 @@ def create_document_routes(
         workspace_id: Optional[str] = None,
         download: bool = False,
     ):
-        """Return an uploaded source document as PDF base64.
+        """Preview or download an uploaded source document.
+
+        Args:
+            file_path: Path to the document file
+            workspace_id: Optional workspace identifier
+            download: If True, returns base64-encoded original file for download.
+                     If False (default), returns markdown/text preview only.
+
+        Returns:
+            PreviewDocumentResponse with either:
+            - download=True: data_base64 populated, data_text is None
+            - download=False: data_text populated (if available), data_base64 is None
 
         Security notes:
         - Path traversal is blocked by `validate_file_path_security`.
@@ -3157,19 +3168,6 @@ def create_document_routes(
                     ),
                 )
 
-            # --- PRIMARY FILE CONTENT (DISK) ---
-            # Always load the original file for base64 encoding
-            original_content_bytes: bytes | None = None
-            async with aiofiles.open(safe_file_path, "rb") as f:
-                original_content_bytes = await f.read()
-            
-            if original_content_bytes is None:
-                raise HTTPException(status_code=500, detail="Failed to load original document content")
-            
-            data_base64 = base64.b64encode(original_content_bytes).decode("ascii")
-            
-            # --- OPTIONAL TEXT PREVIEW (DB or SIBLING FILE) ---
-            data_text: str | None = None
             # Default to original file info
             output_name = safe_file_path.name
             
@@ -3197,7 +3195,21 @@ def create_document_routes(
                 }
                 mime_type = mapping.get(extension, "application/octet-stream")
             
-            if not download:
+            # Initialize response fields
+            data_base64: str | None = None
+            data_text: str | None = None
+            
+            if download:
+                # --- DOWNLOAD MODE: Return base64 only ---
+                async with aiofiles.open(safe_file_path, "rb") as f:
+                    original_content_bytes = await f.read()
+                
+                if original_content_bytes is None:
+                    raise HTTPException(status_code=500, detail="Failed to load original document content")
+                
+                data_base64 = base64.b64encode(original_content_bytes).decode("ascii")
+            else:
+                # --- PREVIEW MODE: Return markdown/text only ---
                 # 1. Try DB-first for markdown (S3/MINIO FULL_DOCS SUPPORT)
                 try:
                     existing_doc_data = await current_rag.doc_status.get_doc_by_file_path(
@@ -3221,13 +3233,14 @@ def create_document_routes(
 
                 # 3. If the original file itself is a text-based file
                 if data_text is None and safe_file_path.suffix.lower() in [".md", ".txt", ".json", ".csv"]:
+                    # Load original content for text extraction
+                    async with aiofiles.open(safe_file_path, "rb") as f:
+                        original_content_bytes = await f.read()
                     try:
                         data_text = original_content_bytes.decode("utf-8")
                     except Exception:
                         data_text = original_content_bytes.decode("latin-1", errors="replace")
-                
-                # (Removed auto-override of mime_type to markdown to keep original file format)
-                pass
+
 
             return PreviewDocumentResponse(
                 workspace_id=resolved_workspace_id,

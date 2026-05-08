@@ -300,6 +300,147 @@ UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
   - All extracted content is converted to **Markdown** before being passed to the chunking pipeline.
   - Any total failure in extraction MUST result in a `FAILED` status with an appropriate error message in the database.
 
+## Citation System for LLM Responses
+
+### Overview
+LightRAG includes a comprehensive citation and reference system that automatically tracks source documents, chunks, and entities during retrieval, then formats them as citations in LLM responses. The system supports both Vietnamese legal documents and general documents with multiple citation formats.
+
+### Core Components
+Located in `lightrag/citation.py`:
+- **CitationMetadata**: Unified metadata structure for all citation types (chunks, entities, relations)
+- **CitationList**: Aggregated citation list with format and workspace information
+- **CitationTracker**: In-memory tracker with O(1) deduplication during query execution
+- **CitationRenderer**: Renders citations in inline, footnote, or bibliography format
+
+### Document Type Classification
+Documents are classified at ingestion time:
+- **`doc_type="legal"`**: Vietnamese legal documents (Luật, Nghị định, Thông tư)
+  - Chunked by article boundaries (Điều) with chapter context (Chương)
+  - Citations include legal metadata: document_type, issuing_authority, legal_status, document_number
+  - Format: `[Khoản X] [Điều Y] [Loại] số [Số hiệu] của [Cơ quan] ([Trạng thái])`
+- **`doc_type="general"`**: General documents (default)
+  - Chunked by markdown headers with breadcrumb navigation
+  - Citations include file path and hierarchical context
+  - Format: `[Section] > [Subsection] (Document Name)`
+
+### Chunking Strategies
+Located in `lightrag/operate.py`:
+- **`legal_chunking_markdown()`**: Clause-aware chunking for Vietnamese legal documents
+  - Splits by article boundaries (Điều) using regex `^#+ Điều \d+`
+  - **Intelligent clause handling**: When an article exceeds token limits, detects clause structure (Khoản) and groups clauses to fit within token boundaries
+  - Clause patterns detected: `1.`, `2.` (numbered), `a)`, `b)` (lettered), `a.`, `b.` (sub-clauses)
+  - Prepends hierarchical context: `[Chương X] [Điều Y] [Khoản Z]` or `[Chương X] [Điều Y] [Khoản 1-3]` for clause ranges
+  - **Fallback behavior**: If no clause structure detected in oversized article, falls back to token-based splitting with warning
+  - Context metadata includes `chapter`, `article`, and `clauses` fields for precise citation
+- **`general_semantic_chunking_markdown()`**: Splits by markdown headers, maintains breadcrumb stack
+- **`select_chunking_function()`**: Auto-selects strategy based on `doc_type`
+
+**Legal Chunking Benefits:**
+- Preserves legal semantic units (complete clauses, not mid-clause splits)
+- Enables precise citations: "Khoản 2, Điều 15, Chương III"
+- Improves RAG quality by maintaining clause context and relationships
+- Optimizes token usage by grouping related clauses together
+
+### Citation Formats
+Three formats supported via `CitationRenderer`:
+1. **Inline**: `[1: Document Title, Section]` - citations embedded directly in text
+2. **Footnote**: `[1]` in text + footnotes at bottom with title, workspace, score
+3. **Bibliography**: `[1]` in text + full bibliography at end with complete metadata
+
+### API Integration
+
+#### Query API (`/query`)
+Request parameters:
+```python
+enable_citations: bool = True  # Enable/disable citation tracking
+citation_format: Literal["inline", "footnote", "bibliography"] = "footnote"
+citation_order: Literal["relevance", "appearance"] = "relevance"
+```
+
+Response fields:
+```python
+citations: Optional[CitationList] = None  # Full citation list with metadata
+citation_count: int = 0  # Number of citations used
+```
+
+#### Citation Lookup API (`/citations/{citation_id}`)
+Retrieve full source content for any citation:
+```bash
+GET /citations/doc-550e8400:chunk-1
+```
+
+Returns document content, chunk content, and metadata including hierarchy context.
+
+#### Legal Metadata Update API (`/documents/{doc_id}/legal_metadata`)
+Update legal metadata without re-ingestion:
+```bash
+PATCH /documents/doc-550e8400/legal_metadata
+{
+  "legal_status": "Hết hiệu lực",
+  "effective_date": "2024-01-01",
+  "issuing_authority": "Chính phủ"
+}
+```
+
+Changes propagate to all chunks automatically.
+
+### Multi-Workspace Support
+- Citations include workspace identifier to distinguish between user documents and legal domain documents
+- Workspace information appears in all citation formats
+- `CitationList.workspaces_used` tracks all workspaces contributing to response
+
+### Advanced Features
+- **Citation Validation**: Detects invalid citation IDs (LLM hallucinations) and replaces with `[?]`
+- **Citation Aggregation**: Consecutive IDs `[1,2,3,4,5]` → `[1-5]` for readability
+- **Confidence Levels**: High (≥0.8), Medium (0.5-0.8), Low (<0.5) based on relevance_score
+- **Table Citations**: Entire tables cited as single unit, not split across chunks
+- **Error Handling**: Graceful degradation for missing metadata with fallback to file_path
+
+### Testing
+Property-based tests (Hypothesis) in `tests/test_citation_*_property.py`:
+- Citation completeness, ID uniqueness, metadata accuracy
+- Format consistency, marker preservation
+- Multi-workspace attribution, deduplication
+- Vietnamese legal citation format
+- Citation relevance ordering, metadata retrieval
+
+Unit tests cover chunking strategies, validation, aggregation, and error handling.
+
+### Performance
+- Citation tracking overhead: < 10ms per query
+- Citation rendering overhead: < 50ms per query
+- In-memory storage during query execution for minimal latency
+- O(1) deduplication using dictionaries
+
+### Usage Example
+```python
+# Query with citations enabled
+result = await rag.aquery(
+    query="Thuế GTGT là gì?",
+    param=QueryParam(
+        mode="hybrid",
+        enable_citations=True,
+        citation_format="footnote",
+        citation_order="relevance"
+    )
+)
+
+# Access citations
+print(result.response)  # Response with [1], [2] markers
+print(result.citation_count)  # Number of citations
+for citation in result.citations.citations:
+    print(f"[{citation.citation_id}] {citation.formatted_ref}")
+```
+
+### Key Files
+- `lightrag/citation.py`: Core citation classes and rendering logic
+- `lightrag/operate.py`: Chunking strategies and citation tracking integration
+- `lightrag/lightrag.py`: Main query flow with citation system integration
+- `lightrag/api/routers/query_routes.py`: Query and citation lookup endpoints
+- `lightrag/api/routers/document_routes.py`: Legal metadata update endpoint
+- `tests/test_citation_*_property.py`: Property-based tests
+- `.kiro/specs/citation-system/`: Requirements, design, and tasks documentation
+
 ## Automation & Agent Workflow
 - Use repo-relative `workdir` arguments for every shell command and prefer `rg`/`rg --files` for searches since they are faster under the CLI harness.
 - Default edits to ASCII, rely on `apply_patch` for single-file changes, and only add concise comments that aid comprehension of complex logic.

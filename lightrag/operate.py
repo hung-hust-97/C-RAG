@@ -219,6 +219,446 @@ def chunking_by_token_size(
     return results
 
 
+def legal_chunking_markdown(
+    tokenizer: Tokenizer,
+    content: str,
+    split_by_character: str | None = None,
+    split_by_character_only: bool = False,
+    chunk_overlap_token_size: int = 100,
+    chunk_token_size: int = 1200,
+) -> list[dict[str, Any]]:
+    """Chunking for Vietnamese legal documents with clause-aware splitting.
+    
+    This function splits legal documents by article boundaries (Điều) while preserving
+    chapter context (Chương). When an article exceeds token limits, it intelligently
+    splits by clause boundaries (Khoản) and groups clauses to fit within token limits.
+    
+    Clause detection patterns:
+    - Numbered clauses: "1.", "2.", "3." at line start
+    - Lettered clauses: "a)", "b)", "c)" at line start
+    - Nested sub-clauses: "a.", "b.", "c." at line start
+    
+    Args:
+        tokenizer: Tokenizer for counting tokens
+        content: Markdown content of the legal document
+        chunk_token_size: Maximum tokens per chunk (default: 1200)
+        chunk_overlap_token_size: Token overlap between chunks (default: 100)
+    
+    Returns:
+        List of chunk dictionaries with keys:
+        - tokens: Number of tokens in the chunk
+        - content: Chunk content with context prefix
+        - chunk_order_index: Sequential index of the chunk
+        - context: Dict with 'chapter', 'article', and optional 'clauses' keys
+    """
+    import re
+    
+    chunks = []
+    current_chapter = ""
+    current_article = ""
+    
+    # Patterns for detecting legal structure
+    chapter_pattern = re.compile(r'^(#+)\s*(Chương\s+[IVXLCDM]+[:\s].*?)$', re.MULTILINE)
+    article_pattern = re.compile(r'^(#+)\s*(Điều\s+\d+[:\s].*?)$', re.MULTILINE)
+    
+    # Clause patterns: numbered (1., 2.), lettered (a), b)), sub-clauses (a., b.)
+    clause_pattern = re.compile(r'^(\d+\.|[a-z]\)|[a-z]\.)\s+', re.MULTILINE)
+    
+    # Split content into lines for processing
+    lines = content.split('\n')
+    current_article_lines = []
+    
+    def build_context_prefix(clause_range: str = ""):
+        """Build the context prefix for chunks.
+        
+        Args:
+            clause_range: Optional clause range like "Khoản 1-3" or "Khoản 1"
+        """
+        prefix_parts = []
+        if current_chapter:
+            prefix_parts.append(f"[{current_chapter}]")
+        if current_article:
+            prefix_parts.append(f"[{current_article}]")
+        if clause_range:
+            prefix_parts.append(f"[{clause_range}]")
+        return " ".join(prefix_parts) + ("\n\n" if prefix_parts else "")
+    
+    def parse_clauses(article_content: str) -> list[dict[str, Any]]:
+        """Parse article content into clauses.
+        
+        Returns:
+            List of dicts with 'identifier' (e.g., "1.", "a)") and 'content' keys
+        """
+        article_lines = article_content.split('\n')
+        clauses = []
+        current_clause = None
+        
+        for line in article_lines:
+            clause_match = clause_pattern.match(line)
+            if clause_match:
+                # Save previous clause if any
+                if current_clause is not None:
+                    clauses.append(current_clause)
+                
+                # Start new clause
+                current_clause = {
+                    'identifier': clause_match.group(1),
+                    'content': line
+                }
+            else:
+                # Continue current clause or add to preamble
+                if current_clause is not None:
+                    current_clause['content'] += '\n' + line
+                else:
+                    # Preamble before first clause
+                    if clauses or line.strip():
+                        if not clauses:
+                            clauses.append({
+                                'identifier': '',
+                                'content': line
+                            })
+                        else:
+                            clauses[0]['content'] += '\n' + line
+        
+        # Save last clause
+        if current_clause is not None:
+            clauses.append(current_clause)
+        
+        return clauses
+    
+    def format_clause_range(start_idx: int, end_idx: int, clauses: list) -> str:
+        """Format clause range for context prefix.
+        
+        Args:
+            start_idx: Starting clause index (0-based)
+            end_idx: Ending clause index (0-based, inclusive)
+            clauses: List of clause dicts
+        
+        Returns:
+            Formatted string like "Khoản 1-3" or "Khoản 1"
+        """
+        if start_idx == end_idx:
+            identifier = clauses[start_idx]['identifier'].rstrip('.)').strip()
+            return f"Khoản {identifier}" if identifier else ""
+        else:
+            start_id = clauses[start_idx]['identifier'].rstrip('.)').strip()
+            end_id = clauses[end_idx]['identifier'].rstrip('.)').strip()
+            if start_id and end_id:
+                return f"Khoản {start_id}-{end_id}"
+            return ""
+    
+    def create_chunks_from_article(article_content: str):
+        """Create one or more chunks from article content, respecting clause boundaries."""
+        if not article_content.strip():
+            return
+        
+        context_prefix = build_context_prefix()
+        full_content = context_prefix + article_content.strip()
+        
+        # Tokenize the full content
+        tokens = tokenizer.encode(full_content)
+        
+        # If content fits in one chunk, create single chunk
+        if len(tokens) <= chunk_token_size:
+            chunks.append({
+                "tokens": len(tokens),
+                "content": full_content,
+                "chunk_order_index": len(chunks),
+                "context": {
+                    "chapter": current_chapter,
+                    "article": current_article,
+                }
+            })
+            return
+        
+        # Article is too large - try to split by clauses
+        clauses = parse_clauses(article_content)
+        
+        # If no clauses detected or only one clause, fall back to token-based splitting
+        if len(clauses) <= 1:
+            logger.warning(
+                f"Article '{current_article}' exceeds token limit ({len(tokens)} > {chunk_token_size}) "
+                f"but no clause structure detected. Falling back to token-based splitting."
+            )
+            for start in range(0, len(tokens), chunk_token_size - chunk_overlap_token_size):
+                chunk_tokens = tokens[start : start + chunk_token_size]
+                chunk_content = tokenizer.decode(chunk_tokens)
+                
+                if not chunk_content.startswith(context_prefix):
+                    chunk_content = context_prefix + chunk_content
+                
+                chunks.append({
+                    "tokens": len(chunk_tokens),
+                    "content": chunk_content.strip(),
+                    "chunk_order_index": len(chunks),
+                    "context": {
+                        "chapter": current_chapter,
+                        "article": current_article,
+                    }
+                })
+            return
+        
+        # Group clauses to fit within token limits
+        current_group = []
+        current_group_start_idx = 0
+        
+        for i, clause in enumerate(clauses):
+            # Build tentative chunk with current group + new clause
+            tentative_group = current_group + [clause]
+            tentative_content = '\n\n'.join([c['content'] for c in tentative_group])
+            
+            # Determine clause range for context
+            clause_range = format_clause_range(current_group_start_idx, i, clauses)
+            tentative_prefix = build_context_prefix(clause_range)
+            tentative_full = tentative_prefix + tentative_content
+            tentative_tokens = len(tokenizer.encode(tentative_full))
+            
+            # If adding this clause exceeds limit and we have clauses in current group
+            if tentative_tokens > chunk_token_size and current_group:
+                # Save current group as chunk
+                group_content = '\n\n'.join([c['content'] for c in current_group])
+                group_range = format_clause_range(current_group_start_idx, i - 1, clauses)
+                group_prefix = build_context_prefix(group_range)
+                group_full = group_prefix + group_content
+                
+                chunks.append({
+                    "tokens": len(tokenizer.encode(group_full)),
+                    "content": group_full.strip(),
+                    "chunk_order_index": len(chunks),
+                    "context": {
+                        "chapter": current_chapter,
+                        "article": current_article,
+                        "clauses": group_range,
+                    }
+                })
+                
+                # Start new group with current clause
+                current_group = [clause]
+                current_group_start_idx = i
+            else:
+                # Add clause to current group
+                current_group.append(clause)
+        
+        # Save remaining group
+        if current_group:
+            group_content = '\n\n'.join([c['content'] for c in current_group])
+            group_range = format_clause_range(current_group_start_idx, len(clauses) - 1, clauses)
+            group_prefix = build_context_prefix(group_range)
+            group_full = group_prefix + group_content
+            
+            chunks.append({
+                "tokens": len(tokenizer.encode(group_full)),
+                "content": group_full.strip(),
+                "chunk_order_index": len(chunks),
+                "context": {
+                    "chapter": current_chapter,
+                    "article": current_article,
+                    "clauses": group_range,
+                }
+            })
+    
+    # Process content line by line
+    for line in lines:
+        # Check for chapter header
+        chapter_match = chapter_pattern.match(line)
+        if chapter_match:
+            # Save previous article if any
+            if current_article_lines:
+                create_chunks_from_article('\n'.join(current_article_lines))
+                current_article_lines = []
+            
+            # Update current chapter
+            current_chapter = chapter_match.group(2).strip()
+            continue
+        
+        # Check for article header
+        article_match = article_pattern.match(line)
+        if article_match:
+            # Save previous article if any
+            if current_article_lines:
+                create_chunks_from_article('\n'.join(current_article_lines))
+                current_article_lines = []
+            
+            # Update current article
+            current_article = article_match.group(2).strip()
+            continue
+        
+        # Accumulate lines for current article
+        current_article_lines.append(line)
+    
+    # Process any remaining article content
+    if current_article_lines:
+        create_chunks_from_article('\n'.join(current_article_lines))
+    
+    return chunks
+
+
+def general_semantic_chunking_markdown(
+    tokenizer: Tokenizer,
+    content: str,
+    split_by_character: str | None = None,
+    split_by_character_only: bool = False,
+    chunk_overlap_token_size: int = 100,
+    chunk_token_size: int = 1200,
+) -> list[dict[str, Any]]:
+    """Semantic chunking for general Markdown documents with breadcrumb inheritance.
+    
+    This function splits general documents by markdown headers (H1-H6) while maintaining
+    a breadcrumb stack that tracks the header hierarchy. Each chunk includes a breadcrumb
+    prefix showing its position in the document structure.
+    
+    Args:
+        tokenizer: Tokenizer for counting tokens
+        content: Markdown content of the document
+        split_by_character: Not used (for signature compatibility)
+        split_by_character_only: Not used (for signature compatibility)
+        chunk_overlap_token_size: Token overlap between chunks (default: 100)
+        chunk_token_size: Maximum tokens per chunk (default: 1200)
+    
+    Returns:
+        List of chunk dictionaries with keys:
+        - tokens: Number of tokens in the chunk
+        - content: Chunk content with breadcrumb prefix
+        - chunk_order_index: Sequential index of the chunk
+        - context: Dict with 'breadcrumb' key containing list of header texts
+    """
+    import re
+    
+    # 1. Protect HTML tables by replacing them with placeholders
+    table_pattern = re.compile(r"<table.*?>.*?</table>", re.IGNORECASE | re.DOTALL)
+    tables = {}
+    
+    def replace_table(match):
+        placeholder = f"__TABLE_PLACEHOLDER_{len(tables)}__"
+        tables[placeholder] = match.group(0)
+        return placeholder
+    
+    content_with_placeholders = table_pattern.sub(replace_table, content)
+    
+    # 2. Split by double newlines to get blocks
+    raw_blocks = content_with_placeholders.split('\n\n')
+    
+    blocks = []
+    for raw_block in raw_blocks:
+        raw_block = raw_block.strip()
+        if not raw_block:
+            continue
+        # Restore tables
+        for placeholder, table_html in tables.items():
+            if placeholder in raw_block:
+                raw_block = raw_block.replace(placeholder, table_html)
+        blocks.append(raw_block)
+    
+    results = []
+    current_chunk_blocks = []
+    current_chunk_tokens = 0
+    chunk_index = 0
+    
+    # Breadcrumb tracking: stack of (level, text) tuples
+    breadcrumb = []  # [(level, text), ...]
+    
+    def save_chunk(blocks_to_save):
+        nonlocal chunk_index
+        if not blocks_to_save:
+            return
+        
+        # Build breadcrumb prefix
+        breadcrumb_prefix = ""
+        if breadcrumb:
+            breadcrumb_path = " > ".join([h[1] for h in breadcrumb])
+            breadcrumb_prefix = f"[{breadcrumb_path}]\n\n"
+        
+        chunk_content = breadcrumb_prefix + "\n\n".join(blocks_to_save)
+        results.append({
+            "tokens": len(tokenizer.encode(chunk_content)),
+            "content": chunk_content.strip(),
+            "chunk_order_index": chunk_index,
+            "context": {
+                "breadcrumb": [h[1] for h in breadcrumb],
+            }
+        })
+        chunk_index += 1
+    
+    for block in blocks:
+        # Check if block is a header
+        header_match = re.match(r"^(#{1,6})\s+(.*)", block)
+        if header_match:
+            level = len(header_match.group(1))
+            text = header_match.group(2).strip()
+            
+            # Update breadcrumb stack
+            # Remove headers at same or deeper level
+            while breadcrumb and breadcrumb[-1][0] >= level:
+                breadcrumb.pop()
+            # Add current header
+            breadcrumb.append((level, text))
+        
+        block_tokens = len(tokenizer.encode(block))
+        
+        # If adding this block exceeds limit AND we already have blocks
+        if current_chunk_tokens + block_tokens > chunk_token_size and current_chunk_blocks:
+            save_chunk(current_chunk_blocks)
+            current_chunk_blocks = []
+            current_chunk_tokens = 0
+        
+        # If the block itself is larger than the limit
+        if block_tokens > chunk_token_size:
+            # If it's a table, keep it intact
+            if "<table" in block.lower():
+                if current_chunk_blocks:
+                    save_chunk(current_chunk_blocks)
+                    current_chunk_blocks = []
+                    current_chunk_tokens = 0
+                save_chunk([block])
+                continue
+            else:
+                # Fallback to token-based splitting
+                if current_chunk_blocks:
+                    save_chunk(current_chunk_blocks)
+                    current_chunk_blocks = []
+                    current_chunk_tokens = 0
+                
+                block_encoded = tokenizer.encode(block)
+                for start in range(0, len(block_encoded), chunk_token_size - chunk_overlap_token_size):
+                    chunk_content = tokenizer.decode(block_encoded[start : start + chunk_token_size])
+                    save_chunk([chunk_content])
+                continue
+        
+        current_chunk_blocks.append(block)
+        current_chunk_tokens += block_tokens
+    
+    if current_chunk_blocks:
+        save_chunk(current_chunk_blocks)
+    
+    return results
+
+
+def select_chunking_function(doc_type: str) -> callable:
+    """Select appropriate chunking function based on document type.
+    
+    This function returns the appropriate chunking strategy based on the document type:
+    - "legal": Returns legal_chunking_markdown for Vietnamese legal documents
+    - "general": Returns general_semantic_chunking_markdown for general documents
+    
+    Args:
+        doc_type: Document type classification ("legal" or "general")
+    
+    Returns:
+        Callable chunking function appropriate for the document type
+    
+    Examples:
+        >>> chunking_func = select_chunking_function("legal")
+        >>> chunks = chunking_func(tokenizer, content)
+        
+        >>> chunking_func = select_chunking_function("general")
+        >>> chunks = chunking_func(tokenizer, content)
+    """
+    if doc_type == "legal":
+        return legal_chunking_markdown
+    else:  # doc_type == "general" or any other value defaults to general
+        return general_semantic_chunking_markdown
+
+
 def semantic_chunking_markdown(
     tokenizer: Tokenizer,
     content: str,
@@ -3456,6 +3896,12 @@ async def kg_query(
     ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
     hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
 
+    # Create citation tracker if citations are enabled
+    citation_tracker = None
+    if query_param.enable_citations:
+        from lightrag.citation import CitationTracker
+        citation_tracker = CitationTracker()
+    
     # Build query context (unified interface)
     context_result = await _build_query_context(
         query,
@@ -3467,6 +3913,7 @@ async def kg_query(
         text_chunks_db,
         query_param,
         chunks_vdb,
+        citation_tracker=citation_tracker,
     )
 
     if context_result is None:
@@ -3498,6 +3945,23 @@ async def kg_query(
         sys_prompt_temp = prompt_manager.get_prompt(
             "rag_response",
             auto_detect_text=query
+        )
+    
+    # Add citation instructions if citations are enabled
+    if query_param.enable_citations and citation_tracker:
+        from lightrag.citation import append_citation_instruction_to_prompt
+        from lightrag.language_detector import detect_language
+        
+        # Detect language for citation instructions
+        detected_lang = detect_language(query)
+        language = "Vietnamese" if detected_lang == "vi" else "English"
+        
+        # Append citation instructions to system prompt
+        sys_prompt_temp = append_citation_instruction_to_prompt(
+            sys_prompt_temp,
+            enable_citations=True,
+            doc_type=None,  # Support both legal and general documents
+            language=language,
         )
     
     sys_prompt = sys_prompt_temp.format(
@@ -3596,9 +4060,58 @@ async def kg_query(
                 .strip()
             )
 
+        # Render citations if enabled
+        if query_param.enable_citations and citation_tracker:
+            from lightrag.citation import CitationRenderer
+            from lightrag.language_detector import detect_language
+            from lightrag.citation_metrics import get_global_metrics_tracker
+            
+            # Detect language for citation rendering
+            detected_lang = detect_language(query)
+            language = "Vietnamese" if detected_lang == "vi" else "English"
+            
+            # Get global metrics tracker
+            metrics_tracker = get_global_metrics_tracker()
+            
+            # Create renderer and render citations
+            renderer = CitationRenderer(
+                citation_tracker=citation_tracker,
+                format=query_param.citation_format,
+                language=language,
+                metrics_tracker=metrics_tracker,
+            )
+            
+            # Render citations in the response
+            rendered_response, citation_list = renderer.render(response)
+            
+            # Track query-level usage metrics
+            metrics_tracker.track_query(
+                enable_citations=True,
+                citation_count=citation_tracker.get_citation_count(),
+                citation_format=query_param.citation_format,
+                workspaces=citation_list.workspaces_used,
+            )
+            
+            return QueryResult(
+                content=rendered_response,
+                raw_data=context_result.raw_data,
+                citations=citation_list,
+                citation_count=citation_tracker.get_citation_count(),
+            )
+        else:
+            # Track query without citations
+            from lightrag.citation_metrics import get_global_metrics_tracker
+            metrics_tracker = get_global_metrics_tracker()
+            metrics_tracker.track_query(
+                enable_citations=False,
+                citation_count=0,
+            )
+        
         return QueryResult(content=response, raw_data=context_result.raw_data)
     else:
         # Streaming response (AsyncIterator)
+        # Note: Citation rendering for streaming responses is not yet implemented
+        # The response will be streamed without citation formatting
         return QueryResult(
             response_iterator=response,
             raw_data=context_result.raw_data,
@@ -4300,9 +4813,26 @@ async def _merge_all_chunks(
     chunks_vdb: BaseVectorStorage = None,
     chunk_tracking: dict = None,
     query_embedding: list[float] = None,
+    citation_tracker: "CitationTracker" = None,
 ) -> list[dict]:
     """
     Merge chunks from different sources: vector_chunks + entity_chunks + relation_chunks.
+    
+    Args:
+        filtered_entities: List of filtered entity dictionaries
+        filtered_relations: List of filtered relation dictionaries
+        vector_chunks: List of chunks from vector search
+        query: User query string
+        knowledge_graph_inst: Knowledge graph storage instance
+        text_chunks_db: Text chunks key-value storage
+        query_param: Query parameters
+        chunks_vdb: Chunks vector database
+        chunk_tracking: Dictionary for tracking chunk sources
+        query_embedding: Query embedding vector
+        citation_tracker: Citation tracker for tracking retrieved sources (optional)
+    
+    Returns:
+        List of merged and deduplicated chunks
     """
     if chunk_tracking is None:
         chunk_tracking = {}
@@ -4319,6 +4849,7 @@ async def _merge_all_chunks(
             chunks_vdb,
             chunk_tracking=chunk_tracking,
             query_embedding=query_embedding,
+            citation_tracker=citation_tracker,
         )
 
     # Get chunks from relations
@@ -4333,6 +4864,7 @@ async def _merge_all_chunks(
             chunks_vdb,
             chunk_tracking=chunk_tracking,
             query_embedding=query_embedding,
+            citation_tracker=citation_tracker,
         )
 
     # Round-robin merge chunks from different sources with deduplication
@@ -4585,6 +5117,160 @@ async def _build_context_str(
     return result, final_data
 
 
+# Citation tracking helper functions
+def _track_chunk_citation(chunk: dict, citation_tracker: "CitationTracker", text_chunks_db: BaseKVStorage) -> None:
+    """Track a chunk in the citation tracker.
+    
+    Extracts metadata from chunk and tracks it with the citation tracker.
+    Handles both doc_type="legal" and doc_type="general" documents.
+    
+    Args:
+        chunk: Chunk dictionary with content and metadata
+        citation_tracker: Citation tracker instance
+        text_chunks_db: Text chunks storage for accessing global config
+    """
+    try:
+        # Extract basic chunk information
+        doc_id = chunk.get("doc_id", "")
+        chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
+        workspace = chunk.get("workspace", "")
+        content = chunk.get("content", "")
+        
+        # Extract metadata
+        metadata = chunk.get("metadata", {})
+        
+        # Determine document type (default to "general")
+        doc_type = metadata.get("doc_type", "general")
+        
+        # Extract common fields
+        file_path = chunk.get("file_path", metadata.get("file_path", ""))
+        relevance_score = chunk.get("score", metadata.get("relevance_score", 0.0))
+        
+        # Extract hierarchy context based on document type
+        hierarchy_path = []
+        legal_info = {}
+        
+        if doc_type == "legal":
+            # Extract legal document hierarchy from chunk metadata
+            context = metadata.get("context", {})
+            chapter = context.get("chapter", "")
+            article = context.get("article", "")
+            
+            if chapter:
+                hierarchy_path.append(chapter)
+            if article:
+                hierarchy_path.append(article)
+            
+            # Build legal_info dictionary
+            legal_info = {
+                "chapter": chapter,
+                "article": article,
+                "clause": context.get("clause", ""),
+                "document_type": metadata.get("document_type", ""),
+                "document_number": metadata.get("document_number", ""),
+                "issuing_authority": metadata.get("issuing_authority", ""),
+                "legal_status": metadata.get("legal_status", ""),
+                "effective_date": metadata.get("effective_date", ""),
+            }
+        else:
+            # Extract general document breadcrumb from chunk metadata
+            context = metadata.get("context", {})
+            breadcrumb = context.get("breadcrumb", [])
+            if breadcrumb:
+                hierarchy_path = breadcrumb
+        
+        # Prepare chunk data for citation tracker
+        chunk_data = {
+            "doc_id": doc_id,
+            "chunk_id": chunk_id,
+            "workspace": workspace,
+            "content": content,
+            "metadata": {
+                "doc_type": doc_type,
+                "file_path": file_path,
+                "hierarchy_path": hierarchy_path,
+                "relevance_score": relevance_score,
+            }
+        }
+        
+        # Add legal_info if it's a legal document
+        if doc_type == "legal" and legal_info:
+            chunk_data["metadata"]["legal_info"] = legal_info
+        
+        # Track the chunk
+        citation_tracker.track_chunk(chunk_data)
+        
+    except Exception as e:
+        logger.warning(f"Failed to track chunk citation: {e}")
+
+
+def _track_entity_citation(entity: dict, citation_tracker: "CitationTracker") -> None:
+    """Track an entity in the citation tracker.
+    
+    Args:
+        entity: Entity dictionary with name, description, and metadata
+        citation_tracker: Citation tracker instance
+    """
+    try:
+        entity_name = entity.get("entity_name", "")
+        workspace = entity.get("workspace", "")
+        description = entity.get("description", "")
+        
+        # Extract relevance score if available
+        relevance_score = entity.get("score", 0.0)
+        
+        entity_data = {
+            "entity_name": entity_name,
+            "workspace": workspace,
+            "description": description,
+            "metadata": {
+                "relevance_score": relevance_score,
+            }
+        }
+        
+        citation_tracker.track_entity(entity_data)
+        
+    except Exception as e:
+        logger.warning(f"Failed to track entity citation: {e}")
+
+
+def _track_relation_citation(relation: dict, citation_tracker: "CitationTracker") -> None:
+    """Track a relation in the citation tracker.
+    
+    Args:
+        relation: Relation dictionary with src, tgt, description, and metadata
+        citation_tracker: Citation tracker instance
+    """
+    try:
+        # Handle different relation data formats
+        if "src_tgt" in relation:
+            src_id, tgt_id = relation["src_tgt"]
+        else:
+            src_id = relation.get("src_id", "")
+            tgt_id = relation.get("tgt_id", "")
+        
+        relation_key = f"{src_id} -> {tgt_id}"
+        workspace = relation.get("workspace", "")
+        description = relation.get("description", "")
+        
+        # Extract relevance score if available
+        relevance_score = relation.get("score", 0.0)
+        
+        relation_data = {
+            "relation_key": relation_key,
+            "workspace": workspace,
+            "description": description,
+            "metadata": {
+                "relevance_score": relevance_score,
+            }
+        }
+        
+        citation_tracker.track_relation(relation_data)
+        
+    except Exception as e:
+        logger.warning(f"Failed to track relation citation: {e}")
+
+
 # Now let's update the old _build_query_context to use the new architecture
 async def _build_query_context(
     query: str,
@@ -4596,10 +5282,23 @@ async def _build_query_context(
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
+    citation_tracker: "CitationTracker" = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
     1. Search -> 2. Truncate -> 3. Merge chunks -> 4. Build LLM context
+
+    Args:
+        query: User query string
+        ll_keywords: Low-level keywords
+        hl_keywords: High-level keywords
+        knowledge_graph_inst: Knowledge graph storage instance
+        entities_vdb: Entity vector database
+        relationships_vdb: Relationship vector database
+        text_chunks_db: Text chunks key-value storage
+        query_param: Query parameters
+        chunks_vdb: Chunks vector database (optional)
+        citation_tracker: Citation tracker for tracking retrieved sources (optional)
 
     Returns unified QueryContextResult containing both context and raw_data.
     """
@@ -4628,6 +5327,23 @@ async def _build_query_context(
             if not search_result["chunk_tracking"]:
                 return None
 
+    # NEW: Track citations if citation_tracker is provided
+    if citation_tracker:
+        # Track vector chunks from naive retrieval
+        if search_result.get("vector_chunks"):
+            for chunk in search_result["vector_chunks"]:
+                _track_chunk_citation(chunk, citation_tracker, text_chunks_db)
+        
+        # Track entities
+        if search_result.get("final_entities"):
+            for entity in search_result["final_entities"]:
+                _track_entity_citation(entity, citation_tracker)
+        
+        # Track relations
+        if search_result.get("final_relations"):
+            for relation in search_result["final_relations"]:
+                _track_relation_citation(relation, citation_tracker)
+
     # Stage 2: Apply token truncation for LLM efficiency
     truncation_result = await _apply_token_truncation(
         search_result,
@@ -4647,6 +5363,7 @@ async def _build_query_context(
         chunks_vdb=chunks_vdb,
         chunk_tracking=search_result["chunk_tracking"],
         query_embedding=search_result["query_embedding"],
+        citation_tracker=citation_tracker,
     )
 
     if (
@@ -4840,6 +5557,7 @@ async def _find_related_text_unit_from_entities(
     chunks_vdb: BaseVectorStorage = None,
     chunk_tracking: dict = None,
     query_embedding=None,
+    citation_tracker: "CitationTracker" = None,
 ):
     """
     Find text chunks related to entities using configurable chunk selection method.
@@ -4847,6 +5565,20 @@ async def _find_related_text_unit_from_entities(
     This function supports two chunk selection strategies:
     1. WEIGHT: Linear gradient weighted polling based on chunk occurrence count
     2. VECTOR: Vector similarity-based selection using embedding cosine similarity
+    
+    Args:
+        node_datas: List of entity dictionaries
+        query_param: Query parameters
+        text_chunks_db: Text chunks key-value storage
+        knowledge_graph_inst: Knowledge graph storage instance
+        query: User query string
+        chunks_vdb: Chunks vector database
+        chunk_tracking: Dictionary for tracking chunk sources
+        query_embedding: Query embedding vector
+        citation_tracker: Citation tracker for tracking retrieved sources (optional)
+    
+    Returns:
+        List of chunks related to entities
     """
     logger.debug(f"Finding text chunks from {len(node_datas)} entities")
 
@@ -4986,6 +5718,10 @@ async def _find_related_text_unit_from_entities(
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
                     "order": i + 1,  # 1-based order in final entity-related results
                 }
+            
+            # NEW: Track citation if citation_tracker is provided
+            if citation_tracker is not None:
+                _track_chunk_citation(chunk_data_copy, citation_tracker, text_chunks_db)
 
     return result_chunks
 
@@ -5091,6 +5827,7 @@ async def _find_related_text_unit_from_relations(
     chunks_vdb: BaseVectorStorage = None,
     chunk_tracking: dict = None,
     query_embedding=None,
+    citation_tracker: "CitationTracker" = None,
 ):
     """
     Find text chunks related to relationships using configurable chunk selection method.
@@ -5098,6 +5835,20 @@ async def _find_related_text_unit_from_relations(
     This function supports two chunk selection strategies:
     1. WEIGHT: Linear gradient weighted polling based on chunk occurrence count
     2. VECTOR: Vector similarity-based selection using embedding cosine similarity
+    
+    Args:
+        edge_datas: List of relation dictionaries
+        query_param: Query parameters
+        text_chunks_db: Text chunks key-value storage
+        entity_chunks: List of chunks from entities (for deduplication)
+        query: User query string
+        chunks_vdb: Chunks vector database
+        chunk_tracking: Dictionary for tracking chunk sources
+        query_embedding: Query embedding vector
+        citation_tracker: Citation tracker for tracking retrieved sources (optional)
+    
+    Returns:
+        List of chunks related to relations
     """
     logger.debug(f"Finding text chunks from {len(edge_datas)} relations")
 
@@ -5281,6 +6032,10 @@ async def _find_related_text_unit_from_relations(
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
                     "order": i + 1,  # 1-based order in final relation-related results
                 }
+            
+            # NEW: Track citation if citation_tracker is provided
+            if citation_tracker is not None:
+                _track_chunk_citation(chunk_data_copy, citation_tracker, text_chunks_db)
 
     return result_chunks
 
@@ -5366,6 +6121,12 @@ async def naive_query(
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
+    # Create citation tracker if citations are enabled
+    citation_tracker = None
+    if query_param.enable_citations:
+        from lightrag.citation import CitationTracker
+        citation_tracker = CitationTracker()
+
     # Use history-aware keywords for retrieval if conversation history is present
     search_query = query
     if query_param.conversation_history:
@@ -5387,6 +6148,11 @@ async def naive_query(
             "[naive_query] No relevant document chunks found; returning no-result."
         )
         return None
+    
+    # Track citations if enabled
+    if citation_tracker:
+        for chunk in chunks:
+            _track_chunk_citation(chunk, citation_tracker, None)
 
     # Calculate dynamic token limit for chunks
     max_total_tokens = getattr(
@@ -5416,6 +6182,23 @@ async def naive_query(
         sys_prompt_template = prompt_manager.get_prompt(
             "naive_rag_response",
             auto_detect_text=query
+        )
+    
+    # Add citation instructions if citations are enabled
+    if query_param.enable_citations and citation_tracker:
+        from lightrag.citation import append_citation_instruction_to_prompt
+        from lightrag.language_detector import detect_language
+        
+        # Detect language for citation instructions
+        detected_lang = detect_language(query)
+        language = "Vietnamese" if detected_lang == "vi" else "English"
+        
+        # Append citation instructions to system prompt
+        sys_prompt_template = append_citation_instruction_to_prompt(
+            sys_prompt_template,
+            enable_citations=True,
+            doc_type=None,  # Support both legal and general documents
+            language=language,
         )
 
     # Create a preliminary system prompt with empty content_data to calculate overhead
@@ -5588,6 +6371,53 @@ async def naive_query(
                 .replace("<system>", "")
                 .replace("</system>", "")
                 .strip()
+            )
+
+        # Render citations if enabled
+        if query_param.enable_citations and citation_tracker:
+            from lightrag.citation import CitationRenderer
+            from lightrag.language_detector import detect_language
+            from lightrag.citation_metrics import get_global_metrics_tracker
+            
+            # Detect language for citation rendering
+            detected_lang = detect_language(query)
+            language = "Vietnamese" if detected_lang == "vi" else "English"
+            
+            # Get global metrics tracker
+            metrics_tracker = get_global_metrics_tracker()
+            
+            # Create renderer and render citations
+            renderer = CitationRenderer(
+                citation_tracker=citation_tracker,
+                format=query_param.citation_format,
+                language=language,
+                metrics_tracker=metrics_tracker,
+            )
+            
+            # Render citations in the response
+            rendered_response, citation_list = renderer.render(response)
+            
+            # Track query-level usage metrics
+            metrics_tracker.track_query(
+                enable_citations=True,
+                citation_count=citation_tracker.get_citation_count(),
+                citation_format=query_param.citation_format,
+                workspaces=citation_list.workspaces_used,
+            )
+            
+            return QueryResult(
+                content=rendered_response,
+                raw_data=raw_data,
+                citations=citation_list,
+                citation_count=citation_tracker.get_citation_count(),
+            )
+        else:
+            # Track query without citations
+            from lightrag.citation_metrics import get_global_metrics_tracker
+            metrics_tracker = get_global_metrics_tracker()
+            metrics_tracker.track_query(
+                enable_citations=False,
+                citation_count=0,
             )
 
         return QueryResult(content=response, raw_data=raw_data)

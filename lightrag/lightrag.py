@@ -90,6 +90,9 @@ from lightrag.namespace import NameSpace
 from lightrag.operate import (
     chunking_by_token_size,
     semantic_chunking_markdown,
+    legal_chunking_markdown,
+    general_semantic_chunking_markdown,
+    select_chunking_function,
     extract_entities,
     merge_nodes_and_edges,
     kg_query,
@@ -1349,6 +1352,7 @@ class LightRAG:
         input: str | list[str],
         ids: list[str] | None = None,
         file_paths: str | list[str] | None = None,
+        doc_type: str = "general",
     ) -> list[str]:
         """
         Pipeline for Processing Documents
@@ -1362,6 +1366,7 @@ class LightRAG:
             input: Single document string or list of document strings
             ids: list of unique document IDs, if not provided, UUID IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
+            doc_type: Document type classification ("legal" or "general", default: "general")
 
         Returns:
             list[str]: list of document IDs
@@ -1444,6 +1449,7 @@ class LightRAG:
                 "file_path": content_data["file_path"],
                 "error_msg": None,
                 "error_stage": None,
+                "metadata": {"doc_type": doc_type},
             }
 
         # 3. Filter out already processed documents using content_hash
@@ -2148,8 +2154,21 @@ class LightRAG:
                                 )
                             content = content_data["content"]
 
+                            # Get doc_type from metadata to select appropriate chunking function
+                            metadata = getattr(status_doc, "metadata", {}) or {}
+                            doc_type = metadata.get("doc_type", "general")
+                            
+                            # Select chunking function based on doc_type
+                            # If user has set a custom chunking_func, use it; otherwise use doc_type-based selection
+                            if self.chunking_func != semantic_chunking_markdown:
+                                # User has set a custom chunking function, use it
+                                selected_chunking_func = self.chunking_func
+                            else:
+                                # Use doc_type-based selection
+                                selected_chunking_func = select_chunking_function(doc_type)
+                            
                             # Call chunking function, supporting both sync and async implementations
-                            chunking_result = self.chunking_func(
+                            chunking_result = selected_chunking_func(
                                 self.tokenizer,
                                 content,
                                 split_by_character,
@@ -3112,6 +3131,8 @@ class LightRAG:
                 if query_result.is_streaming
                 else None,
                 "is_streaming": query_result.is_streaming,
+                "citations": query_result.citations,
+                "citation_count": query_result.citation_count,
             }
 
             return raw_data

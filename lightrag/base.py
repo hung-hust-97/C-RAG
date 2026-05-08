@@ -18,6 +18,12 @@ from typing import (
 )
 from .utils import EmbeddingFunc
 from .types import KnowledgeGraph
+
+# TYPE_CHECKING import to avoid circular dependency
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .citation import CitationList
+
 from .constants import (
     DEFAULT_TOP_K,
     DEFAULT_CHUNK_TOP_K,
@@ -173,6 +179,28 @@ class QueryParam:
     Uses LLM to detect and fix typos, OCR errors, and common misspellings while preserving
     technical terms, proper nouns, and the original query intent.
     Default is True to improve query quality.
+    """
+
+    enable_citations: bool = True
+    """If True, enables citation tracking and rendering in the response.
+    When enabled, the system tracks all retrieved sources (chunks, entities, relations)
+    and includes citation markers in the LLM response.
+    Default is True to provide source attribution.
+    """
+
+    citation_format: Literal["inline", "footnote", "bibliography"] = "footnote"
+    """Specifies the citation format for the response:
+    - "inline": Citations appear immediately after referenced text [N: Document Title, Chunk X]
+    - "footnote": Citation markers [N] in text with full citations at bottom
+    - "bibliography": Citation markers [N] in text with comprehensive bibliography at end
+    Default is "footnote" for balanced readability and detail.
+    """
+
+    citation_order: Literal["relevance", "appearance"] = "relevance"
+    """Specifies the ordering of citations in bibliography format:
+    - "relevance": Citations ordered by relevance score (descending)
+    - "appearance": Citations ordered by first appearance in response text
+    Default is "relevance" to prioritize most relevant sources.
     """
 
 
@@ -919,12 +947,23 @@ class QueryResult:
         response_iterator: Streaming response iterator for streaming responses
         raw_data: Complete structured data including references and metadata
         is_streaming: Whether this is a streaming result
+        citations: Optional citation list containing all source references used in the response
+        citation_count: Number of citations included in the response
     """
 
     content: Optional[str] = None
     response_iterator: Optional[AsyncIterator[str]] = None
     raw_data: Optional[Dict[str, Any]] = None
     is_streaming: bool = False
+    citations: Optional["CitationList"] = None
+    """Citation list containing all source references used in generating the response.
+    Only populated when enable_citations=True in QueryParam.
+    Includes citation metadata, format, and workspace information.
+    """
+    citation_count: int = 0
+    """Total number of citations included in the response.
+    Set to 0 when citations are disabled or no sources were cited.
+    """
 
     @property
     def reference_list(self) -> List[Dict[str, str]]:
@@ -969,3 +1008,25 @@ class QueryContextResult:
     def reference_list(self) -> List[Dict[str, str]]:
         """Convenient property to extract reference list from raw_data."""
         return self.raw_data.get("data", {}).get("references", [])
+
+
+@dataclass
+class LegalMetadataUpdate:
+    """Request model for updating legal metadata of a document.
+    
+    All fields are optional to allow partial updates. Only provided fields
+    will be updated in the document and its associated chunks.
+    
+    Attributes:
+        legal_status: Legal status (e.g., "Còn hiệu lực", "Hết hiệu lực")
+        effective_date: Effective date in ISO format (e.g., "2008-06-03")
+        issuing_authority: Issuing authority (e.g., "Quốc hội", "Chính phủ")
+        document_type: Document type (e.g., "Luật", "Nghị định", "Thông tư")
+        document_number: Document number (e.g., "13/2008/QH12")
+    """
+    
+    legal_status: Optional[str] = None
+    effective_date: Optional[str] = None
+    issuing_authority: Optional[str] = None
+    document_type: Optional[str] = None
+    document_number: Optional[str] = None

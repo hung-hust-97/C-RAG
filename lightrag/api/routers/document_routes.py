@@ -363,6 +363,7 @@ class InsertTextRequest(BaseModel):
         text: The text content to be inserted into the RAG system
         workspace_id: Workspace identifier (required)
         file_source: Source of the text (optional)
+        doc_type: Document type classification ("legal" or "general", default: "general")
     """
 
     text: str = Field(
@@ -374,6 +375,9 @@ class InsertTextRequest(BaseModel):
     )
     file_source: Optional[str] = Field(
         default=None, min_length=0, description="File Source"
+    )
+    doc_type: Literal["legal", "general"] = Field(
+        default="general", description="Document type classification"
     )
 
     @field_validator("text", mode="after")
@@ -392,6 +396,7 @@ class InsertTextRequest(BaseModel):
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "workspace_id": "my-workspace-id",
                 "file_source": "Source of the text (optional)",
+                "doc_type": "general",
             }
         }
     )
@@ -404,6 +409,7 @@ class InsertTextsRequest(BaseModel):
         texts: List of text contents to be inserted into the RAG system
         workspace_id: Workspace identifier (required)
         file_sources: Sources of the texts (optional)
+        doc_type: Document type classification ("legal" or "general", default: "general")
     """
 
     texts: list[str] = Field(
@@ -415,6 +421,9 @@ class InsertTextsRequest(BaseModel):
     )
     file_sources: Optional[list[str]] = Field(
         default=None, min_length=0, description="Sources of the texts"
+    )
+    doc_type: Literal["legal", "general"] = Field(
+        default="general", description="Document type classification"
     )
 
     @field_validator("texts", mode="after")
@@ -443,6 +452,7 @@ class InsertTextsRequest(BaseModel):
                 "file_sources": [
                     "First file source (optional)",
                 ],
+                "doc_type": "general",
             }
         }
     )
@@ -1652,7 +1662,7 @@ async def _extract_text_for_preview(file_path: Path) -> str:
 
 
 async def pipeline_enqueue_file(
-    rag: LightRAG, file_path: Path, doc_id: str = None, task_id: str = None
+    rag: LightRAG, file_path: Path, doc_id: str = None, task_id: str = None, doc_type: str = "general"
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -1660,6 +1670,8 @@ async def pipeline_enqueue_file(
         rag: LightRAG instance
         file_path: Path to the saved file
         doc_id: Optional document ID (for reprocessing existing documents)
+        task_id: Optional task ID for tracking batch operations
+        doc_type: Document type classification ("legal" or "general", default: "general")
     Returns:
         tuple: (success: bool, doc_id: str)
     """
@@ -1676,6 +1688,11 @@ async def pipeline_enqueue_file(
         
         # Create document record with status=EXTRACTING and content_hash=NULL
         try:
+            # Build metadata with doc_type
+            metadata = {"file_name": file_path.name, "doc_type": doc_type}
+            if task_id:
+                metadata["task_id"] = task_id
+            
             initial_doc_data = {
                 doc_id: {
                     "status": DocStatus.EXTRACTING,
@@ -1685,14 +1702,14 @@ async def pipeline_enqueue_file(
                     "file_path": file_path.name,
                     "chunks_list": [],
                     "content_hash": None,  # Will be set after extraction
-                    "metadata": {"file_name": file_path.name, "task_id": task_id} if task_id else {"file_name": file_path.name},
+                    "metadata": metadata,
                     "error_msg": None,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             }
             await rag.doc_status.upsert(initial_doc_data)
-            logger.info(f"[Document] Created doc_id {doc_id} with EXTRACTING status for file: {file_path.name}")
+            logger.info(f"[Document] Created doc_id {doc_id} with EXTRACTING status and doc_type={doc_type} for file: {file_path.name}")
             break  # Success - exit retry loop
             
         except Exception as e:
@@ -2218,7 +2235,7 @@ async def pipeline_enqueue_file(
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 
-async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None, resolved_workspace_id: str = None) -> str:
+async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None, resolved_workspace_id: str = None, doc_type: str = "general") -> str:
     """Index a file with optional doc_id for reprocessing
 
     Args:
@@ -2226,6 +2243,7 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None
         file_path: Path to the saved file
         doc_id: Optional document ID (for reprocessing existing documents)
         resolved_workspace_id: Resolved workspace ID (for Celery task, defaults to rag.workspace or "default")
+        doc_type: Document type classification ("legal" or "general", default: "general")
         
     Returns:
         str: The document ID (UUID-based)
@@ -2256,7 +2274,7 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None
         try:
             # Use resolved_workspace_id to ensure consistency with database
             # Empty workspace ("") is normalized to "default" for Celery tasks
-            task_extract_and_enqueue.delay(workspace_id=resolved_workspace_id, file_path_str=str(file_path), doc_id=doc_id)
+            task_extract_and_enqueue.delay(workspace_id=resolved_workspace_id, file_path_str=str(file_path), doc_id=doc_id, doc_type=doc_type)
             return doc_id
         except Exception as e:
             logger.error(f"Error enqueueing file via Celery {file_path.name}, falling back to synchronous: {str(e)}")
@@ -2264,7 +2282,7 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None
     
     # Fallback to synchronous processing
     try:
-        await pipeline_enqueue_file(rag, file_path, doc_id)
+        await pipeline_enqueue_file(rag, file_path, doc_id, doc_type=doc_type)
         return doc_id
     except Exception as e:
         logger.error(f"Error indexing file {file_path.name}: {str(e)}")
@@ -2357,6 +2375,7 @@ async def pipeline_index_texts(
     texts: List[str],
     file_sources: List[str] = None,
     doc_ids: List[str] = None,
+    doc_type: str = "general",
 ) -> List[str]:
     """Index a list of texts, generating unique doc_id for each if not provided
 
@@ -2365,6 +2384,7 @@ async def pipeline_index_texts(
         texts: The texts to index
         file_sources: Sources of the texts
         doc_ids: Optional list of doc_ids (one per text). If not provided, UUIDs will be generated.
+        doc_type: Document type classification ("legal" or "general", default: "general")
 
     Returns:
         List[str]: List of doc_ids (one per text)
@@ -2395,7 +2415,7 @@ async def pipeline_index_texts(
         raise ValueError("Number of doc_ids must match number of texts")
 
     await rag.apipeline_enqueue_documents(
-        input=texts, ids=doc_ids, file_paths=normalized_file_sources
+        input=texts, ids=doc_ids, file_paths=normalized_file_sources, doc_type=doc_type
     )
     
     # Check if Celery is available and enabled
@@ -2462,7 +2482,8 @@ async def run_scanning_process(
 
             # Process valid files (new files + non-PROCESSED status files)
             if valid_files:
-                doc_ids = await pipeline_index_files(rag, valid_files, resolved_workspace_id)
+                # Use rag.workspace as the workspace_id
+                doc_ids = await pipeline_index_files(rag, valid_files, rag.workspace)
                 if processed_files:
                     logger.info(
                         f"Scanning process completed: {len(valid_files)} files Processed {len(processed_files)} skipped."
@@ -2849,6 +2870,7 @@ def create_document_routes(
         request: Request,
         file: UploadFile = File(...),
         workspace_id: Optional[str] = Form(None),
+        doc_type: Literal["legal", "general"] = Form("general"),
     ):
         """
         Upload a file to the input directory and index it.
@@ -2861,6 +2883,12 @@ def create_document_routes(
         - Configurable via `MAX_UPLOAD_SIZE` environment variable (default: 100MB)
         - Set to `None` or `0` for unlimited upload size
         - Returns HTTP 413 (Request Entity Too Large) if file exceeds limit
+
+        **Document Type Classification:**
+        - `doc_type` parameter classifies documents as "legal" or "general" (default: "general")
+        - Legal documents use article-based chunking with Vietnamese legal metadata
+        - General documents use semantic chunking with breadcrumb context
+        - This classification affects chunking strategy and citation formatting
 
         **Duplicate Detection Behavior:**
 
@@ -2891,6 +2919,8 @@ def create_document_routes(
         Args:
             background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension.
+            workspace_id: Optional workspace identifier for multi-tenant support
+            doc_type: Document type classification ("legal" or "general", default: "general")
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -3088,7 +3118,7 @@ def create_document_routes(
             doc_id = generate_doc_id("doc-")
             
             background_tasks.add_task(
-                pipeline_index_file, current_rag, file_path, doc_id
+                pipeline_index_file, current_rag, file_path, doc_id, doc_type=doc_type
             )
 
             return InsertResponse(
@@ -3354,6 +3384,7 @@ def create_document_routes(
                 [request.text],
                 file_sources=[request.file_source],
                 doc_ids=[doc_id],
+                doc_type=request.doc_type,
             )
 
             logger.info(f"[insert_text] Returning success response")
@@ -3475,6 +3506,7 @@ def create_document_routes(
                 request.texts,
                 file_sources=request.file_sources,
                 doc_ids=doc_ids,
+                doc_type=request.doc_type,
             )
 
             return BatchInsertResponse(
@@ -4760,6 +4792,207 @@ def create_document_routes(
             raise
         except Exception as e:
             logger.error(f"Error getting document by ID '{doc_id}': {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.patch(
+        "/{doc_id}/legal_metadata",
+        response_model=DocStatusResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Update legal metadata for a document",
+    )
+    async def update_legal_metadata(
+        doc_id: str,
+        legal_metadata: Dict[str, Optional[str]],
+        request: Request,
+        workspace_id: Optional[str] = None,
+    ) -> DocStatusResponse:
+        """
+        Update legal metadata for a document without re-processing.
+        
+        This endpoint allows updating legal-specific metadata fields (legal_status,
+        effective_date, issuing_authority, document_type, document_number) for a
+        document that has doc_type="legal". The updates are propagated to all chunks
+        associated with the document without triggering re-chunking or re-extraction.
+        
+        This is useful for:
+        - Updating legal status when a law becomes effective or expires
+        - Correcting metadata errors without re-processing the entire document
+        - Keeping legal information current without re-ingestion
+        
+        Implements Requirements 20.1, 20.2, 20.3, 20.4, 20.7, 20.8:
+        - Validates that document has doc_type="legal"
+        - Updates metadata in document storage without re-processing
+        - Propagates changes to all existing chunks
+        - Returns updated document status
+        
+        Args:
+            doc_id (str): The document ID (format: doc-{uuid})
+            legal_metadata (Dict[str, Optional[str]]): Legal metadata fields to update:
+                - legal_status: Legal status (e.g., "Còn hiệu lực", "Hết hiệu lực")
+                - effective_date: Effective date (e.g., "2008-06-03")
+                - issuing_authority: Issuing authority (e.g., "Quốc hội", "Chính phủ")
+                - document_type: Document type (e.g., "Luật", "Nghị định", "Thông tư")
+                - document_number: Document number (e.g., "13/2008/QH12")
+            workspace_id (Optional[str]): Workspace identifier (optional)
+
+        Returns:
+            DocStatusResponse: Updated document status information
+
+        Raises:
+            HTTPException: 
+                - 400 if doc_id is invalid or document is not legal type
+                - 404 if document not found
+                - 500 if an error occurs during update
+        
+        Example:
+            PATCH /documents/doc-550e8400-e29b-41d4-a716-446655440000/legal_metadata
+            {
+                "legal_status": "Hết hiệu lực",
+                "effective_date": "2024-01-01"
+            }
+        """
+        try:
+            # Validate doc_id format
+            if not doc_id or not doc_id.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Document ID cannot be empty"
+                )
+            
+            doc_id = doc_id.strip()
+            
+            # Resolve workspace context
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                request, workspace_id
+            )
+            
+            # Get document by ID
+            doc_data = await current_rag.doc_status.get_by_id(doc_id)
+            
+            if not doc_data:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Document {doc_id} not found in workspace {resolved_workspace_id}"
+                )
+            
+            # Validate that document has doc_type="legal" (Requirement 20.7)
+            metadata = doc_data.get("metadata", {})
+            doc_type = metadata.get("doc_type", "general")
+            
+            if doc_type != "legal":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot update legal metadata for document with doc_type='{doc_type}'. "
+                           f"Only documents with doc_type='legal' can have legal metadata updated."
+                )
+            
+            # Filter out None values and validate field names
+            valid_fields = {
+                "legal_status",
+                "effective_date",
+                "issuing_authority",
+                "document_type",
+                "document_number"
+            }
+            
+            filtered_metadata = {
+                k: v for k, v in legal_metadata.items()
+                if v is not None and k in valid_fields
+            }
+            
+            if not filtered_metadata:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No valid legal metadata fields provided for update. "
+                           f"Valid fields: {', '.join(sorted(valid_fields))}"
+                )
+            
+            logger.info(
+                f"Updating legal metadata for document {doc_id} in workspace {resolved_workspace_id}: "
+                f"{filtered_metadata}"
+            )
+            
+            # Update metadata in document storage (Requirement 20.4)
+            # Get or create legal_info dict within metadata
+            legal_info = metadata.get("legal_info", {})
+            if not isinstance(legal_info, dict):
+                legal_info = {}
+            
+            # Update legal metadata fields
+            for field, value in filtered_metadata.items():
+                legal_info[field] = value
+            
+            # Update metadata with new legal_info
+            metadata["legal_info"] = legal_info
+            
+            # Update document in storage
+            updated_doc_data = {
+                doc_id: {
+                    **doc_data,
+                    "metadata": metadata,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+            
+            await current_rag.doc_status.upsert(updated_doc_data)
+            
+            # Propagate legal metadata to chunks (Requirement 20.5, 20.6)
+            from lightrag.citation import propagate_legal_metadata_to_chunks
+            
+            try:
+                updated_chunks_count = await propagate_legal_metadata_to_chunks(
+                    doc_id=doc_id,
+                    legal_metadata_update=filtered_metadata,
+                    doc_status_storage=current_rag.doc_status,
+                    text_chunks_storage=current_rag.text_chunks,
+                )
+                
+                logger.info(
+                    f"Successfully propagated legal metadata to {updated_chunks_count} chunks "
+                    f"for document {doc_id}"
+                )
+            except Exception as propagate_error:
+                # Log error but don't fail the request - document metadata was updated
+                logger.error(
+                    f"Failed to propagate legal metadata to chunks for document {doc_id}: "
+                    f"{str(propagate_error)}"
+                )
+                logger.error(traceback.format_exc())
+            
+            # Retrieve updated document to return
+            updated_doc = await current_rag.doc_status.get_by_id(doc_id)
+            
+            if not updated_doc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Document {doc_id} not found after update"
+                )
+            
+            # Convert to DocProcessingStatus if needed
+            if isinstance(updated_doc, dict):
+                from lightrag.base import DocProcessingStatus
+                updated_doc = DocProcessingStatus(**updated_doc)
+            
+            # Return updated document status
+            return DocStatusResponse(
+                id=doc_id,
+                content_summary=getattr(updated_doc, "content_summary", ""),
+                content_length=getattr(updated_doc, "content_length", 0),
+                status=getattr(updated_doc, "status", DocStatus.FAILED),
+                created_at=format_datetime(getattr(updated_doc, "created_at", None)),
+                updated_at=format_datetime(getattr(updated_doc, "updated_at", None)),
+                workspace_id=resolved_workspace_id,
+                chunks_count=getattr(updated_doc, "chunks_count", None),
+                error_msg=getattr(updated_doc, "error_msg", None),
+                metadata=getattr(updated_doc, "metadata", None),
+                file_path=normalize_file_path(getattr(updated_doc, "file_path", "")),
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating legal metadata for document '{doc_id}': {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

@@ -159,15 +159,21 @@ async def _get_rag(workspace_id: str):
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)
-def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, doc_id: str):
+def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, doc_id: str, doc_type: str = "general"):
     """
     Celery Task 1 – OCR & Markdown Extraction.
 
     Picks up a file from disk, runs DeepSeek/Docling to produce Markdown text,
     and writes a PENDING doc_status record. Then automatically triggers
     task_chunk_and_graph to do the heavy graph work.
+    
+    Args:
+        workspace_id: Workspace identifier
+        file_path_str: Path to the file to extract
+        doc_id: Document ID
+        doc_type: Document type classification ("legal" or "general", default: "general")
     """
-    logger.info(f"[Celery/OCR] workspace={workspace_id} file={file_path_str} doc_id={doc_id}")
+    logger.info(f"[Celery/OCR] workspace={workspace_id} file={file_path_str} doc_id={doc_id} doc_type={doc_type}")
 
     async def _run():
         from lightrag.api.routers.document_routes import pipeline_enqueue_file
@@ -179,7 +185,7 @@ def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, doc_id
             logger.error(f"[Celery/OCR] File not found: {file_path_str}")
             return False
 
-        success, _ = await pipeline_enqueue_file(rag, file_path, doc_id, task_id=self.request.id)
+        success, _ = await pipeline_enqueue_file(rag, file_path, doc_id, task_id=self.request.id, doc_type=doc_type)
         return success
 
     try:

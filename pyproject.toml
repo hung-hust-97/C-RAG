@@ -187,6 +187,12 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "offline: marks tests that can run without external services",
+    "requires_db: marks tests that require database connection",
+    "requires_api: marks tests that require API server running",
+]
 
 [tool.ruff]
 target-version = "py310"

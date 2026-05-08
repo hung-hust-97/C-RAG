@@ -117,6 +117,21 @@ class QueryRequest(BaseModel):
         description="Target workspace ID. Overrides LIGHTRAG-WORKSPACE-ID header when set.",
     )
 
+    enable_citations: Optional[bool] = Field(
+        default=None,
+        description="If True, enables citation tracking and rendering in the response. Default is True.",
+    )
+
+    citation_format: Optional[Literal["inline", "footnote", "bibliography"]] = Field(
+        default=None,
+        description="Citation format: 'inline', 'footnote', or 'bibliography'. Default is 'footnote'.",
+    )
+
+    citation_order: Optional[Literal["relevance", "appearance"]] = Field(
+        default=None,
+        description="Citation ordering: 'relevance' or 'appearance'. Default is 'relevance'.",
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
@@ -169,6 +184,14 @@ class QueryResponse(BaseModel):
     references: Optional[List[ReferenceItem]] = Field(
         default=None,
         description="Reference list (Disabled when include_references=False, /query/data always includes references.)",
+    )
+    citations: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Citation list with metadata (only present when enable_citations=True)",
+    )
+    citation_count: int = Field(
+        default=0,
+        description="Total number of citations in the response",
     )
 
 
@@ -256,8 +279,45 @@ def create_query_routes(
                                     },
                                     "description": "Reference list (only included when include_references=True)",
                                 },
+                                "citations": {
+                                    "type": "object",
+                                    "description": "Citation list with metadata (only included when enable_citations=True)",
+                                    "properties": {
+                                        "citations": {
+                                            "type": "array",
+                                            "items": {"type": "object"},
+                                            "description": "List of citation metadata objects",
+                                        },
+                                        "format": {
+                                            "type": "string",
+                                            "enum": ["inline", "footnote", "bibliography"],
+                                            "description": "Citation format used",
+                                        },
+                                        "total_sources": {
+                                            "type": "integer",
+                                            "description": "Total number of unique sources",
+                                        },
+                                        "workspaces_used": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "List of workspaces queried",
+                                        },
+                                        "legal_count": {
+                                            "type": "integer",
+                                            "description": "Number of legal citations",
+                                        },
+                                        "general_count": {
+                                            "type": "integer",
+                                            "description": "Number of general citations",
+                                        },
+                                    },
+                                },
+                                "citation_count": {
+                                    "type": "integer",
+                                    "description": "Total number of citations in the response",
+                                },
                             },
-                            "required": ["response"],
+                            "required": ["response", "citation_count"],
                         },
                         "examples": {
                             "with_references": {
@@ -305,7 +365,55 @@ def create_query_routes(
                                 "summary": "Response without references",
                                 "description": "Example response when include_references=False",
                                 "value": {
-                                    "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving."
+                                    "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving.",
+                                    "citation_count": 0,
+                                },
+                            },
+                            "with_citations": {
+                                "summary": "Response with citations",
+                                "description": "Example response when enable_citations=True with footnote format",
+                                "value": {
+                                    "response": "Artificial Intelligence (AI) is a branch of computer science[1] that aims to create intelligent machines capable of performing tasks that typically require human intelligence[2], such as learning, reasoning, and problem-solving.\n\n---\n[1] Introduction to AI (ai_overview.pdf)\n[2] Machine Learning Basics (machine_learning.txt)",
+                                    "references": [
+                                        {
+                                            "reference_id": "1",
+                                            "file_path": "/documents/ai_overview.pdf",
+                                        },
+                                        {
+                                            "reference_id": "2",
+                                            "file_path": "/documents/machine_learning.txt",
+                                        },
+                                    ],
+                                    "citations": {
+                                        "citations": [
+                                            {
+                                                "citation_id": 1,
+                                                "doc_id": "doc-123",
+                                                "chunk_id": "chunk-1",
+                                                "doc_type": "GENERAL",
+                                                "workspace": "default",
+                                                "file_path": "/documents/ai_overview.pdf",
+                                                "relevance_score": 0.95,
+                                                "formatted_ref": "Introduction to AI (ai_overview.pdf)",
+                                            },
+                                            {
+                                                "citation_id": 2,
+                                                "doc_id": "doc-456",
+                                                "chunk_id": "chunk-2",
+                                                "doc_type": "GENERAL",
+                                                "workspace": "default",
+                                                "file_path": "/documents/machine_learning.txt",
+                                                "relevance_score": 0.88,
+                                                "formatted_ref": "Machine Learning Basics (machine_learning.txt)",
+                                            },
+                                        ],
+                                        "format": "footnote",
+                                        "total_sources": 2,
+                                        "workspaces_used": ["default"],
+                                        "legal_count": 0,
+                                        "general_count": 2,
+                                    },
+                                    "citation_count": 2,
                                 },
                             },
                             "different_modes": {
@@ -511,11 +619,30 @@ def create_query_routes(
                     enriched_references.append(ref_copy)
                 references = enriched_references
 
-            # Return response with or without references based on request
+            # Extract citation data from llm_response
+            citations_data = llm_response.get("citations")
+            citation_count = llm_response.get("citation_count", 0)
+            
+            # Serialize CitationList to dict if present
+            citations_dict = None
+            if citations_data is not None:
+                citations_dict = asdict(citations_data)
+
+            # Return response with or without references and citations based on request
             if request.include_references:
-                return QueryResponse(response=response_content, references=references)
+                return QueryResponse(
+                    response=response_content,
+                    references=references,
+                    citations=citations_dict,
+                    citation_count=citation_count,
+                )
             else:
-                return QueryResponse(response=response_content, references=None)
+                return QueryResponse(
+                    response=response_content,
+                    references=None,
+                    citations=citations_dict,
+                    citation_count=citation_count,
+                )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -1322,5 +1449,385 @@ def create_query_routes(
         except Exception as e:
             logger.error(f"Error checking async query status: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/citations/{citation_id}",
+        dependencies=[Depends(combined_auth)],
+        summary="Retrieve full source content for a citation",
+        responses={
+            200: {
+                "description": "Citation source content and metadata",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "citation_id": {"type": "string", "description": "Citation identifier"},
+                                "doc_id": {"type": "string", "description": "Document identifier"},
+                                "chunk_id": {"type": "string", "description": "Chunk identifier"},
+                                "document_content": {"type": "string", "description": "Full document content"},
+                                "chunk_content": {"type": "string", "description": "Specific chunk content"},
+                                "metadata": {
+                                    "type": "object",
+                                    "description": "Document and chunk metadata including doc_type, hierarchy, legal_info, etc."
+                                },
+                            },
+                            "required": ["citation_id", "doc_id"],
+                        },
+                        "examples": {
+                            "legal_citation": {
+                                "summary": "Legal document citation",
+                                "value": {
+                                    "citation_id": "doc-550e8400:chunk-1",
+                                    "doc_id": "doc-550e8400-e29b-41d4-a716-446655440000",
+                                    "chunk_id": "doc-550e8400-e29b-41d4-a716-446655440000:chunk-1",
+                                    "document_content": "Full text of Luật Thuế GTGT...",
+                                    "chunk_content": "[Chương II] [Điều 8] Thuế suất thuế GTGT là 10%...",
+                                    "metadata": {
+                                        "doc_type": "legal",
+                                        "file_path": "/legal/luat_thue_gtgt.pdf",
+                                        "hierarchy_path": ["Chương II: Thuế GTGT", "Điều 8: Thuế suất"],
+                                        "legal_info": {
+                                            "document_type": "Luật",
+                                            "document_number": "13/2008/QH12",
+                                            "issuing_authority": "Quốc hội",
+                                            "legal_status": "Còn hiệu lực"
+                                        }
+                                    }
+                                }
+                            },
+                            "general_citation": {
+                                "summary": "General document citation",
+                                "value": {
+                                    "citation_id": "doc-660e8400:chunk-5",
+                                    "doc_id": "doc-660e8400-e29b-41d4-a716-446655440001",
+                                    "chunk_id": "doc-660e8400-e29b-41d4-a716-446655440001:chunk-5",
+                                    "document_content": "Full infrastructure guide content...",
+                                    "chunk_content": "[Hạ tầng] > [Quy trình Backup] Để thực hiện backup...",
+                                    "metadata": {
+                                        "doc_type": "general",
+                                        "file_path": "/docs/infrastructure_guide.md",
+                                        "hierarchy_path": ["Hạ tầng", "Quy trình Backup", "Bước 1"]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            400: {
+                "description": "Bad Request - Invalid citation_id format",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "example": {
+                            "detail": "Invalid citation_id format. Expected format: 'doc-{uuid}:chunk-{number}'"
+                        }
+                    }
+                }
+            },
+            404: {
+                "description": "Not Found - Citation not found",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "example": {
+                            "detail": "Citation not found: doc-550e8400:chunk-1"
+                        }
+                    }
+                }
+            },
+            500: {
+                "description": "Internal Server Error",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        },
+                        "example": {
+                            "detail": "Failed to retrieve citation: Storage error"
+                        }
+                    }
+                }
+            }
+        }
+    )
+    async def get_citation(
+        http_request: Request,
+        citation_id: str,
+        workspace_id: Optional[str] = None
+    ):
+        """
+        Retrieve full source content and metadata for a citation.
+        
+        This endpoint allows users to look up the complete source content for any
+        citation reference, enabling verification of information and access to full
+        context. The citation_id format is "doc-{uuid}:chunk-{number}".
+        
+        **Citation ID Format:**
+        - Format: `doc-{uuid}:chunk-{number}`
+        - Example: `doc-550e8400-e29b-41d4-a716-446655440000:chunk-1`
+        - The doc_id part identifies the source document
+        - The chunk_id part identifies the specific chunk within the document
+        
+        **Response Content:**
+        - **document_content**: Full text of the source document
+        - **chunk_content**: Specific chunk text with context (e.g., chapter/article for legal docs)
+        - **metadata**: Complete metadata including:
+          - doc_type: "legal" or "general"
+          - file_path: Original file path
+          - hierarchy_path: Legal structure (Chương/Điều) or breadcrumb (Section > Subsection)
+          - legal_info: Vietnamese legal metadata (for legal documents only)
+        
+        **Use Cases:**
+        - Verify information in LLM responses by checking original sources
+        - Access full document context for cited information
+        - Retrieve legal metadata for compliance and reference purposes
+        - Debug citation system by inspecting source content
+        
+        Args:
+            citation_id: Citation identifier in format "doc-{uuid}:chunk-{number}"
+            workspace_id: Optional workspace ID to filter results (overrides header)
+        
+        Returns:
+            JSON object containing citation_id, doc_id, chunk_id, document_content,
+            chunk_content, and metadata
+        
+        Raises:
+            HTTPException:
+                - 400: Invalid citation_id format
+                - 404: Citation not found in storage
+                - 500: Internal error retrieving citation
+        
+        Example:
+            ```
+            GET /citations/doc-550e8400-e29b-41d4-a716-446655440000:chunk-1
+            ```
+        """
+        try:
+            # Resolve workspace context
+            _, current_rag = await resolve_request_context(http_request, workspace_id)
+            
+            # Parse citation_id format: "doc-{uuid}:chunk-{number}"
+            if ":" not in citation_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid citation_id format. Expected format: 'doc-{{uuid}}:chunk-{{number}}', got: '{citation_id}'"
+                )
+            
+            parts = citation_id.split(":", 1)
+            if len(parts) != 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid citation_id format. Expected format: 'doc-{{uuid}}:chunk-{{number}}', got: '{citation_id}'"
+                )
+            
+            doc_id = parts[0]
+            chunk_id = citation_id  # Full citation_id is the chunk_id
+            
+            # Validate doc_id format (should start with "doc-")
+            if not doc_id.startswith("doc-"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid doc_id format. Expected format: 'doc-{{uuid}}', got: '{doc_id}'"
+                )
+            
+            # Retrieve full document content from full_docs storage
+            document_data = await current_rag.full_docs.get_by_id(doc_id)
+            
+            if not document_data:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Document not found: {doc_id}"
+                )
+            
+            # Retrieve specific chunk content from text_chunks storage
+            chunk_data = await current_rag.text_chunks.get_by_id(chunk_id)
+            
+            if not chunk_data:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Chunk not found: {chunk_id}"
+                )
+            
+            # Extract document content
+            document_content = document_data.get("content", "")
+            
+            # Extract chunk content
+            chunk_content = chunk_data.get("content", "")
+            
+            # Build metadata from chunk data
+            metadata = {
+                "doc_type": chunk_data.get("doc_type", "general"),
+                "file_path": chunk_data.get("file_path", ""),
+                "workspace": current_rag.workspace,
+            }
+            
+            # Add hierarchy_path if available (for both legal and general documents)
+            if "hierarchy_path" in chunk_data:
+                metadata["hierarchy_path"] = chunk_data["hierarchy_path"]
+            
+            # Add context metadata if available (legacy format)
+            if "context" in chunk_data:
+                context = chunk_data["context"]
+                if isinstance(context, dict):
+                    # Legal document context
+                    if "chapter" in context or "article" in context:
+                        metadata["context"] = context
+                    # General document context (breadcrumb)
+                    elif "breadcrumb" in context:
+                        metadata["breadcrumb"] = context["breadcrumb"]
+            
+            # Add legal_info if available (for legal documents)
+            if "legal_info" in chunk_data:
+                metadata["legal_info"] = chunk_data["legal_info"]
+            
+            # Add relevance score if available
+            if "relevance_score" in chunk_data:
+                metadata["relevance_score"] = chunk_data["relevance_score"]
+            
+            # Return citation data
+            return {
+                "citation_id": citation_id,
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "document_content": document_content,
+                "chunk_content": chunk_content,
+                "metadata": metadata,
+            }
+            
+        except HTTPException:
+            # Re-raise HTTP exceptions as-is
+            raise
+        except Exception as e:
+            logger.error(f"Error retrieving citation {citation_id}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to retrieve citation: {str(e)}"
+            )
+    
+    @router.get(
+        "/metrics/citations",
+        dependencies=[Depends(combined_auth)],
+        summary="Get citation metrics",
+        description="Retrieve citation usage and quality metrics for monitoring and observability.",
+    )
+    async def get_citation_metrics():
+        """Get citation metrics for monitoring.
+        
+        This endpoint provides comprehensive metrics about citation usage and quality,
+        including:
+        - Citation usage rate (percentage of queries using citations)
+        - Average number of citations per query
+        - Distribution of citation formats
+        - Distribution of citations per workspace
+        - Citation accuracy (percentage of valid references)
+        - Citation coverage (percentage of context items cited)
+        - Validation failures by type
+        
+        Returns:
+            Dictionary with usage and quality metrics
+        
+        Example response:
+            {
+                "usage": {
+                    "total_queries": 100,
+                    "queries_with_citations": 80,
+                    "queries_without_citations": 20,
+                    "citation_usage_rate": 80.0,
+                    "total_citations": 400,
+                    "avg_citations_per_query": 4.0,
+                    "citations_by_format": {
+                        "footnote": 250,
+                        "inline": 100,
+                        "bibliography": 50
+                    },
+                    "citations_by_workspace": {
+                        "legal-vn": 300,
+                        "user-docs": 100
+                    }
+                },
+                "quality": {
+                    "total_citations_validated": 400,
+                    "valid_citations": 395,
+                    "invalid_citations": 5,
+                    "citation_accuracy": 98.75,
+                    "total_context_items": 1000,
+                    "cited_context_items": 800,
+                    "citation_coverage": 80.0,
+                    "validation_failures": {
+                        "hallucinated_id": 5
+                    }
+                },
+                "timestamp": "2026-05-07T06:45:56.810931+00:00"
+            }
+        """
+        try:
+            from lightrag.citation_metrics import get_global_metrics_tracker
+            
+            # Get global metrics tracker
+            tracker = get_global_metrics_tracker()
+            
+            # Get comprehensive summary
+            summary = tracker.get_summary()
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error retrieving citation metrics: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to retrieve citation metrics: {str(e)}"
+            )
+    
+    @router.post(
+        "/metrics/citations/reset",
+        dependencies=[Depends(combined_auth)],
+        summary="Reset citation metrics",
+        description="Reset all citation metrics to zero. Useful for testing or starting a new monitoring period.",
+    )
+    async def reset_citation_metrics():
+        """Reset citation metrics.
+        
+        This endpoint resets all citation usage and quality metrics to zero,
+        clearing the query history and starting fresh. This is useful for:
+        - Testing and development
+        - Starting a new monitoring period
+        - Clearing metrics after configuration changes
+        
+        Returns:
+            Success message
+        
+        Example response:
+            {
+                "message": "Citation metrics reset successfully",
+                "timestamp": "2026-05-07T06:45:56.810931+00:00"
+            }
+        """
+        try:
+            from lightrag.citation_metrics import reset_global_metrics_tracker
+            from datetime import datetime, timezone
+            
+            # Reset global metrics tracker
+            reset_global_metrics_tracker()
+            
+            return {
+                "message": "Citation metrics reset successfully",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            
+        except Exception as e:
+            logger.error(f"Error resetting citation metrics: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to reset citation metrics: {str(e)}"
+            )
 
     return router

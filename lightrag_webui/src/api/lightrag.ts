@@ -286,7 +286,8 @@ export type WorkspacesResponse = {
 
 export type WorkspaceItem = {
   workspace_id: string
-  workspace_name: string
+  workspace_name?: string
+  is_legal_document_workspace?: boolean
 }
 
 export const InvalidApiKeyError = 'Invalid API Key'

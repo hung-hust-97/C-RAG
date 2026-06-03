@@ -62,7 +62,9 @@ export default function SiteHeader() {
   const currentTab = useSettingsStore.use.currentTab()
   const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
   const workspaceHistory = useSettingsStore.use.workspaceHistory()
+  const workspaceNamesById = useSettingsStore.use.workspaceNamesById()
   const setSelectedWorkspaceId = useSettingsStore.use.setSelectedWorkspaceId()
+  const setWorkspaceNames = useSettingsStore.use.setWorkspaceNames()
   const [workspaceRemoteOptions, setWorkspaceRemoteOptions] = useState<WorkspaceItem[]>([])
 
   useEffect(() => {
@@ -79,8 +81,10 @@ export default function SiteHeader() {
           }))
           .filter((item) => !!item.workspace_id)
         setWorkspaceRemoteOptions(apiWorkspaces)
+        setWorkspaceNames(apiWorkspaces)
 
         const firstWorkspaceId = apiWorkspaces[0]?.workspace_id
+        const firstWorkspaceName = apiWorkspaces[0]?.workspace_name
         const selectedInRemoteList = apiWorkspaces.some(
           (item) => item.workspace_id === selectedWorkspaceId
         )
@@ -92,7 +96,7 @@ export default function SiteHeader() {
             selectedWorkspaceId === 'default' ||
             !selectedInRemoteList)
         ) {
-          setSelectedWorkspaceId(firstWorkspaceId)
+          setSelectedWorkspaceId(firstWorkspaceId, firstWorkspaceName)
         }
       } catch (error) {
         console.error('Failed to load workspaces:', error)
@@ -103,7 +107,7 @@ export default function SiteHeader() {
     return () => {
       disposed = true
     }
-  }, [selectedWorkspaceId, setSelectedWorkspaceId])
+  }, [selectedWorkspaceId, setSelectedWorkspaceId, setWorkspaceNames])
 
   const workspaceOptions = useMemo(() => {
     const deduped = new Set<string>()
@@ -124,7 +128,10 @@ export default function SiteHeader() {
       const normalized = id.trim()
       if (!normalized || deduped.has(normalized)) continue
       deduped.add(normalized)
-      options.push({ workspace_id: normalized, workspace_name: normalized })
+      options.push({
+        workspace_id: normalized,
+        workspace_name: workspaceNamesById[normalized]?.trim() || normalized
+      })
     }
 
     if (options.length === 0) {
@@ -133,7 +140,12 @@ export default function SiteHeader() {
     }
 
     return options
-  }, [selectedWorkspaceId, workspaceHistory, workspaceRemoteOptions])
+  }, [selectedWorkspaceId, workspaceHistory, workspaceNamesById, workspaceRemoteOptions])
+
+  const handleWorkspaceChange = (workspaceId: string) => {
+    const selectedOption = workspaceOptions.find((item) => item.workspace_id === workspaceId)
+    setSelectedWorkspaceId(workspaceId, selectedOption?.workspace_name)
+  }
 
   const versionDisplay = (coreVersion && apiVersion)
     ? `${coreVersion}/${apiVersion}`
@@ -194,7 +206,7 @@ export default function SiteHeader() {
               <select
                 className="h-7 w-44 rounded-md border border-input bg-background px-2 text-xs"
                 value={selectedWorkspaceId}
-                onChange={(event) => setSelectedWorkspaceId(event.target.value)}
+                onChange={(event) => handleWorkspaceChange(event.target.value)}
               >
                 {workspaceOptions.map((item) => (
                   <option

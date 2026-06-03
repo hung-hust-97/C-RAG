@@ -643,7 +643,10 @@ Consider the conversation history if provided to maintain conversational flow an
   - Scrutinize both `Knowledge Graph Data` and `Document Chunks` in the **Context**. Identify and extract all pieces of information that are directly relevant to answering the user query.
   - Weave the extracted facts into a coherent and logical response. Your own knowledge must ONLY be used to formulate fluent sentences and connect ideas, NOT to introduce any external information.
   - Track the reference_id of the document chunk which directly support the facts presented in the response. Correlate reference_id with the entries in the `Reference Document List` to generate the appropriate citations.
-  - Generate a references section at the end of the response. Each reference document must directly support the facts presented in the response.
+  - Use citations and the final References section ONLY from entries in the `Reference Document List`. A cited reference_id must exactly match an ID that appears in that list.
+  - `Knowledge Graph Data` is supporting context only and is NOT a citable document source. Never cite it as `[Knowledge Graph]`, `[KG]`, `[Context]`, or any similar invented source.
+  - If a fact is supported only by `Knowledge Graph Data` and no `Reference Document List` entry supports it, do not create a citation or reference entry for that fact.
+  - Generate a references section at the end of the response only when at least one valid `Reference Document List` entry is cited. Each reference document must directly support the facts presented in the response.
   - Do not generate anything after the reference section.
 
 2. Content & Grounding:
@@ -664,9 +667,12 @@ Consider the conversation history if provided to maintain conversational flow an
 4. References Section Format:
   - The References section should be under heading: `### References`
   - Reference list entries should adhere to the format: `* [n] Document Title`. Do not include a caret (`^`) after opening square bracket (`[`).
+  - Every reference entry MUST use an existing reference_id from the `Reference Document List` and the corresponding document title from that list.
   - The Document Title in the citation must retain its original language.
   - Output each citation on an individual line
   - Provide maximum of 5 most relevant citations.
+  - Do NOT output `[Knowledge Graph]`, `[KG]`, `[Context]`, `[Source]`, or any source not present in the `Reference Document List`.
+  - If no valid `Reference Document List` entry is used, omit the References section entirely.
   - Do not generate footnotes section or any comment, summary, or explanation after the references.
 
 5. Reference Section Example:
@@ -703,7 +709,10 @@ Xem xét lịch sử cuộc trò chuyện nếu được cung cấp để duy tr
   - Xem xét kỹ lưỡng cả `Dữ liệu Đồ thị Tri thức` và `Đoạn Tài liệu` trong **Ngữ cảnh**. Xác định và trích xuất tất cả các phần thông tin có liên quan trực tiếp đến việc trả lời truy vấn của người dùng.
   - Dệt các sự kiện được trích xuất thành một phản hồi mạch lạc và logic. Kiến thức của riêng bạn CHỈ được sử dụng để xây dựng các câu trôi chảy và kết nối ý tưởng, KHÔNG để giới thiệu bất kỳ thông tin bên ngoài nào.
   - Theo dõi reference_id của đoạn tài liệu hỗ trợ trực tiếp các sự kiện được trình bày trong phản hồi. Tương quan reference_id với các mục trong `Danh sách Tài liệu Tham khảo` để tạo các trích dẫn phù hợp.
-  - Tạo phần tài liệu tham khảo ở cuối phản hồi. Mỗi tài liệu tham khảo phải hỗ trợ trực tiếp các sự kiện được trình bày trong phản hồi.
+  - Chỉ sử dụng trích dẫn và phần Tài liệu Tham khảo từ các mục trong `Danh sách Tài liệu Tham khảo`. reference_id được trích dẫn phải khớp chính xác với một ID có trong danh sách đó.
+  - `Dữ liệu Đồ thị Tri thức` chỉ là ngữ cảnh hỗ trợ, KHÔNG phải nguồn tài liệu để trích dẫn. Không bao giờ trích dẫn nó dưới dạng `[Knowledge Graph]`, `[KG]`, `[Đồ thị Tri thức]`, `[Ngữ cảnh]` hoặc bất kỳ nguồn tự tạo tương tự nào.
+  - Nếu một thông tin chỉ được hỗ trợ bởi `Dữ liệu Đồ thị Tri thức` và không có mục nào trong `Danh sách Tài liệu Tham khảo` hỗ trợ, không tạo trích dẫn hoặc mục tài liệu tham khảo cho thông tin đó.
+  - Chỉ tạo phần tài liệu tham khảo ở cuối phản hồi khi có ít nhất một mục hợp lệ trong `Danh sách Tài liệu Tham khảo` được trích dẫn. Mỗi tài liệu tham khảo phải hỗ trợ trực tiếp các sự kiện được trình bày trong phản hồi.
   - Không tạo bất cứ thứ gì sau phần tài liệu tham khảo.
 
 2. Nội dung & Căn cứ:
@@ -724,9 +733,12 @@ Xem xét lịch sử cuộc trò chuyện nếu được cung cấp để duy tr
 4. Định dạng Phần Tài liệu Tham khảo:
   - Phần Tài liệu Tham khảo nên ở dưới tiêu đề: `### Tài liệu Tham khảo`
   - Các mục danh sách tài liệu tham khảo nên tuân theo định dạng: `* [n] Tiêu đề Tài liệu`. Không bao gồm dấu mũ (`^`) sau dấu ngoặc vuông mở (`[`).
+  - Mỗi mục tài liệu tham khảo PHẢI dùng reference_id có sẵn trong `Danh sách Tài liệu Tham khảo` và tiêu đề tài liệu tương ứng từ danh sách đó.
   - Tiêu đề Tài liệu trong trích dẫn phải giữ nguyên ngôn ngữ gốc.
   - Xuất mỗi trích dẫn trên một dòng riêng lẻ
   - Cung cấp tối đa 5 trích dẫn liên quan nhất.
+  - Không xuất `[Knowledge Graph]`, `[KG]`, `[Đồ thị Tri thức]`, `[Ngữ cảnh]`, `[Nguồn]` hoặc bất kỳ nguồn nào không có trong `Danh sách Tài liệu Tham khảo`.
+  - Nếu không dùng mục hợp lệ nào trong `Danh sách Tài liệu Tham khảo`, bỏ hẳn phần Tài liệu Tham khảo.
   - Không tạo phần chú thích hoặc bất kỳ nhận xét, tóm tắt hoặc giải thích nào sau phần tài liệu tham khảo.
 
 5. Ví dụ Phần Tài liệu Tham khảo:
@@ -763,7 +775,9 @@ Consider the conversation history if provided to maintain conversational flow an
   - Scrutinize `Document Chunks` in the **Context**. Identify and extract all pieces of information that are directly relevant to answering the user query.
   - Weave the extracted facts into a coherent and logical response. Your own knowledge must ONLY be used to formulate fluent sentences and connect ideas, NOT to introduce any external information.
   - Track the reference_id of the document chunk which directly support the facts presented in the response. Correlate reference_id with the entries in the `Reference Document List` to generate the appropriate citations.
-  - Generate a **References** section at the end of the response. Each reference document must directly support the facts presented in the response.
+  - Use citations and the final References section ONLY from entries in the `Reference Document List`. A cited reference_id must exactly match an ID that appears in that list.
+  - Never cite invented sources such as `[Knowledge Graph]`, `[KG]`, `[Context]`, or any source that is not present in the `Reference Document List`.
+  - Generate a **References** section at the end of the response only when at least one valid `Reference Document List` entry is cited. Each reference document must directly support the facts presented in the response.
   - Do not generate anything after the reference section.
 
 2. Content & Grounding:
@@ -781,9 +795,12 @@ Consider the conversation history if provided to maintain conversational flow an
 4. References Section Format:
   - The References section should be under heading: `### References`
   - Reference list entries should adhere to the format: `* [n] Document Title`. Do not include a caret (`^`) after opening square bracket (`[`).
+  - Every reference entry MUST use an existing reference_id from the `Reference Document List` and the corresponding document title from that list.
   - The Document Title in the citation must retain its original language.
   - Output each citation on an individual line
   - Provide maximum of 5 most relevant citations.
+  - Do NOT output `[Knowledge Graph]`, `[KG]`, `[Context]`, `[Source]`, or any source not present in the `Reference Document List`.
+  - If no valid `Reference Document List` entry is used, omit the References section entirely.
   - Do not generate footnotes section or any comment, summary, or explanation after the references.
 
 5. Reference Section Example:
@@ -820,7 +837,9 @@ Xem xét lịch sử cuộc trò chuyện nếu được cung cấp để duy tr
   - Xem xét kỹ lưỡng `Đoạn Tài liệu` trong **Ngữ cảnh**. Xác định và trích xuất tất cả các phần thông tin có liên quan trực tiếp đến việc trả lời truy vấn của người dùng.
   - Dệt các sự kiện được trích xuất thành một phản hồi mạch lạc và logic. Kiến thức của riêng bạn CHỈ được sử dụng để xây dựng các câu trôi chảy và kết nối ý tưởng, KHÔNG để giới thiệu bất kỳ thông tin bên ngoài nào.
   - Theo dõi reference_id của đoạn tài liệu hỗ trợ trực tiếp các sự kiện được trình bày trong phản hồi. Tương quan reference_id với các mục trong `Danh sách Tài liệu Tham khảo` để tạo các trích dẫn phù hợp.
-  - Tạo phần **Tài liệu Tham khảo** ở cuối phản hồi. Mỗi tài liệu tham khảo phải hỗ trợ trực tiếp các sự kiện được trình bày trong phản hồi.
+  - Chỉ sử dụng trích dẫn và phần Tài liệu Tham khảo từ các mục trong `Danh sách Tài liệu Tham khảo`. reference_id được trích dẫn phải khớp chính xác với một ID có trong danh sách đó.
+  - Không bao giờ trích dẫn nguồn tự tạo như `[Knowledge Graph]`, `[KG]`, `[Đồ thị Tri thức]`, `[Ngữ cảnh]` hoặc bất kỳ nguồn nào không có trong `Danh sách Tài liệu Tham khảo`.
+  - Chỉ tạo phần **Tài liệu Tham khảo** ở cuối phản hồi khi có ít nhất một mục hợp lệ trong `Danh sách Tài liệu Tham khảo` được trích dẫn. Mỗi tài liệu tham khảo phải hỗ trợ trực tiếp các sự kiện được trình bày trong phản hồi.
   - Không tạo bất cứ thứ gì sau phần tài liệu tham khảo.
 
 2. Nội dung & Căn cứ:
@@ -838,9 +857,12 @@ Xem xét lịch sử cuộc trò chuyện nếu được cung cấp để duy tr
 4. Định dạng Phần Tài liệu Tham khảo:
   - Phần Tài liệu Tham khảo nên ở dưới tiêu đề: `### Tài liệu Tham khảo`
   - Các mục danh sách tài liệu tham khảo nên tuân theo định dạng: `* [n] Tiêu đề Tài liệu`. Không bao gồm dấu mũ (`^`) sau dấu ngoặc vuông mở (`[`).
+  - Mỗi mục tài liệu tham khảo PHẢI dùng reference_id có sẵn trong `Danh sách Tài liệu Tham khảo` và tiêu đề tài liệu tương ứng từ danh sách đó.
   - Tiêu đề Tài liệu trong trích dẫn phải giữ nguyên ngôn ngữ gốc.
   - Xuất mỗi trích dẫn trên một dòng riêng lẻ
   - Cung cấp tối đa 5 trích dẫn liên quan nhất.
+  - Không xuất `[Knowledge Graph]`, `[KG]`, `[Đồ thị Tri thức]`, `[Ngữ cảnh]`, `[Nguồn]` hoặc bất kỳ nguồn nào không có trong `Danh sách Tài liệu Tham khảo`.
+  - Nếu không dùng mục hợp lệ nào trong `Danh sách Tài liệu Tham khảo`, bỏ hẳn phần Tài liệu Tham khảo.
   - Không tạo phần chú thích hoặc bất kỳ nhận xét, tóm tắt hoặc giải thích nào sau phần tài liệu tham khảo.
 
 5. Ví dụ Phần Tài liệu Tham khảo:
@@ -861,13 +883,13 @@ Xem xét lịch sử cuộc trò chuyện nếu được cung cấp để duy tr
 """
 
 PROMPTS["kg_query_context"] = """
-Knowledge Graph Data (Entity):
+Knowledge Graph Data (Entity, supporting context only; not a citable reference source):
 
 ```json
 {entities_str}
 ```
 
-Knowledge Graph Data (Relationship):
+Knowledge Graph Data (Relationship, supporting context only; not a citable reference source):
 
 ```json
 {relations_str}
@@ -1251,3 +1273,141 @@ Truy vấn người dùng: {query}
 
 ---Đầu ra---
 """
+
+# --- LEGAL DOCUMENT PROMPTS ---
+
+PROMPTS["legal_entity_extraction_system_prompt"] = """---Role---
+You are a Legal Knowledge Graph Specialist responsible for extracting entities and relationships from legal documents.
+
+---Instructions---
+1.  **Entity Extraction & Output:**
+    *   **Identification:** Identify clearly defined and meaningful legal entities in the input text.
+    *   **Limits:** Output at most 24 highest-value entities per chunk. Prioritize legal subjects, authorities, rights, obligations, conditions, penalties, deadlines, procedures, and legal actions. Skip generic or repeated terms.
+    *   **Entity Details:** For each identified entity, extract the following information:
+        *   `entity_name`: The name of the entity. Capitalize the first letter of each significant word (title case). Ensure **consistent naming** across the entire extraction process.
+        *   `entity_type`: Categorize the entity using one of the following types: `{entity_types}`. If none apply, classify it as `Other`.
+        *   `entity_description`: Provide a concise description, at most 35 words, of the entity's legal attributes, rights, or obligations, based *solely* on the input text.
+    *   **Output Format - Entities:** Output 4 fields for each entity, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be `entity`.
+        *   Format: `entity{tuple_delimiter}entity_name{tuple_delimiter}entity_type{tuple_delimiter}entity_description`
+
+2.  **Relationship Extraction & Output:**
+    *   **Identification:** Identify direct, clearly stated legal relationships between previously extracted entities (e.g., who regulates who, what penalty applies to what action).
+    *   **Limits:** Output at most 36 highest-value relationships per chunk. Do not repeat the same relation using different wording.
+    *   **Relationship Details:** For each binary relationship, extract:
+        *   `source_entity`: The name of the source entity.
+        *   `target_entity`: The name of the target entity.
+        *   `relationship_keywords`: A single high-level keyword summarizing the legal nature of the relationship. Choose from the following list if applicable, or create a concise one: APPLIES_TO, PENALIZED_BY, REGULATED_BY, HAS_OBLIGATION, HAS_RIGHT, IS_CONDITION_FOR, REPLACES, MODIFIES. **DO NOT use `{tuple_delimiter}` in this field.**
+        *   `relationship_description`: A concise explanation, at most 35 words, of the legal nature of the relationship, citing specific conditions or thresholds if present.
+    *   **Output Format - Relationships:** Output 5 fields for each relationship, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be `relation`.
+        *   Format: `relation{tuple_delimiter}source_entity{tuple_delimiter}target_entity{tuple_delimiter}relationship_keywords{tuple_delimiter}relationship_description`
+
+3.  **Delimiter Usage Protocol:**
+    *   The `{tuple_delimiter}` is a complete, atomic marker and **must not be filled with content**.
+
+4.  **Relationship Direction & Duplication:**
+    *   Treat relationships as directed when describing regulatory or penalizing actions. Avoid duplicates.
+
+5.  **Output Order & Prioritization:**
+    *   Output all entities first, followed by all relationships. Priority given to core regulatory actions and penalties.
+
+6.  **Language & Proper Nouns:**
+    *   The entire output must be written in `{language}`. Retain technical legal terms.
+
+7.  **Completion Signal:** Output the literal string `{completion_delimiter}` only after all extractions are complete.
+
+---Examples---
+{examples}
+"""
+
+PROMPTS["legal_entity_extraction_system_prompt_vi"] = """---Vai trò---
+Bạn là Chuyên gia Đồ thị Tri thức Pháp luật chịu trách nhiệm trích xuất thực thể và mối quan hệ từ các văn bản quy phạm pháp luật.
+
+---Hướng dẫn---
+1.  **Trích xuất & Xuất Thực thể:**
+    *   **Nhận diện:** Xác định các thực thể pháp lý được định nghĩa rõ ràng trong văn bản đầu vào.
+    *   **Giới hạn:** Chỉ xuất tối đa 24 thực thể quan trọng nhất trong mỗi chunk. Ưu tiên chủ thể pháp lý, cơ quan có thẩm quyền, quyền, nghĩa vụ, điều kiện, chế tài, thời hạn, thủ tục và hành vi pháp lý. Bỏ qua thuật ngữ chung chung hoặc lặp lại.
+    *   **Chi tiết Thực thể:** Đối với mỗi thực thể, trích xuất:
+        *   `entity_name`: Tên của thực thể (viết hoa chữ cái đầu tiên). Đảm bảo **nhất quán**.
+        *   `entity_type`: Phân loại thực thể dùng một trong các loại: `{entity_types}`. Nếu không thuộc loại nào, chọn `Other`.
+        *   `entity_description`: Mô tả ngắn gọn, tối đa 35 từ, về thuộc tính pháp lý, quyền hạn, nghĩa vụ hoặc định nghĩa của thực thể dựa trên văn bản.
+    *   **Định dạng Xuất - Thực thể:** Xuất 4 trường, phân tách bởi `{tuple_delimiter}`, trên một dòng. Trường đầu tiên *phải* là `entity`.
+        *   Định dạng: `entity{tuple_delimiter}entity_name{tuple_delimiter}entity_type{tuple_delimiter}entity_description`
+
+2.  **Trích xuất & Xuất Mối quan hệ:**
+    *   **Nhận diện:** Xác định các mối quan hệ pháp lý mang tính ràng buộc giữa các thực thể (vd: quy định, áp dụng, xử phạt).
+    *   **Giới hạn:** Chỉ xuất tối đa 36 mối quan hệ quan trọng nhất trong mỗi chunk. Không lặp lại cùng một quan hệ với cách diễn đạt khác.
+    *   **Chi tiết Mối quan hệ:** Đối với mỗi mối quan hệ, trích xuất:
+        *   `source_entity`: Tên thực thể nguồn.
+        *   `target_entity`: Tên thực thể đích.
+        *   `relationship_keywords`: Một từ khóa ngắn gọn, tiếng Anh mô tả bản chất pháp lý của mối quan hệ. Ưu tiên sử dụng các từ: APPLIES_TO, PENALIZED_BY, REGULATED_BY, HAS_OBLIGATION, HAS_RIGHT, IS_CONDITION_FOR, REPLACES, MODIFIES. **KHÔNG dùng `{tuple_delimiter}`.**
+        *   `relationship_description`: Giải thích ngắn gọn, tối đa 35 từ, về điều kiện pháp lý, hậu quả, hoặc nội dung của quy định ràng buộc hai thực thể này.
+    *   **Định dạng Xuất - Mối quan hệ:** Xuất 5 trường, phân tách bởi `{tuple_delimiter}`, trên một dòng. Trường đầu tiên *phải* là `relation`.
+        *   Định dạng: `relation{tuple_delimiter}source_entity{tuple_delimiter}target_entity{tuple_delimiter}relationship_keywords{tuple_delimiter}relationship_description`
+
+3.  **Quy tắc Dấu phân tách:**
+    *   `{tuple_delimiter}` là nguyên tử, không được chỉnh sửa hay việt hóa.
+
+4.  **Hướng Mối quan hệ:**
+    *   Xác định rõ hướng (vd: Cơ quan A -> XỬ PHẠT -> Hành vi B).
+
+5.  **Ngôn ngữ:**
+    *   Toàn bộ đầu ra viết bằng `{language}`. Tuy nhiên, `relationship_keywords` nên giữ tiếng Anh (để chuẩn hóa graph).
+
+6.  **Tín hiệu Hoàn thành:** Xuất `{completion_delimiter}` ở dòng cuối cùng.
+
+---Ví dụ---
+{examples}
+"""
+
+PROMPTS["legal_entity_extraction_user_prompt"] = PROMPTS["entity_extraction_user_prompt"]
+PROMPTS["legal_entity_extraction_user_prompt_vi"] = PROMPTS["entity_extraction_user_prompt_vi"]
+PROMPTS["legal_entity_continue_extraction_user_prompt"] = PROMPTS["entity_continue_extraction_user_prompt"]
+PROMPTS["legal_entity_continue_extraction_user_prompt_vi"] = PROMPTS["entity_continue_extraction_user_prompt_vi"]
+
+PROMPTS["legal_entity_extraction_examples"] = [
+    """<Entity_types>
+["LegalSubject","GovernmentAgency","Court","Procuracy","Inspector","PublicOfficial","Enterprise","Citizen","ForeignEntity","LegalDocument","Law","Ordinance","Decree","Circular","JointCircular","Resolution","Decision","Directive","InternationalTreaty","LegalAction","LegalPenalty","LegalRight","LegalObligation","LegalCondition","LegalConcept","LegalPrinciple","LegalStatus","Violation","Crime","Sanction","AdministrativeProcedure","LitigationProcedure","ArbitrationProcedure","License","LegalDeadline","Tax","Fee","Budget","FinancialInstrument","LandCategory","LandUseRight","PropertyRight","ConstructionPermit","LaborContract","SocialInsurance","LaborStandard","BusinessLicense","Contract","IntellectualProperty","Competition","EnvironmentalStandard","NaturalResource","EnvironmentalImpact"]
+
+<Input Text>
+```
+Any enterprise operating in the logistics sector must obtain a valid operating license from the Ministry of Transport. Engaging in logistics activities without this license is strictly prohibited and shall be subject to a fine ranging from 50,000,000 VND to 100,000,000 VND.
+```
+
+<Output>
+entity{tuple_delimiter}Enterprise In Logistics Sector{tuple_delimiter}Enterprise{tuple_delimiter}A business entity that operates within the logistics industry and is subject to licensing requirements.
+entity{tuple_delimiter}Operating License{tuple_delimiter}License{tuple_delimiter}A mandatory legal permit required for enterprises to lawfully operate in the logistics sector.
+entity{tuple_delimiter}Ministry Of Transport{tuple_delimiter}GovernmentAgency{tuple_delimiter}The government authority responsible for issuing operating licenses to logistics enterprises.
+entity{tuple_delimiter}Engaging In Logistics Without License{tuple_delimiter}Violation{tuple_delimiter}The prohibited action of conducting logistics operations without the mandatory operating license.
+entity{tuple_delimiter}Fine Of 50,000,000 To 100,000,000 VND{tuple_delimiter}LegalPenalty{tuple_delimiter}The monetary penalty imposed for engaging in logistics activities without a valid license.
+relation{tuple_delimiter}Enterprise In Logistics Sector{tuple_delimiter}Operating License{tuple_delimiter}HAS_OBLIGATION{tuple_delimiter}Logistics enterprises are obligated to obtain a valid operating license.
+relation{tuple_delimiter}Ministry Of Transport{tuple_delimiter}Operating License{tuple_delimiter}REGULATED_BY{tuple_delimiter}The Ministry of Transport is the authority that regulates and issues the operating license.
+relation{tuple_delimiter}Engaging In Logistics Without License{tuple_delimiter}Enterprise In Logistics Sector{tuple_delimiter}APPLIES_TO{tuple_delimiter}The prohibition of operating without a license applies to logistics enterprises.
+relation{tuple_delimiter}Engaging In Logistics Without License{tuple_delimiter}Fine Of 50,000,000 To 100,000,000 VND{tuple_delimiter}PENALIZED_BY{tuple_delimiter}Operating without a license is penalized by a fine ranging from 50 to 100 million VND.
+{completion_delimiter}
+"""
+]
+
+PROMPTS["legal_entity_extraction_examples_vi"] = [
+    """<Entity_types>
+["LegalSubject","GovernmentAgency","Court","Procuracy","Inspector","PublicOfficial","Enterprise","Citizen","ForeignEntity","LegalDocument","Law","Ordinance","Decree","Circular","JointCircular","Resolution","Decision","Directive","InternationalTreaty","LegalAction","LegalPenalty","LegalRight","LegalObligation","LegalCondition","LegalConcept","LegalPrinciple","LegalStatus","Violation","Crime","Sanction","AdministrativeProcedure","LitigationProcedure","ArbitrationProcedure","License","LegalDeadline","Tax","Fee","Budget","FinancialInstrument","LandCategory","LandUseRight","PropertyRight","ConstructionPermit","LaborContract","SocialInsurance","LaborStandard","BusinessLicense","Contract","IntellectualProperty","Competition","EnvironmentalStandard","NaturalResource","EnvironmentalImpact"]
+
+<Input Text>
+```
+Phạt tiền từ 10.000.000 đồng đến 20.000.000 đồng đối với người sử dụng lao động có hành vi giữ bản chính giấy tờ tùy thân, văn bằng, chứng chỉ của người lao động khi giao kết hoặc thực hiện hợp đồng lao động. Chánh Thanh tra Sở Lao động - Thương binh và Xã hội có quyền xử phạt vi phạm này.
+```
+
+<Output>
+entity{tuple_delimiter}Người Sử Dụng Lao Động{tuple_delimiter}Enterprise{tuple_delimiter}Cá nhân hoặc tổ chức tuyển dụng, sử dụng lao động và có trách nhiệm thực hiện hợp đồng lao động.
+entity{tuple_delimiter}Người Lao Động{tuple_delimiter}Citizen{tuple_delimiter}Cá nhân làm việc cho người sử dụng lao động, là chủ sở hữu của giấy tờ tùy thân và văn bằng.
+entity{tuple_delimiter}Giữ Bản Chính Giấy Tờ Tùy Thân, Văn Bằng, Chứng Chỉ{tuple_delimiter}Violation{tuple_delimiter}Hành vi vi phạm của người sử dụng lao động khi giữ giấy tờ gốc của người lao động trong quá trình giao kết hợp đồng.
+entity{tuple_delimiter}Phạt Tiền Từ 10.000.000 Đến 20.000.000 Đồng{tuple_delimiter}LegalPenalty{tuple_delimiter}Mức phạt hành chính áp dụng cho hành vi giữ bản chính giấy tờ tùy thân của người lao động.
+entity{tuple_delimiter}Chánh Thanh Tra Sở Lao Động Thương Binh Và Xã Hội{tuple_delimiter}Inspector{tuple_delimiter}Cơ quan/Cá nhân có thẩm quyền xử phạt đối với hành vi vi phạm về hợp đồng lao động.
+entity{tuple_delimiter}Hợp Đồng Lao Động{tuple_delimiter}LaborContract{tuple_delimiter}Thỏa thuận pháp lý giữa người sử dụng lao động và người lao động về điều kiện lao động, quyền và nghĩa vụ của các bên.
+relation{tuple_delimiter}Người Sử Dụng Lao Động{tuple_delimiter}Giữ Bản Chính Giấy Tờ Tùy Thân, Văn Bằng, Chứng Chỉ{tuple_delimiter}APPLIES_TO{tuple_delimiter}Hành vi vi phạm giữ giấy tờ gốc do người sử dụng lao động thực hiện.
+relation{tuple_delimiter}Giữ Bản Chính Giấy Tờ Tùy Thân, Văn Bằng, Chứng Chỉ{tuple_delimiter}Người Lao Động{tuple_delimiter}APPLIES_TO{tuple_delimiter}Hành vi vi phạm này xâm phạm đến quyền lợi và giấy tờ của người lao động.
+relation{tuple_delimiter}Giữ Bản Chính Giấy Tờ Tùy Thân, Văn Bằng, Chứng Chỉ{tuple_delimiter}Phạt Tiền Từ 10.000.000 Đến 20.000.000 Đồng{tuple_delimiter}PENALIZED_BY{tuple_delimiter}Hành vi vi phạm bị xử phạt hành chính bằng tiền từ 10 đến 20 triệu đồng.
+relation{tuple_delimiter}Chánh Thanh Tra Sở Lao Động Thương Binh Và Xã Hội{tuple_delimiter}Phạt Tiền Từ 10.000.000 Đến 20.000.000 Đồng{tuple_delimiter}HAS_RIGHT{tuple_delimiter}Chánh Thanh tra Sở có thẩm quyền ra quyết định áp dụng mức phạt này.
+relation{tuple_delimiter}Người Sử Dụng Lao Động{tuple_delimiter}Hợp Đồng Lao Động{tuple_delimiter}HAS_OBLIGATION{tuple_delimiter}Người sử dụng lao động có nghĩa vụ thực hiện đúng hợp đồng lao động, không được giữ giấy tờ gốc của người lao động.
+{completion_delimiter}
+"""
+]

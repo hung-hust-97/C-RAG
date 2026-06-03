@@ -82,15 +82,22 @@ def _validate_ocr_config(args: argparse.Namespace) -> None:
         args: Parsed arguments containing OCR configuration
 
     Validates:
-        - ocr_engine is one of: auto, deepseek, tesseract, none
+        - ocr_engine is one of supported OCR/extraction engines
         - deepseek_api_url format (http:// or https://)
+        - mineru_api_url format (http:// or https://)
         - deepseek_ocr_timeout is positive integer
 
     Logs warnings for invalid configurations but does not raise exceptions
     to maintain backward compatibility.
     """
     # Validate OCR engine
-    valid_engines = ["auto", "deepseek", "tesseract", "none"]
+    valid_engines = [
+        "auto",
+        "deepseek",
+        "mineru",
+        "docling",
+        "none",
+    ]
     if args.deepseek_ocr_engine not in valid_engines:
         logging.warning(
             f"Invalid DEEPSEEK_OCR_ENGINE value '{args.deepseek_ocr_engine}'. "
@@ -107,6 +114,17 @@ def _validate_ocr_config(args: argparse.Namespace) -> None:
                 f"Invalid DEEPSEEK_API_URL format '{args.deepseek_api_url}'. "
                 f"URL must start with 'http://' or 'https://'. "
                 f"OCR functionality may not work correctly."
+            )
+
+    if getattr(args, "mineru_api_url", None):
+        if not (
+            args.mineru_api_url.startswith("http://")
+            or args.mineru_api_url.startswith("https://")
+        ):
+            logging.warning(
+                f"Invalid MINERU_API_URL format '{args.mineru_api_url}'. "
+                f"URL must start with 'http://' or 'https://'. "
+                f"MinerU OCR functionality may not work correctly."
             )
 
     # Validate timeout is positive integer
@@ -508,6 +526,18 @@ def parse_args() -> argparse.Namespace:
     args.deepseek_api_url = get_env_value(
         "DEEPSEEK_API_URL", "http://10.1.6.52:8006/ocr/pdf"
     )
+    args.mineru_api_url = get_env_value(
+        "MINERU_API_URL", "http://10.1.6.52:8009/file_parse"
+    )
+    args.mineru_backend = get_env_value("MINERU_BACKEND", "vlm-auto-engine")
+    args.mineru_lang_list = get_env_value("MINERU_LANG_LIST", "en,vn")
+    args.mineru_parse_method = get_env_value("MINERU_PARSE_METHOD", "auto")
+    args.mineru_return_middle_json = get_env_value(
+        "MINERU_RETURN_MIDDLE_JSON", False, bool
+    )
+    args.mineru_return_images = get_env_value("MINERU_RETURN_IMAGES", False, bool)
+    args.mineru_formula_enable = get_env_value("MINERU_FORMULA_ENABLE", True, bool)
+    args.mineru_table_enable = get_env_value("MINERU_TABLE_ENABLE", True, bool)
     args.deepseek_ocr_timeout = get_env_value("DEEPSEEK_OCR_TIMEOUT", 300, int)
     args.deepseek_ocr_fallback = get_env_value("DEEPSEEK_OCR_FALLBACK", True, bool)
     args.ocr_preserve_markdown_structure = get_env_value(

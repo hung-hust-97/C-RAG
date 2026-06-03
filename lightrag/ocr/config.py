@@ -5,7 +5,7 @@ This module defines configuration structures for OCR processing,
 including engine selection, API endpoints, and processing parameters.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import logging
 
@@ -17,10 +17,10 @@ class OCRConfig:
     """Configuration for OCR processing.
     
     Attributes:
-        engine: OCR engine selection ('auto', 'deepseek', 'tesseract', 'none')
+        engine: OCR engine selection ('auto', 'deepseek', 'mineru', 'docling', 'none')
         deepseek_api_url: DeepSeek OCR API endpoint URL
-        tesseract_lang: Tesseract language codes (e.g., 'eng+vie')
-        enable_fallback: Enable fallback to Tesseract if DeepSeek fails
+        mineru_api_url: MinerU /file_parse API endpoint URL
+        enable_fallback: Enable fallback to another configured extractor
         timeout: Request timeout in seconds
         preserve_markdown_structure: Keep markdown structure for entity extraction
     """
@@ -28,12 +28,17 @@ class OCRConfig:
     engine: str = "auto"
     deepseek_api_url: str = "http://10.1.6.52:8006/ocr/pdf"
     deepseek_image_api_url: str = "http://10.1.6.52:8006/ocr/image"
-    tesseract_lang: str = "eng+vie"
+    mineru_api_url: str = "http://10.1.6.52:8009/file_parse"
+    mineru_backend: str = "vlm-auto-engine"
+    mineru_lang_list: str = "en,vn"
+    mineru_parse_method: str = "auto"
+    mineru_return_middle_json: bool = False
+    mineru_return_images: bool = False
+    mineru_formula_enable: bool = True
+    mineru_table_enable: bool = True
     enable_fallback: bool = True
     timeout: int = 1200
     preserve_markdown_structure: bool = True
-    use_hybrid_mode: bool = True
-    min_table_chars: int = 50
     
     @classmethod
     def from_global_args(cls, global_args) -> "OCRConfig":
@@ -49,25 +54,45 @@ class OCRConfig:
         
         # Load OCR configuration from environment variables via get_env_value
         engine = get_env_value("DEEPSEEK_OCR_ENGINE", "auto")
-        deepseek_api_url = get_env_value("DEEPSEEK_API_URL", "http://10.1.6.52:8006/ocr/pdf")
-        deepseek_image_api_url = get_env_value("DEEPSEEK_IMAGE_API_URL", "http://10.1.6.52:8006/ocr/image")
-        tesseract_lang = get_env_value("TESSERACT_LANG", "eng+vie")
+        deepseek_api_url = get_env_value(
+            "DEEPSEEK_API_URL", "http://10.1.6.52:8006/ocr/pdf"
+        )
+        deepseek_image_api_url = get_env_value(
+            "DEEPSEEK_IMAGE_API_URL", "http://10.1.6.52:8006/ocr/image"
+        )
+        mineru_api_url = get_env_value(
+            "MINERU_API_URL", "http://10.1.6.52:8009/file_parse"
+        )
+        mineru_backend = get_env_value("MINERU_BACKEND", "vlm-auto-engine")
+        mineru_lang_list = get_env_value("MINERU_LANG_LIST", "en,vn")
+        mineru_parse_method = get_env_value("MINERU_PARSE_METHOD", "auto")
+        mineru_return_middle_json = get_env_value(
+            "MINERU_RETURN_MIDDLE_JSON", False, bool
+        )
+        mineru_return_images = get_env_value("MINERU_RETURN_IMAGES", False, bool)
+        mineru_formula_enable = get_env_value("MINERU_FORMULA_ENABLE", True, bool)
+        mineru_table_enable = get_env_value("MINERU_TABLE_ENABLE", True, bool)
         enable_fallback = get_env_value("DEEPSEEK_OCR_FALLBACK", True, bool)
         timeout = get_env_value("DEEPSEEK_OCR_TIMEOUT", 1200, int)
-        preserve_markdown_structure = get_env_value("OCR_PRESERVE_MARKDOWN_STRUCTURE", True, bool)
-        use_hybrid_mode = get_env_value("OCR_USE_HYBRID_MODE", True, bool)
-        min_table_chars = get_env_value("OCR_MIN_TABLE_CHARS", 50, int)
+        preserve_markdown_structure = get_env_value(
+            "OCR_PRESERVE_MARKDOWN_STRUCTURE", True, bool
+        )
         
         config = cls(
             engine=engine,
             deepseek_api_url=deepseek_api_url,
             deepseek_image_api_url=deepseek_image_api_url,
-            tesseract_lang=tesseract_lang,
+            mineru_api_url=mineru_api_url,
+            mineru_backend=mineru_backend,
+            mineru_lang_list=mineru_lang_list,
+            mineru_parse_method=mineru_parse_method,
+            mineru_return_middle_json=mineru_return_middle_json,
+            mineru_return_images=mineru_return_images,
+            mineru_formula_enable=mineru_formula_enable,
+            mineru_table_enable=mineru_table_enable,
             enable_fallback=enable_fallback,
             timeout=timeout,
             preserve_markdown_structure=preserve_markdown_structure,
-            use_hybrid_mode=use_hybrid_mode,
-            min_table_chars=min_table_chars,
         )
         
         # Validate configuration
@@ -82,26 +107,53 @@ class OCRConfig:
             ValueError: If configuration is invalid
         """
         # Validate engine value
-        valid_engines = ["auto", "deepseek", "docling", "hybrid", "tesseract", "none"]
+        valid_engines = [
+            "auto",
+            "deepseek",
+            "mineru",
+            "docling",
+            "none",
+        ]
         if self.engine not in valid_engines:
             raise ValueError(
                 f"Invalid OCR engine '{self.engine}'. "
                 f"Must be one of: {', '.join(valid_engines)}"
             )
         
-        # Validate deepseek_api_url format
-        if self.engine in ["auto", "deepseek"]:
-            if not self.deepseek_api_url:
-                raise ValueError(
-                    f"deepseek_api_url is required when engine is '{self.engine}'"
-                )
-            
-            if not (self.deepseek_api_url.startswith("http://") or 
-                    self.deepseek_api_url.startswith("https://")):
+        # Validate DeepSeek API URL when it is required or configured.
+        if self.engine == "deepseek" and not self.deepseek_api_url:
+            raise ValueError("deepseek_api_url is required when engine is 'deepseek'")
+
+        if self.deepseek_api_url:
+            if not (
+                self.deepseek_api_url.startswith("http://")
+                or self.deepseek_api_url.startswith("https://")
+            ):
                 raise ValueError(
                     f"Invalid deepseek_api_url '{self.deepseek_api_url}'. "
                     "Must start with http:// or https://"
                 )
+
+        if self.engine == "mineru" and not self.mineru_api_url:
+            raise ValueError("mineru_api_url is required when engine is 'mineru'")
+
+        if self.mineru_api_url:
+            if not (
+                self.mineru_api_url.startswith("http://")
+                or self.mineru_api_url.startswith("https://")
+            ):
+                raise ValueError(
+                    f"Invalid mineru_api_url '{self.mineru_api_url}'. "
+                    "Must start with http:// or https://"
+                )
+
+        if self.engine == "auto" and not (
+            self.mineru_api_url or self.deepseek_api_url
+        ):
+            logger.warning(
+                "Auto OCR configured without MinerU or DeepSeek endpoint. "
+                "Only local Docling can be selected if installed."
+            )
         
         # Validate timeout
         if self.timeout <= 0:
@@ -142,7 +194,12 @@ class OCRResult:
     def __post_init__(self):
         """Validate OCRResult after initialization."""
         # Validate engine_used
-        valid_engines = ["deepseek", "tesseract", "none", "pypdf", "docling", "hybrid"]
+        valid_engines = [
+            "deepseek",
+            "mineru",
+            "none",
+            "docling",
+        ]
         if self.engine_used not in valid_engines:
             raise ValueError(
                 f"Invalid engine_used '{self.engine_used}'. "

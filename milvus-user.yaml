@@ -1,0 +1,3 @@
+quotaAndLimits:
+  limits:
+    maxDynamicFieldLength: 524288

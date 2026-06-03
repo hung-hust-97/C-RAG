@@ -2,10 +2,12 @@
 OCR module for LightRAG - Intelligent OCR engine selection and processing.
 
 This module provides OCR capabilities for processing scanned PDF documents,
-with support for DeepSeek OCR and Tesseract OCR engines. It includes:
+with support for DeepSeek OCR, MinerU OCR, and Docling.
+It includes:
 
 - OCRConfig: Configuration dataclass for OCR settings
 - DeepSeekOCRExtractor: Client for DeepSeek OCR API
+- MinerUOCRExtractor: Client for MinerU /file_parse API
 - OCREngineSelector: Intelligent OCR engine selection
 - MarkdownPreprocessor: Markdown preprocessing for entity extraction
 - Custom exceptions for OCR error handling
@@ -16,11 +18,11 @@ import time
 import os
 import tempfile
 import logging
-from io import BytesIO
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
 from lightrag.ocr.config import OCRConfig, OCRResult
 from lightrag.ocr.deepseek import DeepSeekOCRExtractor
+from lightrag.ocr.miner_u import MinerUOCRExtractor
 from lightrag.ocr.selector import OCREngineSelector
 from lightrag.ocr.markdown import MarkdownPreprocessor
 from lightrag.ocr.exceptions import (
@@ -28,6 +30,9 @@ from lightrag.ocr.exceptions import (
     OCRTimeoutError,
     PDFProcessingError,
     DeepSeekAPIConnectionError,
+    MinerUAPIConnectionError,
+    MinerUOCRError,
+    MinerUOCRTimeoutError,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,12 +41,16 @@ __all__ = [
     "OCRConfig",
     "OCRResult",
     "DeepSeekOCRExtractor",
+    "MinerUOCRExtractor",
     "OCREngineSelector",
     "MarkdownPreprocessor",
     "DeepSeekOCRError",
     "OCRTimeoutError",
     "PDFProcessingError",
     "DeepSeekAPIConnectionError",
+    "MinerUAPIConnectionError",
+    "MinerUOCRError",
+    "MinerUOCRTimeoutError",
     "process_document_with_ocr",
 ]
 
@@ -54,10 +63,10 @@ async def process_document_with_ocr(
 ) -> OCRResult:
     """Process document with prioritized OCR routing.
     
-    New Logic (User Optimized):
-    1. For PDF/Images: Use DeepSeek OCR directly.
-    2. For other formats (fallback): Try DeepSeek OCR if requested.
-    3. If DeepSeek OCR fails or returns no content: Return FAILED (no local fallback).
+    Routing:
+    1. Select the configured OCR engine.
+    2. Auto mode tries MinerU, then DeepSeek, then Docling when compatible.
+    3. Return an OCRResult with error details if all selected engines fail.
     
     Args:
         file_bytes: File content as bytes
@@ -77,67 +86,78 @@ async def process_document_with_ocr(
     
     logger.info(f"Processing {file_extension} with prioritized OCR routing")
     
-    # Select engine
     selector = OCREngineSelector(ocr_config)
-    engine = selector.select_engine()
-    
-    # Primary path: DeepSeek OCR (supports PDF and images, and potentially others via API)
-    if engine == "deepseek":
-        try:
-            logger.info(f"Attempting direct DeepSeek OCR for {file_extension}")
-            result = await _extract_with_deepseek(file_bytes, ocr_config, start_time, file_extension)
-            if result.text.strip():
-                return result
-            
-            logger.warning(f"DeepSeek OCR returned empty result for {file_extension}.")
-            return OCRResult(
-                text="",
-                engine_used="deepseek",
-                processing_time=time.time() - start_time,
-                page_count=0,
-                error="DeepSeek OCR returned no content",
-            )
-        except Exception as e:
-            logger.error(f"DeepSeek OCR failed for {file_extension}: {e}")
-            return OCRResult(
-                text="",
-                engine_used="deepseek",
-                processing_time=time.time() - start_time,
-                page_count=0,
-                error=f"DeepSeek OCR failed: {str(e)}",
-            )
-    
-    # If engine is docling (explicitly requested)
-    elif engine == "docling":
-         try:
-            logger.info(f"Attempting Docling extraction for {file_extension}")
-            result = await _extract_with_docling(file_bytes, ocr_config, start_time)
-            if result.text.strip():
-                return result
-            return OCRResult(
-                text="",
-                engine_used="docling",
-                processing_time=time.time() - start_time,
-                page_count=0,
-                error="Docling returned no content",
-            )
-         except Exception as e:
-            return OCRResult(
-                text="",
-                engine_used="docling",
-                processing_time=time.time() - start_time,
-                page_count=0,
-                error=f"Docling failed: {str(e)}",
-            )
 
-    # Final fallback if they reached here
-    processing_time = time.time() - start_time
+    normalized_extension = file_extension.lower()
+    if normalized_extension and not normalized_extension.startswith("."):
+        normalized_extension = f".{normalized_extension}"
+
+    if ocr_config.engine == "auto":
+        engines = selector.get_auto_engine_candidates()
+    else:
+        engines = [selector.select_engine()]
+
+    last_error = None
+    for engine in engines:
+        if engine == "none":
+            break
+
+        if engine == "docling" and normalized_extension != ".pdf":
+            logger.debug(
+                "Skipping Docling OCR candidate for unsupported extension: %s",
+                normalized_extension,
+            )
+            continue
+
+        try:
+            if engine == "mineru":
+                logger.info(f"Attempting MinerU OCR for {file_extension}")
+                result = await _extract_with_mineru(
+                    file_bytes,
+                    ocr_config,
+                    start_time,
+                    file_extension,
+                )
+            elif engine == "deepseek":
+                logger.info(f"Attempting direct DeepSeek OCR for {file_extension}")
+                result = await _extract_with_deepseek(
+                    file_bytes,
+                    ocr_config,
+                    start_time,
+                    file_extension,
+                )
+            elif engine == "docling":
+                logger.info(f"Attempting Docling extraction for {file_extension}")
+                result = await _extract_with_docling(file_bytes, ocr_config, start_time)
+            else:
+                continue
+
+            if result.text.strip():
+                return result
+
+            last_error = f"{engine} returned no content"
+            logger.warning("%s for %s.", last_error, file_extension)
+            if ocr_config.engine != "auto" or not ocr_config.enable_fallback:
+                return result
+        except Exception as e:
+            last_error = f"{engine} failed: {str(e)}"
+            logger.error("%s for %s", last_error, file_extension)
+            if ocr_config.engine != "auto" or not ocr_config.enable_fallback:
+                return OCRResult(
+                    text="",
+                    engine_used=engine,
+                    processing_time=time.time() - start_time,
+                    page_count=0,
+                    error=last_error,
+                )
+
     return OCRResult(
         text="",
         engine_used="none",
-        processing_time=processing_time,
+        processing_time=time.time() - start_time,
         page_count=0,
-        error=f"No suitable extraction method for {file_extension} or primary engine failed",
+        error=last_error
+        or f"No suitable extraction method for {file_extension} or primary engine failed",
     )
 
 
@@ -171,7 +191,14 @@ async def _extract_with_deepseek(
     
     try:
         # Check if the file is an image
-        if file_extension.lower() in [".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"]:
+        if file_extension.lower() in [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".tiff",
+            ".bmp",
+        ]:
             logger.info("Extracting text from image using DeepSeek OCR.")
             result = await extractor.extract_text_from_image(file_bytes)
             # Image extraction might not provide page_count, default to 1
@@ -196,56 +223,44 @@ async def _extract_with_deepseek(
         await extractor.close()
 
 
-async def _extract_with_tesseract(
+async def _extract_with_mineru(
     file_bytes: bytes,
     config: OCRConfig,
     start_time: float,
+    file_extension: str = ".pdf",
 ) -> OCRResult:
-    """Extract text using Tesseract OCR.
-    
-    Args:
-        file_bytes: PDF file content as bytes
-        config: OCR configuration
-        start_time: Processing start timestamp
-        
-    Returns:
-        OCRResult: Result with extracted text and metadata
-        
-    Raises:
-        ImportError: If pytesseract or pdf2image not installed
-        Exception: If OCR processing fails
-    """
-    try:
-        import pytesseract
-        from pdf2image import convert_from_bytes
-    except ImportError as e:
-        logger.error(f"Tesseract OCR dependencies not available: {e}")
-        raise ImportError(
-            "Tesseract OCR requires pytesseract and pdf2image. "
-            "Install with: pip install pytesseract pdf2image"
-        ) from e
-    
-    # Convert PDF to images
-    images = convert_from_bytes(file_bytes, dpi=300)
-    page_count = len(images)
-    
-    # Extract text from each page
-    pages_text = []
-    for i, image in enumerate(images):
-        logger.debug(f"Processing page {i + 1}/{page_count} with Tesseract")
-        text = pytesseract.image_to_string(image, lang=config.tesseract_lang)
-        pages_text.append(text)
-    
-    full_text = "\n".join(pages_text)
-    processing_time = time.time() - start_time
-    
-    return OCRResult(
-        text=full_text,
-        engine_used="tesseract",
-        processing_time=processing_time,
-        page_count=page_count,
-        format="plain",
+    """Extract text using MinerU OCR API."""
+    extractor = MinerUOCRExtractor(
+        api_url=config.mineru_api_url,
+        timeout=config.timeout,
+        backend=config.mineru_backend,
+        lang_list=config.mineru_lang_list,
+        parse_method=config.mineru_parse_method,
+        return_middle_json=config.mineru_return_middle_json,
+        return_images=config.mineru_return_images,
+        formula_enable=config.mineru_formula_enable,
+        table_enable=config.mineru_table_enable,
     )
+
+    try:
+        normalized_extension = file_extension.lower()
+        if normalized_extension and not normalized_extension.startswith("."):
+            normalized_extension = f".{normalized_extension}"
+        filename = f"document{normalized_extension or '.pdf'}"
+
+        result = await extractor.extract_text_from_document(file_bytes, filename)
+        processing_time = time.time() - start_time
+
+        return OCRResult(
+            text=result["text"],
+            engine_used="mineru",
+            processing_time=processing_time,
+            page_count=result.get("page_count", 0),
+            format="markdown",
+        )
+
+    finally:
+        await extractor.close()
 
 
 async def _extract_with_docling(
@@ -276,17 +291,19 @@ async def _extract_with_docling(
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
-        
+
     try:
-        converter = DocumentConverter(
-            allowed_formats=[InputFormat.PDF]
-        )
+        converter = DocumentConverter(allowed_formats=[InputFormat.PDF])
         conversion_result = converter.convert(tmp_path)
         markdown_content = conversion_result.document.export_to_markdown()
-        page_count = conversion_result.document.num_pages if hasattr(conversion_result.document, "num_pages") else 0
-        
+        page_count = (
+            conversion_result.document.num_pages
+            if hasattr(conversion_result.document, "num_pages")
+            else 0
+        )
+
         processing_time = time.time() - start_time
-        
+
         return OCRResult(
             text=markdown_content,
             engine_used="docling",
@@ -294,160 +311,6 @@ async def _extract_with_docling(
             page_count=page_count,
             format="markdown",
         )
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-async def _hybrid_extract(
-    file_bytes: bytes,
-    config: OCRConfig,
-    start_time: float,
-) -> OCRResult:
-    """Hybrid extraction: Docling for structure + DeepSeek for complex regions.
-    
-    1. Process with Docling to get structure and elements.
-    2. Identify 'unreadable' or 'complex' elements (tables, figures).
-    3. Crop those regions using PyMuPDF.
-    4. Send crops to DeepSeek Image OCR API.
-    5. Reconstruct improved markdown.
-    """
-    try:
-        from docling.document_converter import DocumentConverter
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        import fitz  # PyMuPDF
-        from PIL import Image
-    except ImportError as e:
-        logger.error(f"Hybrid dependencies not available: {e}")
-        raise ImportError(
-            "Hybrid mode requires docling, pymupdf, and pillow. "
-            "Install with: pip install docling pymupdf pillow"
-        ) from e
-
-    # 1. Run Docling
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-        
-    try:
-        # Configure Docling to preserve coordinates
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = False  # Let DeepSeek do the heavy lifting for images
-        pipeline_options.do_table_structure = True
-        
-        converter = DocumentConverter(
-            allowed_formats=[InputFormat.PDF]
-        )
-        
-        conversion_result = converter.convert(tmp_path)
-        doc = conversion_result.document
-        
-        # 2. Identify and Refine Complex Elements
-        # We focus on tables that might be "broken" or poorly extracted
-        refinement_tasks = []
-        
-        for element, _level in doc.iterate_items():
-            # Check for Table elements
-            # Element types vary by docling version, we use string check or class check
-            element_type = element.__class__.__name__
-            
-            if "TableItem" in element_type:
-                # Check if table content looks "poor" or if it marks as an image
-                table_text = element.export_to_markdown()
-                if len(table_text.strip()) < config.min_table_chars or "|" not in table_text:
-                    if hasattr(element, "prov") and element.prov:
-                        refinement_tasks.append(element)
-            
-            # Optionally check for PictureItem if we want to OCR images found in PDF
-            elif "PictureItem" in element_type:
-                if hasattr(element, "prov") and element.prov:
-                    refinement_tasks.append(element)
-
-        if refinement_tasks:
-            logger.info(f"Hybrid Refinement identifying {len(refinement_tasks)} complex regions")
-            
-            # Load PDF with PyMuPDF for cropping
-            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-            deepseek_extractor = DeepSeekOCRExtractor(
-                api_url=config.deepseek_api_url,
-                image_api_url=config.deepseek_image_api_url,
-                timeout=config.timeout
-            )
-            
-            try:
-                for element in refinement_tasks:
-                    prov = element.prov[0]
-                    page_no = prov.page_no - 1  # Docling uses 1-based, fitz uses 0-based
-                    
-                    if 0 <= page_no < len(pdf_doc):
-                        page = pdf_doc[page_no]
-                        # docling bbox: [l, t, r, b] - need to verify coordinate system
-                        # docling usually uses points? fitz uses points.
-                        bbox = prov.bbox
-                        # Some versions might have [x1, y1, x2, y2]
-                        # Fitz Rect: x0, y0, x1, y1
-                        rect = fitz.Rect(bbox.l, bbox.t, bbox.r, bbox.b)
-                        
-                        # Add a small margin
-                        rect.x0 = max(0, rect.x0 - 5)
-                        rect.y0 = max(0, rect.y0 - 5)
-                        rect.x1 = min(page.rect.width, rect.x1 + 5)
-                        rect.y1 = min(page.rect.height, rect.y1 + 5)
-                        
-                        # Create image crop
-                        pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(2, 2)) # 2x zoom for better OCR
-                        img_bytes = pix.tobytes("png")
-                        
-                        # Send to DeepSeek
-                        try:
-                            refined_result = await deepseek_extractor.extract_text_from_image(img_bytes)
-                            refined_text = refined_result.get("text", "")
-                            
-                            if refined_text:
-                                if not hasattr(doc, "_refined_content"):
-                                    doc._refined_content = {}
-                                doc._refined_content[id(element)] = refined_text
-                        except Exception as e:
-                            logger.warning(f"Regional refinement failed for element {id(element)}: {e}")
-            finally:
-                await deepseek_extractor.close()
-                pdf_doc.close()
-
-        # 3. Apply Refined Content via Monkeypatching
-        # We replace the export_to_markdown method of the specific elements
-        # so that when doc.export_to_markdown() is called, it uses our refined text.
-        if hasattr(doc, "_refined_content"):
-            for element, _level in doc.iterate_items():
-                elem_id = id(element)
-                if elem_id in doc._refined_content:
-                    refined_text = doc._refined_content[elem_id]
-                    logger.info(f"Replacing element {elem_id} with refined text (length: {len(refined_text)})")
-                    
-                    # Store original method just in case, though doc is short-lived
-                    # We use a closure to ensure we capture the correct refined_text
-                    def make_refined_exporter(text):
-                        def refined_exporter(*args, **kwargs):
-                            return text
-                        return refined_exporter
-                    
-                    element.export_to_markdown = make_refined_exporter(refined_text)
-
-        markdown_content = doc.export_to_markdown()
-        
-        page_count = doc.num_pages if hasattr(doc, "num_pages") else 0
-        processing_time = time.time() - start_time
-        
-        return OCRResult(
-            text=markdown_content,
-            engine_used="hybrid",
-            processing_time=processing_time,
-            page_count=page_count,
-            format="markdown",
-        )
-    except Exception as e:
-        logger.error(f"Hybrid extraction failed within processing: {e}")
-        raise
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)

@@ -40,6 +40,73 @@ DEFAULT_ENTITY_TYPES = [
     "NaturalObject",
 ]
 
+# Entity types specifically designed for Vietnamese legal documents (Văn bản QPPL)
+# Covers subjects, document types, substantive concepts, procedures, and specialized domains
+DEFAULT_LEGAL_ENTITY_TYPES = [
+    # --- Chủ thể pháp luật (Legal Subjects) ---
+    "LegalSubject",              # Chủ thể pháp lý chung (cá nhân, tổ chức, cơ quan)
+    "GovernmentAgency",          # Cơ quan nhà nước (Bộ, Sở, UBND, Chính phủ, Quốc hội)
+    "Court",                     # Tòa án (TAND tối cao, TAND cấp tỉnh/huyện)
+    "Procuracy",                 # Viện Kiểm sát (VKSND tối cao, VKSND cấp tỉnh/huyện)
+    "Inspector",                 # Thanh tra (Thanh tra Chính phủ, Thanh tra Bộ, Thanh tra Sở)
+    "PublicOfficial",            # Công chức, viên chức, người có thẩm quyền
+    "Enterprise",                # Doanh nghiệp (công ty, hộ kinh doanh)
+    "Citizen",                   # Công dân, cá nhân, người dân
+    "ForeignEntity",             # Tổ chức/cá nhân nước ngoài
+    # --- Loại văn bản QPPL (Legal Document Types) ---
+    "LegalDocument",             # Văn bản QPPL chung
+    "Law",                       # Luật, Bộ luật
+    "Ordinance",                 # Pháp lệnh
+    "Decree",                    # Nghị định
+    "Circular",                  # Thông tư
+    "JointCircular",             # Thông tư liên tịch
+    "Resolution",                # Nghị quyết (Quốc hội, HĐND, Chính phủ)
+    "Decision",                  # Quyết định (Thủ tướng, Bộ trưởng, UBND)
+    "Directive",                 # Chỉ thị
+    "InternationalTreaty",       # Điều ước quốc tế
+    # --- Khái niệm pháp lý cốt lõi (Core Legal Concepts) ---
+    "LegalAction",               # Hành vi pháp lý (hành vi vi phạm, hành vi hợp pháp)
+    "LegalPenalty",              # Hình phạt, chế tài (phạt tiền, phạt tù, cảnh cáo)
+    "LegalRight",                # Quyền (quyền sở hữu, quyền con người, quyền công dân)
+    "LegalObligation",           # Nghĩa vụ pháp lý
+    "LegalCondition",            # Điều kiện pháp lý (điều kiện kinh doanh, điều kiện cấp phép)
+    "LegalConcept",              # Khái niệm/Định nghĩa pháp lý (thuật ngữ chuyên ngành)
+    "LegalPrinciple",            # Nguyên tắc pháp lý (nguyên tắc suy đoán vô tội, thiện chí)
+    "LegalStatus",               # Tình trạng pháp lý (còn hiệu lực, hết hiệu lực, sửa đổi)
+    "Violation",                 # Vi phạm (vi phạm hành chính, vi phạm hình sự)
+    "Crime",                     # Tội phạm (tội danh cụ thể trong Bộ luật Hình sự)
+    "Sanction",                  # Biện pháp xử lý (biện pháp khắc phục hậu quả, biện pháp ngăn chặn)
+    # --- Thủ tục hành chính & Tố tụng (Procedures) ---
+    "AdministrativeProcedure",   # Thủ tục hành chính (đăng ký, cấp phép, phê duyệt)
+    "LitigationProcedure",       # Thủ tục tố tụng (khởi kiện, xét xử, kháng cáo)
+    "ArbitrationProcedure",      # Thủ tục trọng tài
+    "License",                   # Giấy phép, chứng chỉ, giấy chứng nhận
+    "LegalDeadline",             # Thời hạn, thời hiệu (thời hiệu khởi kiện, thời hạn giải quyết)
+    # --- Tài chính, Thuế, Ngân sách (Finance & Tax) ---
+    "Tax",                       # Thuế (thuế GTGT, thuế TNDN, thuế TNCN, thuế XNK)
+    "Fee",                       # Phí, lệ phí (phí công chứng, lệ phí đăng ký)
+    "Budget",                    # Ngân sách nhà nước, quỹ tài chính
+    "FinancialInstrument",       # Công cụ tài chính (trái phiếu, cổ phiếu, chứng khoán)
+    # --- Đất đai, Bất động sản, Xây dựng (Land & Property) ---
+    "LandCategory",              # Loại đất (đất nông nghiệp, đất ở, đất thương mại)
+    "LandUseRight",              # Quyền sử dụng đất
+    "PropertyRight",             # Quyền sở hữu tài sản, bất động sản
+    "ConstructionPermit",        # Giấy phép xây dựng, quy hoạch
+    # --- Lao động, Bảo hiểm (Labor & Insurance) ---
+    "LaborContract",             # Hợp đồng lao động
+    "SocialInsurance",           # Bảo hiểm xã hội (BHXH, BHYT, BHTN)
+    "LaborStandard",             # Tiêu chuẩn lao động (lương tối thiểu, giờ làm việc)
+    # --- Doanh nghiệp, Thương mại (Corporate & Commerce) ---
+    "BusinessLicense",           # Giấy phép kinh doanh, đăng ký doanh nghiệp
+    "Contract",                  # Hợp đồng (hợp đồng dân sự, thương mại)
+    "IntellectualProperty",      # Sở hữu trí tuệ (bằng sáng chế, nhãn hiệu, bản quyền)
+    "Competition",               # Cạnh tranh (chống độc quyền, cạnh tranh không lành mạnh)
+    # --- Môi trường, Tài nguyên (Environment & Resources) ---
+    "EnvironmentalStandard",     # Tiêu chuẩn/Quy chuẩn môi trường
+    "NaturalResource",           # Tài nguyên thiên nhiên (khoáng sản, nước, rừng)
+    "EnvironmentalImpact",       # Đánh giá tác động môi trường (ĐTM)
+]
+
 # Separator for: description, source_id and relation-key fields(Can not be changed after data inserted)
 GRAPH_FIELD_SEP = "<SEP>"
 

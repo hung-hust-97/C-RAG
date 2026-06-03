@@ -117,6 +117,11 @@ class QueryRequest(BaseModel):
         description="Target workspace ID. Overrides LIGHTRAG-WORKSPACE-ID header when set.",
     )
 
+    workspace_ids: Optional[List[str]] = Field(
+        default=None,
+        description="List of additional workspace IDs to search/retrieve from.",
+    )
+
     enable_citations: Optional[bool] = Field(
         default=None,
         description="If True, enables citation tracking and rendering in the response. Default is True.",
@@ -157,12 +162,14 @@ class QueryRequest(BaseModel):
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
             exclude_none=True,
-            exclude={"query", "include_chunk_content", "workspace_id"},
+            exclude={"query", "include_chunk_content", "workspace_id", "workspace_ids"},
         )
 
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
+        if self.workspace_ids:
+            param.workspace_ids = self.workspace_ids
         return param
 
 
@@ -171,6 +178,10 @@ class ReferenceItem(BaseModel):
 
     reference_id: str = Field(description="Unique reference identifier")
     file_path: str = Field(description="Path to the source file")
+    workspace: Optional[str] = Field(
+        default=None,
+        description="Workspace name of this reference",
+    )
     content: Optional[List[str]] = Field(
         default=None,
         description="List of chunk contents from this file (only present when include_chunk_content=True)",
@@ -547,6 +558,17 @@ def create_query_routes(
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
+            if request.workspace_ids and get_rag_for_workspace is not None:
+                other_rags = []
+                for other_ws_id in request.workspace_ids:
+                    if other_ws_id == request.workspace_id:
+                        continue
+                    try:
+                        other_rag = await get_rag_for_workspace(other_ws_id)
+                        other_rags.append(other_rag)
+                    except Exception as e:
+                        logger.error(f"Failed to load additional workspace {other_ws_id}: {e}")
+                param.other_rag_instances = other_rags
 
             if request.mode != "bypass":
                 # Consolidate normalization, classification, and keyword extraction
@@ -858,6 +880,17 @@ def create_query_routes(
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
+            if request.workspace_ids and get_rag_for_workspace is not None:
+                other_rags = []
+                for other_ws_id in request.workspace_ids:
+                    if other_ws_id == request.workspace_id:
+                        continue
+                    try:
+                        other_rag = await get_rag_for_workspace(other_ws_id)
+                        other_rags.append(other_rag)
+                    except Exception as e:
+                        logger.error(f"Failed to load additional workspace {other_ws_id}: {e}")
+                param.other_rag_instances = other_rags
 
             from fastapi.responses import StreamingResponse
 
@@ -1371,6 +1404,17 @@ def create_query_routes(
         try:
             _, current_rag = await resolve_request_context(http_request, request.workspace_id)
             param = request.to_query_params(False)  # No streaming for data endpoint
+            if request.workspace_ids and get_rag_for_workspace is not None:
+                other_rags = []
+                for other_ws_id in request.workspace_ids:
+                    if other_ws_id == request.workspace_id:
+                        continue
+                    try:
+                        other_rag = await get_rag_for_workspace(other_ws_id)
+                        other_rags.append(other_rag)
+                    except Exception as e:
+                        logger.error(f"Failed to load additional workspace {other_ws_id}: {e}")
+                param.other_rag_instances = other_rags
             response = await current_rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata

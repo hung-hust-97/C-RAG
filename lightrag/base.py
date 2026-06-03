@@ -200,8 +200,14 @@ class QueryParam:
     """Specifies the ordering of citations in bibliography format:
     - "relevance": Citations ordered by relevance score (descending)
     - "appearance": Citations ordered by first appearance in response text
-    Default is "relevance" to prioritize most relevant sources.
+    - Default is "relevance" to prioritize most relevant sources.
     """
+
+    workspace_ids: list[str] = field(default_factory=list)
+    """List of additional workspace IDs to search/retrieve from."""
+
+    other_rag_instances: list[Any] = field(default_factory=list)
+    """Internal list of other RAG instances corresponding to workspace_ids."""
 
 
 @dataclass
@@ -634,6 +640,32 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             target_node_id: The ID of the target node
             edge_data: A dictionary of edge properties
         """
+
+    async def upsert_nodes(self, nodes_data: list[tuple[str, dict[str, str]]]) -> None:
+        """Insert or update multiple nodes in the graph.
+
+        Default implementation falls back to calling upsert_node one by one.
+        Override this method for better performance in storage backends that support batch operations.
+
+        Args:
+            nodes_data: A list of tuples (node_id, node_data)
+        """
+        for node_id, node_data in nodes_data:
+            await self.upsert_node(node_id, node_data)
+
+    async def upsert_edges(
+        self, edges_data: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Insert or update multiple edges in the graph.
+
+        Default implementation falls back to calling upsert_edge one by one.
+        Override this method for better performance in storage backends that support batch operations.
+
+        Args:
+            edges_data: A list of tuples (source_node_id, target_node_id, edge_data)
+        """
+        for src_id, tgt_id, edge_data in edges_data:
+            await self.upsert_edge(src_id, tgt_id, edge_data)
 
     @abstractmethod
     async def delete_node(self, node_id: str) -> None:

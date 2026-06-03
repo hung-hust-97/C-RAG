@@ -116,6 +116,31 @@ def create_graph_routes(
         )
         return resolved, current_rag
 
+    async def is_legal_document_workspace(current_rag, workspace_id: str) -> bool:
+        """Read the workspace legal flag from PostgreSQL metadata when available."""
+        db = getattr(getattr(current_rag, "doc_status", None), "db", None)
+        db_query = getattr(db, "query", None)
+        if db_query is None:
+            return False
+
+        try:
+            from lightrag.kg.postgres_impl import to_uuid
+
+            row = await db.query(
+                """
+                SELECT is_legal_document_workspace
+                FROM tbl_workspace
+                WHERE id = $1
+                """,
+                [to_uuid(workspace_id)],
+            )
+            return bool(row and row.get("is_legal_document_workspace"))
+        except Exception as e:
+            logger.debug(
+                f"Failed to read legal workspace flag for '{workspace_id}': {e}"
+            )
+            return False
+
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
     async def get_graph_labels(
         http_request: Request,
@@ -220,11 +245,17 @@ def create_graph_routes(
             logger.debug(
                 f"get_knowledge_graph called with label: '{label}' (length: {len(label)}, repr: {repr(label)})"
             )
-            _, current_rag = await resolve_request_context(http_request, workspace_id)
+            resolved_workspace_id, current_rag = await resolve_request_context(
+                http_request, workspace_id
+            )
+            is_legal_workspace = await is_legal_document_workspace(
+                current_rag, resolved_workspace_id
+            )
             return await current_rag.get_knowledge_graph(
                 node_label=label,
                 max_depth=max_depth,
                 max_nodes=max_nodes,
+                is_legal_document_workspace=is_legal_workspace,
             )
         except Exception as e:
             logger.error(f"Error getting knowledge graph for label '{label}': {str(e)}")

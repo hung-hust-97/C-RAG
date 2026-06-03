@@ -57,47 +57,6 @@ def _is_docling_available() -> bool:
     except ImportError:
         return False
 
-
-@lru_cache(maxsize=1)
-def _is_ocr_available() -> bool:
-    """Check if pytesseract and pdf2image are available for OCR fallback.
-
-    Returns:
-        bool: True if both pytesseract and pdf2image are installed.
-    """
-    try:
-        import pytesseract  # noqa: F401  # type: ignore[import-not-found]
-        import pdf2image  # noqa: F401  # type: ignore[import-not-found]
-
-        return True
-    except ImportError:
-        return False
-
-
-def _extract_pdf_ocr(file_bytes: bytes, lang: str = "eng+vie") -> str:
-    """Extract text from a scanned/image-based PDF using OCR (pytesseract + pdf2image).
-
-    Args:
-        file_bytes: PDF file content as bytes.
-        lang: Tesseract language string (default includes English and Vietnamese).
-
-    Returns:
-        str: OCR-extracted text content.
-
-    Raises:
-        Exception: If OCR processing fails.
-    """
-    import pytesseract  # type: ignore[import-not-found]
-    from pdf2image import convert_from_bytes  # type: ignore[import-not-found]
-
-    images = convert_from_bytes(file_bytes, dpi=300)
-    pages_text: list[str] = []
-    for image in images:
-        text = pytesseract.image_to_string(image, lang=lang)
-        pages_text.append(text)
-    return "\n".join(pages_text)
-
-
 async def generate_title_from_text(text: str, rag_instance: LightRAG, max_length: int = 100) -> str:
     """Generate a concise title from text content using LLM.
 
@@ -1883,14 +1842,7 @@ async def pipeline_enqueue_file(
                         # Create OCR config from global_args
                         ocr_config = OCRConfig.from_global_args(global_args)
                         
-                        # Set engine to deepseek explicitly for images
-                        if ext.lower() in [".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"]:
-                            import copy
-                            img_config = copy.copy(ocr_config)
-                            img_config.engine = "deepseek"
-                            ocr_config = img_config
-
-                        # Call process_document_with_ocr() for document extraction (Hybrid/OCR)
+                        # Call process_document_with_ocr() for document extraction
                         ocr_result = await process_document_with_ocr(
                             file_bytes=file,
                             password=global_args.pdf_decrypt_password,
@@ -1936,7 +1888,10 @@ async def pipeline_enqueue_file(
                             is_binary_doc = ext.lower() in [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"]
                             
                             if is_binary_doc:
-                                logger.warning(f"[File Extraction] DeepSeek OCR returned no content for {file_path.name}. Skipping fallback for binary document.")
+                                logger.warning(
+                                    f"[File Extraction] OCR returned no content for {file_path.name}. "
+                                    "Skipping fallback for binary document."
+                                )
                             elif _is_docling_available():
                                 logger.info(f"[File Extraction] Fallback to Docling for {file_path.name}")
                                 try:
@@ -1948,7 +1903,7 @@ async def pipeline_enqueue_file(
                             if ocr_result and ocr_result.error:
                                 error_msg = f"[File Extraction]Document extraction failed: {ocr_result.error}"
                             else:
-                                error_msg = "[File Extraction]Document extraction returned no content (DeepSeek OCR)"
+                                error_msg = "[File Extraction]Document extraction returned no content (OCR)"
                             
                             await rag.doc_status.upsert({
                                 doc_id: {
@@ -1977,16 +1932,26 @@ async def pipeline_enqueue_file(
 
                 case ".docx" | ".pptx" | ".xlsx":
                     try:
+                        content = ""
                         # Try DOCLING first if available
                         if _is_docling_available():
                             logger.info(f"[File Extraction] Attempting Docling for {file_path.name}")
                             content = await asyncio.to_thread(
                                 _convert_with_docling, file_path
                             )
+                        else:
+                            # High-speed native fallback (python-docx, python-pptx, openpyxl)
+                            logger.info(f"[File Extraction] Docling not available, using native extractor for {file_path.name}")
+                            if ext == ".docx":
+                                content = await asyncio.to_thread(_extract_docx, file)
+                            elif ext == ".pptx":
+                                content = await asyncio.to_thread(_extract_pptx, file)
+                            elif ext == ".xlsx":
+                                content = await asyncio.to_thread(_extract_xlsx, file)
                         
                         if not content or not content.strip():
                             # Fallback to OCR as requested
-                            logger.info(f"[File Extraction] Docling failed/empty for {file_path.name}, falling back to OCR")
+                            logger.info(f"[File Extraction] Primary native extraction failed/empty for {file_path.name}, falling back to OCR")
                             ocr_config = OCRConfig.from_global_args(global_args)
                             ocr_result = await process_document_with_ocr(
                                 file_bytes=file,
@@ -2472,7 +2437,10 @@ async def run_scanning_process(
                 filename = file_path.name
                 existing_doc_data = await rag.doc_status.get_doc_by_file_path(filename)
 
-                if existing_doc_data and existing_doc_data.get("status") == "processed":
+                existing_status = str(
+                    existing_doc_data.get("status", "") if existing_doc_data else ""
+                ).strip().upper()
+                if existing_doc_data and existing_status in {"PROCESSED", "COMPLETED"}:
                     # File is already PROCESSED, skip it with warning
                     processed_files.append(filename)
                     logger.warning(f"Skipping already processed file: {filename}")

@@ -286,8 +286,8 @@ const GraphViewer = () => {
         </div>
       </div>
 
-      {/* Loading overlay - shown when data is loading or theme is switching */}
-      {(isFetching || isThemeSwitching) && (
+      {/* Loading overlay - shown when data is loading, theme is switching, or KG status is loading */}
+      {(isFetching || isThemeSwitching || activeKGStatus.status === 'loading') && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 z-10">
           <div className="text-center">
             <div className="mb-2 h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto"></div>

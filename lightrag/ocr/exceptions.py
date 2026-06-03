@@ -1,4 +1,4 @@
-"""OCR-specific exception classes for the DeepSeek OCR integration.
+"""OCR-specific exception classes for OCR integrations.
 
 This module defines custom exceptions for OCR processing errors, providing
 granular error handling for different failure scenarios in the OCR pipeline.
@@ -27,7 +27,7 @@ class OCRTimeoutError(DeepSeekOCRError):
     - DeepSeek OCR API request exceeds DEEPSEEK_OCR_TIMEOUT
     - Processing time approaches timeout limit and operation is cancelled
     
-    The system may attempt fallback to Tesseract OCR if enabled.
+    The system may attempt fallback to another configured extractor if enabled.
     """
     pass
 
@@ -36,7 +36,7 @@ class PDFProcessingError(Exception):
     """Exception raised when all PDF extraction methods fail.
     
     Raised when:
-    - All methods in the fallback chain fail (pypdf -> docling -> deepseek -> tesseract)
+    - All methods in the configured extraction chain fail
     - PDF file is corrupted or invalid
     - No extraction method is available or configured
     
@@ -54,6 +54,21 @@ class DeepSeekAPIConnectionError(DeepSeekOCRError):
     - DNS resolution fails for API URL
     - Connection timeout occurs before request is sent
     
-    The system may attempt fallback to Tesseract OCR if enabled.
+    The system may attempt fallback to another configured extractor if enabled.
     """
+    pass
+
+
+class MinerUOCRError(Exception):
+    """Base exception for MinerU OCR processing failures."""
+    pass
+
+
+class MinerUOCRTimeoutError(MinerUOCRError):
+    """Exception raised when MinerU OCR processing exceeds the timeout."""
+    pass
+
+
+class MinerUAPIConnectionError(MinerUOCRError):
+    """Exception raised when the MinerU OCR API endpoint is unreachable."""
     pass

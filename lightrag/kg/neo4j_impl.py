@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass
-from typing import final
+from typing import Any, final
 import configparser
 
 
@@ -1186,11 +1186,163 @@ class Neo4JStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error during edge upsert: {str(e)}")
             raise
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(
+            (
+                neo4jExceptions.ServiceUnavailable,
+                neo4jExceptions.TransientError,
+                neo4jExceptions.WriteServiceUnavailable,
+                neo4jExceptions.ClientError,
+                neo4jExceptions.SessionExpired,
+                ConnectionResetError,
+                OSError,
+            )
+        ),
+    )
+    async def upsert_nodes(self, nodes_data: list[tuple[str, dict[str, str]]]) -> None:
+        """Batch insert or update nodes in Neo4j using UNWIND.
+        
+        Groups nodes by entity_type to handle dynamic label assignment.
+        """
+        if not nodes_data:
+            return
+
+        workspace_label = self._get_workspace_label()
+        
+        # Group by entity_type to assign labels dynamically
+        batches_by_type = {}
+        for node_id, properties in nodes_data:
+            entity_type = properties.get("entity_type", "UNKNOWN")
+            # Sanitize entity type (same logic as upsert_node)
+            if isinstance(entity_type, str):
+                if "`" in entity_type or "," in entity_type or not entity_type.strip():
+                    original = entity_type
+                    entity_type = entity_type.replace("`", "").strip()
+                    if "," in entity_type:
+                        entity_type = entity_type.split(",")[0].strip()
+                    if not entity_type:
+                        entity_type = "UNKNOWN"
+                    logger.warning(
+                        f"[{self.workspace}] Entity type sanitized in upsert_nodes: '{original}' -> '{entity_type}'"
+                    )
+            else:
+                entity_type = str(entity_type)
+            
+            clean_properties = dict(properties)
+            clean_properties["entity_type"] = entity_type
+            
+            if entity_type not in batches_by_type:
+                batches_by_type[entity_type] = []
+            batches_by_type[entity_type].append({"entity_id": node_id, "properties": clean_properties})
+
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+                for entity_type, batch in batches_by_type.items():
+                    async def execute_upsert_batch(tx: AsyncManagedTransaction, etype: str, b: list):
+                        query = f"""
+                        CALL apoc.periodic.iterate(
+                            "UNWIND $batch AS row RETURN row",
+                            "MERGE (n:`{workspace_label}` {{entity_id: row.entity_id, workspace_id: $workspace_id}})
+                             SET n += row.properties
+                             SET n:`{etype}`",
+                            {{batchSize: 1000, parallel: false, params: {{batch: $batch, workspace_id: $workspace_id}}}}
+                        )
+                        """
+                        result = await tx.run(
+                            query, workspace_id=self.workspace, batch=b
+                        )
+                        await result.consume()
+                    await session.execute_write(execute_upsert_batch, entity_type, batch)
+        except Exception as e:
+            logger.warning(f"[{self.workspace}] APOC upsert_nodes failed, falling back to standard UNWIND: {str(e)}")
+            async with self._driver.session(database=self._DATABASE) as session:
+                for entity_type, batch in batches_by_type.items():
+                    async def execute_upsert_batch_fallback(tx: AsyncManagedTransaction, etype: str, b: list):
+                        query = f"""
+                        UNWIND $batch AS row
+                        MERGE (n:`{workspace_label}` {{entity_id: row.entity_id, workspace_id: $workspace_id}})
+                        SET n += row.properties
+                        SET n:`{etype}`
+                        """
+                        result = await tx.run(
+                            query, workspace_id=self.workspace, batch=b
+                        )
+                        await result.consume()
+
+                    await session.execute_write(execute_upsert_batch_fallback, entity_type, batch)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(
+            (
+                neo4jExceptions.ServiceUnavailable,
+                neo4jExceptions.TransientError,
+                neo4jExceptions.WriteServiceUnavailable,
+                neo4jExceptions.ClientError,
+                neo4jExceptions.SessionExpired,
+                ConnectionResetError,
+                OSError,
+            )
+        ),
+    )
+    async def upsert_edges(
+        self, edges_data: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Batch insert or update edges in Neo4j using UNWIND."""
+        if not edges_data:
+            return
+
+        workspace_label = self._get_workspace_label()
+        batch = [
+            {"source_id": src, "target_id": tgt, "properties": props}
+            for src, tgt, props in edges_data
+        ]
+
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+                async def execute_upsert_edges_batch(tx: AsyncManagedTransaction):
+                    query = f"""
+                    CALL apoc.periodic.iterate(
+                        "UNWIND $batch AS row RETURN row",
+                        "MATCH (source:`{workspace_label}` {{entity_id: row.source_id, workspace_id: $workspace_id}})
+                         MATCH (target:`{workspace_label}` {{entity_id: row.target_id, workspace_id: $workspace_id}})
+                         MERGE (source)-[r:DIRECTED]-(target)
+                         SET r += row.properties",
+                        {{batchSize: 1000, parallel: false, params: {{batch: $batch, workspace_id: $workspace_id}}}}
+                    )
+                    """
+                    result = await tx.run(
+                        query, workspace_id=self.workspace, batch=batch
+                    )
+                    await result.consume()
+                await session.execute_write(execute_upsert_edges_batch)
+        except Exception as e:
+            logger.warning(f"[{self.workspace}] APOC upsert_edges failed, falling back to standard UNWIND: {str(e)}")
+            async with self._driver.session(database=self._DATABASE) as session:
+                async def execute_upsert_edges_batch_fallback(tx: AsyncManagedTransaction):
+                    query = f"""
+                    UNWIND $batch AS row
+                    MATCH (source:`{workspace_label}` {{entity_id: row.source_id, workspace_id: $workspace_id}})
+                    MATCH (target:`{workspace_label}` {{entity_id: row.target_id, workspace_id: $workspace_id}})
+                    MERGE (source)-[r:DIRECTED]-(target)
+                    SET r += row.properties
+                    """
+                    result = await tx.run(
+                        query, workspace_id=self.workspace, batch=batch
+                    )
+                    await result.consume()
+
+                await session.execute_write(execute_upsert_edges_batch_fallback)
+
     async def get_knowledge_graph(
         self,
         node_label: str,
         max_depth: int = 3,
         max_nodes: int = None,
+        is_legal_document_workspace: bool = False,
     ) -> KnowledgeGraph:
         """
         Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
@@ -1215,6 +1367,45 @@ class Neo4JStorage(BaseGraphStorage):
         result = KnowledgeGraph()
         seen_nodes = set()
         seen_edges = set()
+        relationship_mode = "all"
+        is_legal_workspace = bool(is_legal_document_workspace)
+        legal_entity_types = {
+            "LEGAL_DOCUMENT",
+            "CHAPTER",
+            "ARTICLE",
+            "CLAUSE",
+            "POINT",
+        }
+        legal_hierarchy_keywords = [
+            "HAS_CHAPTER",
+            "HAS_ARTICLE",
+            "HAS_CLAUSE",
+            "HAS_POINT",
+        ]
+        legal_entity_link_keywords = [
+            "MENTIONED_IN",
+            "IS_STRUCTURAL_PART_OF",
+        ]
+
+        def collect_legal_ancestor_labels(node: Any) -> list[str]:
+            if not is_legal_workspace:
+                return []
+
+            entity_type = node.get("entity_type")
+            entity_id = node.get("entity_id")
+            if entity_type not in legal_entity_types or not isinstance(entity_id, str):
+                return []
+
+            parts = entity_id.split("#")
+            # tvpl_key itself uses three # separated parts:
+            # document_type#effective_date#document_number.
+            if len(parts) <= 3:
+                return []
+
+            ancestors = ["#".join(parts[:3])]
+            for end in range(4, len(parts)):
+                ancestors.append("#".join(parts[:end]))
+            return ancestors
 
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
@@ -1239,21 +1430,69 @@ class Neo4JStorage(BaseGraphStorage):
                         if count_result:
                             await count_result.consume()
 
-                    # Run main query to get nodes with highest degree
-                    main_query = f"""
-                    MATCH (n:`{workspace_label}`)
-                    OPTIONAL MATCH (n)-[r]-()
-                    WITH n, COALESCE(count(r), 0) AS degree
-                    ORDER BY degree DESC
-                    LIMIT $max_nodes
-                    WITH collect({{node: n}}) AS filtered_nodes
-                    UNWIND filtered_nodes AS node_info
-                    WITH collect(node_info.node) AS kept_nodes, filtered_nodes
-                    OPTIONAL MATCH (a)-[r]-(b)
-                    WHERE a IN kept_nodes AND b IN kept_nodes
-                    RETURN filtered_nodes AS node_info,
-                           collect(DISTINCT r) AS relationships
-                    """
+                    legal_document_count = 0
+                    if is_legal_workspace:
+                        legal_count_query = f"""
+                        MATCH (n:`{workspace_label}`)
+                        WHERE n.entity_type = 'LEGAL_DOCUMENT'
+                        RETURN count(n) AS total
+                        """
+                        legal_count_result = None
+                        try:
+                            legal_count_result = await session.run(legal_count_query)
+                            legal_count_record = await legal_count_result.single()
+                            if legal_count_record:
+                                legal_document_count = legal_count_record["total"]
+                        finally:
+                            if legal_count_result:
+                                await legal_count_result.consume()
+
+                    # For legal workspaces, the default graph is document-level:
+                    # legal documents plus their inter-document relations. Users
+                    # expand a document to load hierarchy one level at a time.
+                    if legal_document_count > 0:
+                        relationship_mode = "document"
+                        if legal_document_count > max_nodes:
+                            result.is_truncated = True
+
+                        main_query = f"""
+                        MATCH (n:`{workspace_label}`)
+                        WHERE n.entity_type = 'LEGAL_DOCUMENT'
+                        OPTIONAL MATCH (n)-[r]-()
+                        WITH n,
+                             sum(CASE
+                                 WHEN coalesce(r.keywords, '') STARTS WITH 'VAN_BAN'
+                                 THEN 1 ELSE 0
+                             END) AS degree
+                        ORDER BY degree DESC
+                        LIMIT $max_nodes
+                        WITH collect({{node: n}}) AS filtered_nodes
+                        UNWIND filtered_nodes AS node_info
+                        WITH collect(node_info.node) AS kept_nodes, filtered_nodes
+                        OPTIONAL MATCH (a)-[r]-(b)
+                        WHERE a IN kept_nodes
+                          AND b IN kept_nodes
+                          AND a.entity_type = 'LEGAL_DOCUMENT'
+                          AND b.entity_type = 'LEGAL_DOCUMENT'
+                          AND coalesce(r.keywords, '') STARTS WITH 'VAN_BAN'
+                        RETURN filtered_nodes AS node_info,
+                               collect(DISTINCT r) AS relationships
+                        """
+                    else:
+                        main_query = f"""
+                        MATCH (n:`{workspace_label}`)
+                        OPTIONAL MATCH (n)-[r]-()
+                        WITH n, COALESCE(count(r), 0) AS degree
+                        ORDER BY degree DESC
+                        LIMIT $max_nodes
+                        WITH collect({{node: n}}) AS filtered_nodes
+                        UNWIND filtered_nodes AS node_info
+                        WITH collect(node_info.node) AS kept_nodes, filtered_nodes
+                        OPTIONAL MATCH (a)-[r]-(b)
+                        WHERE a IN kept_nodes AND b IN kept_nodes
+                        RETURN filtered_nodes AS node_info,
+                               collect(DISTINCT r) AS relationships
+                        """
                     result_set = None
                     try:
                         result_set = await session.run(
@@ -1266,103 +1505,175 @@ class Neo4JStorage(BaseGraphStorage):
                             await result_set.consume()
 
                 else:
-                    # return await self._robust_fallback(node_label, max_depth, max_nodes)
-                    # First try without limit to check if we need to truncate
-                    full_query = f"""
+                    start_type_query = f"""
                     MATCH (start:`{workspace_label}`)
                     WHERE start.entity_id = $entity_id
-                    WITH start
-                    CALL apoc.path.subgraphAll(start, {{
-                        relationshipFilter: '',
-                        labelFilter: '{workspace_label}',
-                        minLevel: 0,
-                        maxLevel: $max_depth,
-                        bfs: true
-                    }})
-                    YIELD nodes, relationships
-                    WITH nodes, relationships, size(nodes) AS total_nodes
-                    UNWIND nodes AS node
-                    WITH collect({{node: node}}) AS node_info, relationships, total_nodes
-                    RETURN node_info, relationships, total_nodes
+                    RETURN start.entity_type AS entity_type
                     """
-
-                    # Try to get full result
-                    full_result = None
+                    start_type_result = None
                     try:
-                        full_result = await session.run(
-                            full_query,
-                            {
-                                "entity_id": node_label,
-                                "max_depth": max_depth,
-                            },
+                        start_type_result = await session.run(
+                            start_type_query, entity_id=node_label
                         )
-                        full_record = await full_result.single()
-
-                        # If no record found, return empty KnowledgeGraph
-                        if not full_record:
-                            logger.debug(
-                                f"[{self.workspace}] No nodes found for entity_id: {node_label}"
-                            )
-                            return result
-
-                        # If record found, check node count
-                        total_nodes = full_record["total_nodes"]
-
-                        if total_nodes <= max_nodes:
-                            # If node count is within limit, use full result directly
-                            logger.debug(
-                                f"[{self.workspace}] Using full result with {total_nodes} nodes (no truncation needed)"
-                            )
-                            record = full_record
-                        else:
-                            # If node count exceeds limit, set truncated flag and run limited query
-                            result.is_truncated = True
-                            logger.info(
-                                f"[{self.workspace}] Graph truncated: {total_nodes} nodes found, breadth-first search limited to {max_nodes}"
-                            )
-
-                            # Run limited query
-                            limited_query = f"""
-                            MATCH (start:`{workspace_label}`)
-                            WHERE start.entity_id = $entity_id
-                            WITH start
-                            CALL apoc.path.subgraphAll(start, {{
-                                relationshipFilter: '',
-                                labelFilter: '{workspace_label}',
-                                minLevel: 0,
-                                maxLevel: $max_depth,
-                                limit: $max_nodes,
-                                bfs: true
-                            }})
-                            YIELD nodes, relationships
-                            UNWIND nodes AS node
-                            WITH collect({{node: node}}) AS node_info, relationships
-                            RETURN node_info, relationships
-                            """
-                            result_set = None
-                            try:
-                                result_set = await session.run(
-                                    limited_query,
-                                    {
-                                        "entity_id": node_label,
-                                        "max_depth": max_depth,
-                                        "max_nodes": max_nodes,
-                                    },
-                                )
-                                record = await result_set.single()
-                            finally:
-                                if result_set:
-                                    await result_set.consume()
+                        start_type_record = await start_type_result.single()
                     finally:
-                        if full_result:
-                            await full_result.consume()
+                        if start_type_result:
+                            await start_type_result.consume()
+
+                    if (
+                        is_legal_workspace
+                        and
+                        start_type_record
+                        and start_type_record["entity_type"] in legal_entity_types
+                    ):
+                        relationship_mode = "hierarchy"
+                        hierarchy_query = f"""
+                        MATCH (start:`{workspace_label}`)
+                        WHERE start.entity_id = $entity_id
+                        MATCH path = (start)-[rels*0..{max_depth}]-(n:`{workspace_label}`)
+                        WHERE all(r IN rels WHERE r.keywords IN $hierarchy_keywords)
+                        WITH collect(DISTINCT n)[0..$max_nodes] AS legal_nodes
+                        OPTIONAL MATCH (entity:`{workspace_label}`)-[link]-(legal:`{workspace_label}`)
+                        WHERE legal IN legal_nodes
+                          AND coalesce(link.keywords, '') IN $entity_link_keywords
+                        WITH legal_nodes, collect(DISTINCT entity) AS linked_entities
+                        WITH [node IN legal_nodes + linked_entities WHERE node IS NOT NULL] AS candidate_nodes
+                        UNWIND candidate_nodes AS kept_node
+                        WITH collect(DISTINCT kept_node) AS kept_nodes
+                        WITH [node IN kept_nodes | {{node: node}}] AS node_info, kept_nodes
+                        OPTIONAL MATCH (a)-[r]-(b)
+                        WHERE a IN kept_nodes
+                          AND b IN kept_nodes
+                          AND (
+                            coalesce(r.keywords, '') IN $hierarchy_keywords
+                            OR coalesce(r.keywords, '') IN $entity_link_keywords
+                            OR (
+                              NOT (coalesce(a.entity_type, '') IN $legal_entity_types)
+                              AND NOT (coalesce(b.entity_type, '') IN $legal_entity_types)
+                            )
+                          )
+                        RETURN node_info, collect(DISTINCT r) AS relationships
+                        """
+                        result_set = None
+                        try:
+                            result_set = await session.run(
+                                hierarchy_query,
+                                {
+                                    "entity_id": node_label,
+                                    "max_nodes": max_nodes,
+                                    "hierarchy_keywords": legal_hierarchy_keywords,
+                                    "entity_link_keywords": legal_entity_link_keywords,
+                                    "legal_entity_types": list(legal_entity_types),
+                                },
+                            )
+                            record = await result_set.single()
+                        finally:
+                            if result_set:
+                                await result_set.consume()
+                    else:
+                        # return await self._robust_fallback(node_label, max_depth, max_nodes)
+                        # First try without limit to check if we need to truncate
+                        full_query = f"""
+                        MATCH (start:`{workspace_label}`)
+                        WHERE start.entity_id = $entity_id
+                        WITH start
+                        CALL apoc.path.subgraphAll(start, {{
+                            relationshipFilter: '',
+                            labelFilter: '{workspace_label}',
+                            minLevel: 0,
+                            maxLevel: $max_depth,
+                            bfs: true
+                        }})
+                        YIELD nodes, relationships
+                        WITH nodes, relationships, size(nodes) AS total_nodes
+                        UNWIND nodes AS node
+                        WITH collect({{node: node}}) AS node_info, relationships, total_nodes
+                        RETURN node_info, relationships, total_nodes
+                        """
+
+                        # Try to get full result
+                        full_result = None
+                        try:
+                            full_result = await session.run(
+                                full_query,
+                                {
+                                    "entity_id": node_label,
+                                    "max_depth": max_depth,
+                                },
+                            )
+                            full_record = await full_result.single()
+
+                            # If no record found, return empty KnowledgeGraph
+                            if not full_record:
+                                logger.debug(
+                                    f"[{self.workspace}] No nodes found for entity_id: {node_label}"
+                                )
+                                return result
+
+                            # If record found, check node count
+                            total_nodes = full_record["total_nodes"]
+
+                            if total_nodes <= max_nodes:
+                                # If node count is within limit, use full result directly
+                                logger.debug(
+                                    f"[{self.workspace}] Using full result with {total_nodes} nodes (no truncation needed)"
+                                )
+                                record = full_record
+                            else:
+                                # If node count exceeds limit, set truncated flag and run limited query
+                                result.is_truncated = True
+                                logger.info(
+                                    f"[{self.workspace}] Graph truncated: {total_nodes} nodes found, breadth-first search limited to {max_nodes}"
+                                )
+
+                                # Run limited query
+                                limited_query = f"""
+                                MATCH (start:`{workspace_label}`)
+                                WHERE start.entity_id = $entity_id
+                                WITH start
+                                CALL apoc.path.subgraphAll(start, {{
+                                    relationshipFilter: '',
+                                    labelFilter: '{workspace_label}',
+                                    minLevel: 0,
+                                    maxLevel: $max_depth,
+                                    limit: $max_nodes,
+                                    bfs: true
+                                }})
+                                YIELD nodes, relationships
+                                UNWIND nodes AS node
+                                WITH collect({{node: node}}) AS node_info, relationships
+                                RETURN node_info, relationships
+                                """
+                                result_set = None
+                                try:
+                                    result_set = await session.run(
+                                        limited_query,
+                                        {
+                                            "entity_id": node_label,
+                                            "max_depth": max_depth,
+                                            "max_nodes": max_nodes,
+                                        },
+                                    )
+                                    record = await result_set.single()
+                                finally:
+                                    if result_set:
+                                        await result_set.consume()
+                        finally:
+                            if full_result:
+                                await full_result.consume()
 
                 if record:
+                    returned_node_ids = []
+                    missing_ancestor_labels = set()
                     # Handle nodes (compatible with multi-label cases)
                     for node_info in record["node_info"]:
                         node = node_info["node"]
                         node_id = node.id
                         if node_id not in seen_nodes:
+                            missing_ancestor_labels.update(
+                                collect_legal_ancestor_labels(node)
+                            )
+                            returned_node_ids.append(node_id)
                             result.nodes.append(
                                 KnowledgeGraphNode(
                                     id=f"{node_id}",
@@ -1372,8 +1683,98 @@ class Neo4JStorage(BaseGraphStorage):
                             )
                             seen_nodes.add(node_id)
 
+                    if missing_ancestor_labels:
+                        existing_labels = {
+                            node.properties.get("entity_id") for node in result.nodes
+                        }
+                        missing_ancestor_labels.difference_update(existing_labels)
+
+                    if missing_ancestor_labels:
+                        ancestor_query = f"""
+                        MATCH (n:`{workspace_label}`)
+                        WHERE n.entity_id IN $entity_ids
+                        RETURN collect({{node: n}}) AS node_info
+                        """
+                        ancestor_result = None
+                        try:
+                            ancestor_result = await session.run(
+                                ancestor_query,
+                                entity_ids=list(missing_ancestor_labels),
+                            )
+                            ancestor_record = await ancestor_result.single()
+                            if ancestor_record:
+                                for node_info in ancestor_record["node_info"]:
+                                    node = node_info["node"]
+                                    node_id = node.id
+                                    if node_id not in seen_nodes:
+                                        returned_node_ids.append(node_id)
+                                        result.nodes.append(
+                                            KnowledgeGraphNode(
+                                                id=f"{node_id}",
+                                                labels=[node.get("entity_id")],
+                                                properties=dict(node),
+                                            )
+                                        )
+                                        seen_nodes.add(node_id)
+                        finally:
+                            if ancestor_result:
+                                await ancestor_result.consume()
+
+                    relationships = record["relationships"]
+                    if returned_node_ids:
+                        if relationship_mode == "document":
+                            relationships_query = f"""
+                            MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
+                            WHERE id(a) IN $node_ids
+                              AND id(b) IN $node_ids
+                              AND a.entity_type = 'LEGAL_DOCUMENT'
+                              AND b.entity_type = 'LEGAL_DOCUMENT'
+                              AND coalesce(r.keywords, '') STARTS WITH 'VAN_BAN'
+                            RETURN collect(DISTINCT r) AS relationships
+                            """
+                            relationship_params = {"node_ids": returned_node_ids}
+                        elif relationship_mode == "hierarchy":
+                            relationships_query = f"""
+                            MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
+                            WHERE id(a) IN $node_ids
+                              AND id(b) IN $node_ids
+                              AND (
+                                coalesce(r.keywords, '') IN $hierarchy_keywords
+                                OR coalesce(r.keywords, '') IN $entity_link_keywords
+                                OR (
+                                  NOT (coalesce(a.entity_type, '') IN $legal_entity_types)
+                                  AND NOT (coalesce(b.entity_type, '') IN $legal_entity_types)
+                                )
+                              )
+                            RETURN collect(DISTINCT r) AS relationships
+                            """
+                            relationship_params = {
+                                "node_ids": returned_node_ids,
+                                "hierarchy_keywords": legal_hierarchy_keywords,
+                                "entity_link_keywords": legal_entity_link_keywords,
+                                "legal_entity_types": list(legal_entity_types),
+                            }
+                        else:
+                            relationships_query = f"""
+                            MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
+                            WHERE id(a) IN $node_ids AND id(b) IN $node_ids
+                            RETURN collect(DISTINCT r) AS relationships
+                            """
+                            relationship_params = {"node_ids": returned_node_ids}
+                        relationships_result = None
+                        try:
+                            relationships_result = await session.run(
+                                relationships_query, **relationship_params
+                            )
+                            relationships_record = await relationships_result.single()
+                            if relationships_record:
+                                relationships = relationships_record["relationships"]
+                        finally:
+                            if relationships_result:
+                                await relationships_result.consume()
+
                     # Handle relationships (including direction information)
-                    for rel in record["relationships"]:
+                    for rel in relationships:
                         edge_id = rel.id
                         if edge_id not in seen_edges:
                             start = rel.start_node

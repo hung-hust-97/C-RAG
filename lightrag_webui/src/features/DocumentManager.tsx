@@ -49,14 +49,10 @@ const getCountValue = (counts: Record<string, number>, ...keys: string[]): numbe
 }
 
 const hasActiveDocumentsStatus = (counts: Record<string, number>): boolean =>
+  getCountValue(counts, 'UPLOADING', 'UPLOADING') > 0 ||
   getCountValue(counts, 'EXTRACTING', 'EXTRACTING') > 0 ||
   getCountValue(counts, 'EXTRACTED', 'EXTRACTED') > 0 ||
-  getCountValue(counts, 'CHUNKING', 'CHUNKING') > 0 ||
-  getCountValue(counts, 'CHUNKED', 'chunked') > 0 ||
-  // Legacy statuses
-  getCountValue(counts, 'PROCESSING', 'PROCESSING') > 0 ||
-  getCountValue(counts, 'PENDING', 'PENDING') > 0 ||
-  getCountValue(counts, 'PREPROCESSED', 'preprocessed') > 0
+  getCountValue(counts, 'CHUNKING', 'CHUNKING') > 0
 
 const getDisplayFileName = (doc: DocStatusResponse, maxLength: number = 20): string => {
   // Check if file_path exists and is a non-empty string
@@ -232,6 +228,7 @@ export default function DocumentManager() {
   const [docs, setDocs] = useState<DocsStatusesResponse | null>(null)
 
   const currentTab = useSettingsStore.use.currentTab()
+  const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
   const showFileName = useSettingsStore.use.showFileName()
   const setShowFileName = useSettingsStore.use.setShowFileName()
   const documentsPageSize = useSettingsStore.use.documentsPageSize()
@@ -250,6 +247,27 @@ export default function DocumentManager() {
   const [statusCounts, setStatusCounts] = useState<Record<string, number>>({ all: 0 })
   const [isRefreshing, setIsRefreshing] = useState(false)
 
+  // Workspace switching loading state
+  const [isWorkspaceSwitching, setIsWorkspaceSwitching] = useState(false)
+  const prevWorkspaceIdRef = useRef(selectedWorkspaceId)
+
+  // Detect workspace changes and show loading screen
+  useEffect(() => {
+    if (prevWorkspaceIdRef.current !== selectedWorkspaceId) {
+      setIsWorkspaceSwitching(true)
+      setDocs(null)
+      setCurrentPageDocs([])
+      prevWorkspaceIdRef.current = selectedWorkspaceId
+    }
+  }, [selectedWorkspaceId])
+
+  // Reset loading state when fetch completes
+  useEffect(() => {
+    if (!isRefreshing) {
+      setIsWorkspaceSwitching(false)
+    }
+  }, [isRefreshing])
+
   // Sort state
   const [sortField, setSortField] = useState<SortField>('updated_at')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
@@ -260,11 +278,12 @@ export default function DocumentManager() {
   // State to store page number for each status filter
   const [pageByStatus, setPageByStatus] = useState<Record<StatusFilter, number>>({
     all: 1,
-    processed: 1,
-    preprocessed: 1,
-    processing: 1,
-    pending: 1,
-    failed: 1,
+    UPLOADING: 1,
+    EXTRACTING: 1,
+    EXTRACTED: 1,
+    CHUNKING: 1,
+    PROCESSED: 1,
+    FAILED: 1,
   });
 
   // State for document selection
@@ -327,11 +346,12 @@ export default function DocumentManager() {
     // Reset all status filters' page memory since sorting affects all
     setPageByStatus({
       all: 1,
-      processed: 1,
-      preprocessed: 1,
-      processing: 1,
-      pending: 1,
-      failed: 1,
+      UPLOADING: 1,
+      EXTRACTING: 1,
+      EXTRACTED: 1,
+      CHUNKING: 1,
+      PROCESSED: 1,
+      FAILED: 1,
     });
   };
 
@@ -473,20 +493,20 @@ export default function DocumentManager() {
     return counts;
   }, [docs]);
 
-  const processedCount = getCountValue(statusCounts, 'PROCESSED', 'PROCESSED') || documentCounts.PROCESSED || 0;
-  const chunkedCount = getCountValue(statusCounts, 'CHUNKED', 'chunked', 'PREPROCESSED', 'preprocessed') || documentCounts.PREPROCESSED || documentCounts.CHUNKED || 0;
-  const chunkingCount = getCountValue(statusCounts, 'CHUNKING', 'CHUNKING', 'PROCESSING', 'PROCESSING') || documentCounts.PROCESSING || documentCounts.CHUNKING || 0;
-  const extractedCount = getCountValue(statusCounts, 'EXTRACTED', 'EXTRACTED', 'PENDING', 'PENDING') || documentCounts.PENDING || documentCounts.EXTRACTED || 0;
-  const extractingCount = getCountValue(statusCounts, 'EXTRACTING', 'EXTRACTING') || documentCounts.EXTRACTING || 0;
-  const failedCount = getCountValue(statusCounts, 'FAILED', 'FAILED') || documentCounts.FAILED || 0;
+  const uploadingCount = getCountValue(statusCounts, 'UPLOADING') || documentCounts.UPLOADING || 0;
+  const extractingCount = getCountValue(statusCounts, 'EXTRACTING') || documentCounts.EXTRACTING || 0;
+  const extractedCount = getCountValue(statusCounts, 'EXTRACTED') || documentCounts.EXTRACTED || 0;
+  const chunkingCount = getCountValue(statusCounts, 'CHUNKING') || documentCounts.CHUNKING || 0;
+  const processedCount = getCountValue(statusCounts, 'PROCESSED') || documentCounts.PROCESSED || 0;
+  const failedCount = getCountValue(statusCounts, 'FAILED') || documentCounts.FAILED || 0;
 
   // Store previous status counts
   const prevStatusCounts = useRef({
-    processed: 0,
-    chunked: 0,
-    chunking: 0,
-    extracted: 0,
+    uploading: 0,
     extracting: 0,
+    extracted: 0,
+    chunking: 0,
+    processed: 0,
     failed: 0
   })
 
@@ -574,11 +594,12 @@ export default function DocumentManager() {
     // Update legacy docs state for backward compatibility
     const legacyDocs: DocsStatusesResponse = {
       statuses: {
-        processed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PROCESSED'),
-        preprocessed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'preprocessed'),
-        processing: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PROCESSING'),
-        pending: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PENDING'),
-        failed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'FAILED')
+        UPLOADING: response.documents.filter((doc: DocStatusResponse) => doc.status === 'UPLOADING'),
+        EXTRACTING: response.documents.filter((doc: DocStatusResponse) => doc.status === 'EXTRACTING'),
+        EXTRACTED: response.documents.filter((doc: DocStatusResponse) => doc.status === 'EXTRACTED'),
+        CHUNKING: response.documents.filter((doc: DocStatusResponse) => doc.status === 'CHUNKING'),
+        PROCESSED: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PROCESSED'),
+        FAILED: response.documents.filter((doc: DocStatusResponse) => doc.status === 'FAILED'),
       }
     };
 
@@ -885,11 +906,12 @@ export default function DocumentManager() {
     // Reset all status filters to page 1 when page size changes
     setPageByStatus({
       all: 1,
-      processed: 1,
-      preprocessed: 1,
-      processing: 1,
-      pending: 1,
-      failed: 1,
+      UPLOADING: 1,
+      EXTRACTING: 1,
+      EXTRACTED: 1,
+      CHUNKING: 1,
+      PROCESSED: 1,
+      FAILED: 1,
     });
 
     setPagination(prev => ({ ...prev, page: 1, page_size: newPageSize }));
@@ -926,11 +948,12 @@ export default function DocumentManager() {
         // Update legacy docs state for backward compatibility
         const legacyDocs: DocsStatusesResponse = {
           statuses: {
-            processed: response.documents.filter(doc => doc.status === 'PROCESSED'),
-            preprocessed: response.documents.filter(doc => doc.status === 'preprocessed'),
-            processing: response.documents.filter(doc => doc.status === 'PROCESSING'),
-            pending: response.documents.filter(doc => doc.status === 'PENDING'),
-            failed: response.documents.filter(doc => doc.status === 'FAILED')
+            UPLOADING: response.documents.filter((doc: DocStatusResponse) => doc.status === 'UPLOADING'),
+            EXTRACTING: response.documents.filter((doc: DocStatusResponse) => doc.status === 'EXTRACTING'),
+            EXTRACTED: response.documents.filter((doc: DocStatusResponse) => doc.status === 'EXTRACTED'),
+            CHUNKING: response.documents.filter((doc: DocStatusResponse) => doc.status === 'CHUNKING'),
+            PROCESSED: response.documents.filter((doc: DocStatusResponse) => doc.status === 'PROCESSED'),
+            FAILED: response.documents.filter((doc: DocStatusResponse) => doc.status === 'FAILED'),
           }
         };
 
@@ -1002,11 +1025,12 @@ export default function DocumentManager() {
 
     // Get new status counts
     const newStatusCounts = {
-      processed: docs?.statuses?.processed?.length || 0,
-      preprocessed: docs?.statuses?.preprocessed?.length || 0,
-      processing: docs?.statuses?.processing?.length || 0,
-      pending: docs?.statuses?.pending?.length || 0,
-      failed: docs?.statuses?.failed?.length || 0
+      uploading: docs?.statuses?.UPLOADING?.length || 0,
+      extracting: docs?.statuses?.EXTRACTING?.length || 0,
+      extracted: docs?.statuses?.EXTRACTED?.length || 0,
+      chunking: docs?.statuses?.CHUNKING?.length || 0,
+      processed: docs?.statuses?.PROCESSED?.length || 0,
+      failed: docs?.statuses?.FAILED?.length || 0
     }
 
     // Check if any status count has changed
@@ -1066,10 +1090,12 @@ export default function DocumentManager() {
     // Reset status counts to ensure proper state
     setStatusCounts({
       all: 0,
-      processed: 0,
-      processing: 0,
-      pending: 0,
-      failed: 0
+      UPLOADING: 0,
+      EXTRACTING: 0,
+      EXTRACTED: 0,
+      CHUNKING: 0,
+      PROCESSED: 0,
+      FAILED: 0
     });
 
     // Perform one immediate refresh to confirm clear operation
@@ -1117,7 +1143,8 @@ export default function DocumentManager() {
     statusFilter,
     sortField,
     sortDirection,
-    fetchPaginatedDocuments
+    fetchPaginatedDocuments,
+    selectedWorkspaceId
   ]);
 
   return (
@@ -1219,6 +1246,54 @@ export default function DocumentManager() {
                   </Button>
                   <Button
                     size="sm"
+                    variant={statusFilter === 'UPLOADING' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('UPLOADING')}
+                    disabled={isRefreshing}
+                    className={cn(
+                      uploadingCount > 0 ? 'text-gray-600' : 'text-gray-500',
+                      statusFilter === 'UPLOADING' && 'bg-gray-100 dark:bg-gray-800 font-medium border shadow-sm'
+                    )}
+                  >
+                    {t('documentPanel.documentManager.status.uploading', 'Uploading')} ({uploadingCount})
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={statusFilter === 'EXTRACTING' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('EXTRACTING')}
+                    disabled={isRefreshing}
+                    className={cn(
+                      extractingCount > 0 ? 'text-orange-600' : 'text-gray-500',
+                      statusFilter === 'EXTRACTING' && 'bg-orange-100 dark:bg-orange-900/30 font-medium border border-orange-400 dark:border-orange-600 shadow-sm'
+                    )}
+                  >
+                    {t('documentPanel.documentManager.status.extracting', 'Extracting')} ({extractingCount})
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={statusFilter === 'EXTRACTED' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('EXTRACTED')}
+                    disabled={isRefreshing}
+                    className={cn(
+                      extractedCount > 0 ? 'text-yellow-600' : 'text-gray-500',
+                      statusFilter === 'EXTRACTED' && 'bg-yellow-100 dark:bg-yellow-900/30 font-medium border border-yellow-400 dark:border-yellow-600 shadow-sm'
+                    )}
+                  >
+                    {t('documentPanel.documentManager.status.extracted', 'Extracted')} ({extractedCount})
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={statusFilter === 'CHUNKING' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('CHUNKING')}
+                    disabled={isRefreshing}
+                    className={cn(
+                      chunkingCount > 0 ? 'text-blue-600' : 'text-gray-500',
+                      statusFilter === 'CHUNKING' && 'bg-blue-100 dark:bg-blue-900/30 font-medium border border-blue-400 dark:border-blue-600 shadow-sm'
+                    )}
+                  >
+                    {t('documentPanel.documentManager.status.chunking', 'Chunking')} ({chunkingCount})
+                  </Button>
+                  <Button
+                    size="sm"
                     variant={statusFilter === 'PROCESSED' ? 'secondary' : 'outline'}
                     onClick={() => handleStatusFilterChange('PROCESSED')}
                     disabled={isRefreshing}
@@ -1228,42 +1303,6 @@ export default function DocumentManager() {
                     )}
                   >
                     {t('documentPanel.documentManager.status.completed')} ({processedCount})
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={statusFilter === 'preprocessed' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('preprocessed')}
-                    disabled={isRefreshing}
-                    className={cn(
-                      preprocessedCount > 0 ? 'text-purple-600' : 'text-gray-500',
-                      statusFilter === 'preprocessed' && 'bg-purple-100 dark:bg-purple-900/30 font-medium border border-purple-400 dark:border-purple-600 shadow-sm'
-                    )}
-                  >
-                    {t('documentPanel.documentManager.status.preprocessed')} ({preprocessedCount})
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={statusFilter === 'PROCESSING' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('PROCESSING')}
-                    disabled={isRefreshing}
-                    className={cn(
-                      processingCount > 0 ? 'text-blue-600' : 'text-gray-500',
-                      statusFilter === 'PROCESSING' && 'bg-blue-100 dark:bg-blue-900/30 font-medium border border-blue-400 dark:border-blue-600 shadow-sm'
-                    )}
-                  >
-                    {t('documentPanel.documentManager.status.processing')} ({processingCount})
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={statusFilter === 'PENDING' ? 'secondary' : 'outline'}
-                    onClick={() => handleStatusFilterChange('PENDING')}
-                    disabled={isRefreshing}
-                    className={cn(
-                      pendingCount > 0 ? 'text-yellow-600' : 'text-gray-500',
-                      statusFilter === 'PENDING' && 'bg-yellow-100 dark:bg-yellow-900/30 font-medium border border-yellow-400 dark:border-yellow-600 shadow-sm'
-                    )}
-                  >
-                    {t('documentPanel.documentManager.status.pending')} ({pendingCount})
                   </Button>
                   <Button
                     size="sm"
@@ -1313,8 +1352,13 @@ export default function DocumentManager() {
             <CardDescription aria-hidden="true" className="hidden">{t('documentPanel.documentManager.uploadedDescription')}</CardDescription>
           </CardHeader>
 
-          <CardContent className="flex-1 relative p-0" ref={cardContentRef}>
-            {!docs && (
+          <CardContent className="flex-1 relative p-0 min-h-[400px]" ref={cardContentRef}>
+            {(isWorkspaceSwitching || isRefreshing) && (
+              <div className="absolute inset-0 z-50 flex items-center justify-center bg-white/50 dark:bg-black/50 backdrop-blur-sm">
+                <RefreshCwIcon className="w-8 h-8 animate-spin text-primary" />
+              </div>
+            )}
+            {!docs && !(isWorkspaceSwitching || isRefreshing) && (
               <div className="absolute inset-0 p-0">
                 <EmptyCard
                   title={t('documentPanel.documentManager.emptyTitle')}
@@ -1418,20 +1462,20 @@ export default function DocumentManager() {
                           </TableCell>
                           <TableCell>
                             <div className="group relative flex items-center overflow-visible tooltip-container">
-                              {doc.status === 'PROCESSED' && (
-                                <span className="text-green-600">{t('documentPanel.documentManager.status.completed')}</span>
-                              )}
-                              {(doc.status === 'chunked' || doc.status === 'preprocessed') && (
-                                <span className="text-purple-600">{t('documentPanel.documentManager.status.chunked')}</span>
-                              )}
-                              {(doc.status === 'CHUNKING' || doc.status === 'PROCESSING') && (
-                                <span className="text-blue-600">{t('documentPanel.documentManager.status.chunking')}</span>
-                              )}
-                              {(doc.status === 'EXTRACTED' || doc.status === 'PENDING') && (
-                                <span className="text-yellow-600">{t('documentPanel.documentManager.status.extracted')}</span>
+                              {doc.status === 'UPLOADING' && (
+                                <span className="text-gray-600">{t('documentPanel.documentManager.status.uploading', 'Uploading')}</span>
                               )}
                               {doc.status === 'EXTRACTING' && (
-                                <span className="text-orange-600">{t('documentPanel.documentManager.status.extracting')}</span>
+                                <span className="text-orange-600">{t('documentPanel.documentManager.status.extracting', 'Extracting')}</span>
+                              )}
+                              {doc.status === 'EXTRACTED' && (
+                                <span className="text-yellow-600">{t('documentPanel.documentManager.status.extracted', 'Extracted')}</span>
+                              )}
+                              {doc.status === 'CHUNKING' && (
+                                <span className="text-blue-600">{t('documentPanel.documentManager.status.chunking', 'Chunking')}</span>
+                              )}
+                              {doc.status === 'PROCESSED' && (
+                                <span className="text-green-600">{t('documentPanel.documentManager.status.completed')}</span>
                               )}
                               {doc.status === 'FAILED' && (
                                 <span className="text-red-600">{t('documentPanel.documentManager.status.failed')}</span>

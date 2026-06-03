@@ -28,9 +28,9 @@ WORKDIR /app
 # Install system deps (Rust is required by some wheels)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl \
-        build-essential \
-        pkg-config \
+    curl \
+    build-essential \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
@@ -76,14 +76,6 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 ENV UV_SYSTEM_PYTHON=1
-
-# Install system dependencies for OCR (tesseract) and PDF-to-image (poppler)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        tesseract-ocr \
-        tesseract-ocr-vie \
-        poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy configuration files
 COPY pyproject.toml .

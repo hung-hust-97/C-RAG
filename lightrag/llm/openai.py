@@ -204,9 +204,12 @@ def create_openai_async_client(
             "api_key": api_key,
         }
 
+        import random
         # Add explicit parameters (override client_configs)
         if base_url is not None:
-            merged_configs["azure_endpoint"] = base_url
+            urls = [url.strip() for url in base_url.split(",") if url.strip()]
+            if urls:
+                merged_configs["azure_endpoint"] = random.choice(urls)
         if azure_deployment is not None:
             merged_configs["azure_deployment"] = azure_deployment
         if api_version is not None:
@@ -234,8 +237,11 @@ def create_openai_async_client(
             "api_key": api_key,
         }
 
+        import random
         if base_url is not None:
-            merged_configs["base_url"] = base_url
+            urls = [url.strip() for url in base_url.split(",") if url.strip()]
+            if urls:
+                merged_configs["base_url"] = random.choice(urls)
         else:
             merged_configs["base_url"] = os.environ.get(
                 "OPENAI_API_BASE", "https://api.openai.com/v1"

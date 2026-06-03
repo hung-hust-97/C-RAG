@@ -7,7 +7,7 @@ extraction of text from PDF documents using the DeepSeek OCR service.
 
 import logging
 import httpx
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 from lightrag.ocr.exceptions import (
     DeepSeekOCRError,
@@ -16,6 +16,24 @@ from lightrag.ocr.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize response dictionary to avoid printing huge base64 strings or texts in logs."""
+    sanitized = {}
+    for k, v in data.items():
+        if isinstance(v, str):
+            if len(v) > 200:
+                sanitized[k] = f"<{len(v)} chars string...>"
+            else:
+                sanitized[k] = v
+        elif isinstance(v, list):
+            sanitized[k] = f"<list of {len(v)} items>"
+        elif isinstance(v, dict):
+            sanitized[k] = _sanitize_response(v)
+        else:
+            sanitized[k] = v
+    return sanitized
 
 
 class DeepSeekOCRExtractor:
@@ -139,7 +157,7 @@ class DeepSeekOCRExtractor:
             if not text.strip() or page_count == 0:
                 logger.warning(
                     f"DeepSeek OCR returned empty result despite HTTP 200. "
-                    f"Response data: {response_data}"
+                    f"Response data: {_sanitize_response(response_data)}"
                 )
             else:
                 logger.info(
@@ -220,7 +238,7 @@ class DeepSeekOCRExtractor:
             if not text.strip():
                 logger.warning(
                     f"DeepSeek OCR returned empty image result despite HTTP 200. "
-                    f"Response data: {response_data}"
+                    f"Response data: {_sanitize_response(response_data)}"
                 )
             else:
                 logger.info(

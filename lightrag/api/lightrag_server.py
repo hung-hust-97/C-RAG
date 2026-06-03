@@ -71,7 +71,7 @@ except ImportError:
     celery_app = None
     logger.warning("Celery worker module not available, async processing disabled")
 
-def monkeypatch_apipeline_process_enqueue_documents(self, reprocess_failed=False):
+async def monkeypatch_apipeline_process_enqueue_documents(self, reprocess_failed=False):
     """
     Monkeypatch for LightRAG.apipeline_process_enqueue_documents to use Celery.
     """
@@ -544,24 +544,22 @@ def create_app(args):
         try:
             db = getattr(getattr(rag.doc_status, "db", None), "query", None)
             if db is not None:
+                from lightrag.kg.postgres_impl import to_uuid
+                workspace_uuid = to_uuid(normalized_workspace_id)
                 rows = await rag.doc_status.db.query(
                     """
-                    SELECT workspace_id, name, id, workspace
-                    FROM LIGHTRAG_WORKSPACES
-                    WHERE workspace_id = $1
-                       OR id = $1
-                       OR workspace = $1
-                       OR LOWER(name) = LOWER($1)
+                    SELECT id as workspace_id, name, id, name as workspace
+                    FROM tbl_workspace
+                    WHERE id = $1
+                       OR LOWER(name) = LOWER($2)
                     ORDER BY
                         CASE
-                            WHEN workspace_id = $1 THEN 0
-                            WHEN id = $1 THEN 1
-                            WHEN workspace = $1 THEN 2
-                            ELSE 3
+                            WHEN id = $1 THEN 0
+                            ELSE 1
                         END
                     LIMIT 1
                     """,
-                    [normalized_workspace_id],
+                    [workspace_uuid, normalized_workspace_id],
                     multirows=True,
                 )
 
@@ -612,8 +610,8 @@ def create_app(args):
         logger.info(f"[{normalized_workspace_id}] Acquiring lock for workspace initialization...")
         
         try:
-            # Add timeout for lock acquisition to prevent infinite waiting
-            async with asyncio.timeout(30.0):  # 30 second timeout for lock acquisition
+            # Add timeout for lock acquisition and initialization to prevent infinite waiting
+            async with asyncio.timeout(600.0):  # 600 second timeout to accommodate large migrations
                 async with rag_instances_lock:
                     # Double-check after acquiring lock
                     if normalized_workspace_id in rag_instances:
@@ -658,7 +656,7 @@ def create_app(args):
                     logger.info(f"[{normalized_workspace_id}] Checking and migrating data...")
                     await asyncio.wait_for(
                         workspace_rag.check_and_migrate_data(),
-                        timeout=120.0  # 2 minute timeout for migration
+                        timeout=600.0  # 10 minute timeout for heavy graph migration
                     )
                     
                     logger.info(f"[{normalized_workspace_id}] Checking embedding changes...")
@@ -848,29 +846,31 @@ def create_app(args):
         workspace_map.update({ws: ws for ws in doc_manager_instances.keys() if ws})
 
         # Include workspace metadata persisted in PostgreSQL when available.
+        workspace_flags: dict[str, bool] = {}
         try:
             db = getattr(getattr(rag.doc_status, "db", None), "query", None)
             if db is not None:
                 rows = await rag.doc_status.db.query(
-                    "SELECT workspace_id, name FROM LIGHTRAG_WORKSPACES",
+                    "SELECT id as workspace_id, name, is_legal_document_workspace FROM tbl_workspace",
                     multirows=True,
                 )
                 if rows:
                     for row in rows:
-                        workspace_id = (row.get("workspace_id") or "").strip()
+                        workspace_id = str(row.get("workspace_id") or "").strip()
                         if not workspace_id:
                             continue
-                        workspace_name = (row.get("name") or "").strip() or workspace_id
+                        workspace_name = str(row.get("name") or "").strip() or workspace_id
                         workspace_map[workspace_id] = workspace_name
+                        workspace_flags[workspace_id] = bool(row.get("is_legal_document_workspace"))
 
                 # Fallback source: discover real workspace IDs from document status table.
                 status_rows = await rag.doc_status.db.query(
-                    "SELECT DISTINCT workspace FROM LIGHTRAG_DOC_STATUS",
+                    "SELECT DISTINCT workspace_id FROM tbl_document",
                     multirows=True,
                 )
                 if status_rows:
                     for row in status_rows:
-                        workspace_id = (row.get("workspace") or "").strip()
+                        workspace_id = str(row.get("workspace_id") or "").strip()
                         if not workspace_id:
                             continue
                         data_workspace_ids.add(workspace_id)
@@ -918,6 +918,7 @@ def create_app(args):
                 "workspace_id": workspace_id,
                 "workspace_name": workspace_map.get(workspace_id, workspace_id)
                 or workspace_id,
+                "is_legal_document_workspace": workspace_flags.get(workspace_id, False),
             }
             for workspace_id in workspace_ids
         ]
@@ -931,12 +932,14 @@ def create_app(args):
         if db_execute is None:
             return False
 
+        from lightrag.kg.postgres_impl import to_uuid
+        workspace_uuid = to_uuid(workspace_id)
         await db_obj.execute(
             """
-            DELETE FROM LIGHTRAG_WORKSPACES
-            WHERE workspace_id = $1 OR id = $1 OR workspace = $1
+            DELETE FROM tbl_workspace
+            WHERE id = $1
             """,
-            {"workspace_id": workspace_id},
+            {"id": workspace_uuid},
         )
 
         registered_workspaces = getattr(db_obj, "_registered_workspaces", None)

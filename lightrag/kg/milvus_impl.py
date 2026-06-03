@@ -376,6 +376,129 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         normalized_name = str(db_name).strip()
         return normalized_name or None
 
+    def _connect_bulk_insert_alias(self, alias: str) -> None:
+        """Connect ORM utility APIs to the same database used by MilvusClient."""
+        from pymilvus import connections, db
+
+        connection_kwargs = self._get_milvus_connection_kwargs(include_db_name=True)
+        connections.connect(alias, **connection_kwargs)
+
+        db_name = self._get_milvus_db_name()
+        if db_name:
+            db.using_database(db_name, using=alias)
+
+    def _do_bulk_insert(self, collection_name: str, files: list[str], using: str) -> int:
+        """Run Milvus bulk import while preserving the configured database name."""
+        from pymilvus import utility
+
+        db_name = self._get_milvus_db_name()
+        if not db_name or db_name == "default":
+            return utility.do_bulk_insert(
+                collection_name=collection_name,
+                files=files,
+                using=using,
+            )
+
+        # PyMilvus 2.5.x utility.do_bulk_insert() does not set ImportRequest.db_name,
+        # so Milvus handles the import in the default database even when the
+        # connection alias is bound to a non-default database.
+        from pymilvus.client.grpc_handler import (  # type: ignore
+            ErrorCode,
+            MilvusException,
+            check_status,
+            common_pb2,
+        )
+        from pymilvus.client.prepare import Prepare  # type: ignore
+        from pymilvus.orm.utility import _get_connection  # type: ignore
+
+        connection = _get_connection(using)
+        request = Prepare.do_bulk_insert(collection_name, None, files)
+        request.db_name = db_name
+        response = connection._stub.Import(request)
+        check_status(response.status)
+        if len(response.tasks) == 0:
+            raise MilvusException(
+                ErrorCode.UNEXPECTED_ERROR,
+                "no task id returned from server",
+                common_pb2.UnexpectedError,
+            )
+        return response.tasks[0]
+
+    async def _cleanup_expired_bulk_insert_objects(
+        self,
+        s3_client: Any,
+        bucket: str,
+        *,
+        current_key: Optional[str] = None,
+    ) -> None:
+        """Delete old Milvus bulk insert objects from S3/MinIO."""
+        import time
+
+        ttl_seconds = _get_env_int("MILVUS_BULK_INSERT_TTL_SECONDS", 86400)
+        if ttl_seconds <= 0:
+            return
+
+        cleanup_interval = _get_env_int(
+            "MILVUS_BULK_INSERT_CLEANUP_INTERVAL_SECONDS", 3600
+        )
+        now = time.time()
+        if now - self._last_bulk_insert_cleanup_at < cleanup_interval:
+            return
+
+        self._last_bulk_insert_cleanup_at = now
+        prefix = "bulk_insert/"
+        expires_before = now - ttl_seconds
+        delete_batch: list[dict[str, str]] = []
+        deleted_count = 0
+
+        async def flush_delete_batch() -> None:
+            nonlocal deleted_count
+            if not delete_batch:
+                return
+
+            batch = list(delete_batch)
+            delete_batch.clear()
+            await s3_client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": batch, "Quiet": True},
+            )
+            deleted_count += len(batch)
+
+        try:
+            paginator = s3_client.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if not key or key == current_key:
+                        continue
+
+                    last_modified = obj.get("LastModified")
+                    if last_modified is None:
+                        continue
+
+                    try:
+                        modified_ts = last_modified.timestamp()
+                    except AttributeError:
+                        continue
+
+                    if modified_ts >= expires_before:
+                        continue
+
+                    delete_batch.append({"Key": key})
+                    if len(delete_batch) >= 1000:
+                        await flush_delete_batch()
+
+            await flush_delete_batch()
+            if deleted_count:
+                logger.info(
+                    f"[{self.workspace}] Deleted {deleted_count} expired Milvus "
+                    f"bulk insert files from {bucket}/{prefix}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[{self.workspace}] Failed to cleanup expired Milvus bulk insert files: {e}"
+            )
+
     def _sanitize_workspace_for_collection(self, workspace: str) -> str:
         """Sanitize workspace name for use as Milvus collection name prefix.
         
@@ -1346,8 +1469,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     self._client.describe_collection(self.final_namespace)
                     self._validate_collection_compatibility()
                     try:
-                        # Ensure the collection is loaded after validation
-                        self._ensure_collection_loaded()
                         return
                     except Exception as load_error:
                         if not self._is_missing_vector_index_error(load_error):
@@ -1355,7 +1476,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
                         try:
                             self._repair_missing_vector_index()
-                            self._ensure_collection_loaded()
                             logger.info(
                                 f"[{self.workspace}] Repaired missing vector index for existing collection '{self.namespace}'"
                             )
@@ -1414,9 +1534,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Then create indexes
             self._create_indexes_after_collection()
 
-            # Load the newly created collection
-            self._ensure_collection_loaded()
-
             logger.info(
                 f"[{self.workspace}] Successfully created Milvus collection: {self.namespace}"
             )
@@ -1460,9 +1577,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     collection_name=self.final_namespace, schema=schema
                 )
                 self._create_indexes_after_collection()
-
-                # Load the newly created collection
-                self._ensure_collection_loaded()
 
                 logger.info(
                     f"[{self.workspace}] Successfully force-created collection {self.namespace}"
@@ -1532,6 +1646,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Initialize client as None - will be created in initialize() method
         self._client = None
         self._collection_loaded = False
+        self._last_bulk_insert_cleanup_at = 0.0
         self._max_batch_size = self.global_config["embedding_batch_num"]
         self._initialized = False
 
@@ -1572,27 +1687,98 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 )
                 raise
 
+    async def finalize(self):
+        """Close the Milvus client and release its gRPC channel."""
+        client = self._client
+        self._client = None
+        self._collection_loaded = False
+        self._initialized = False
+
+        if client is None:
+            return
+
+        close = getattr(client, "close", None)
+        if not callable(close):
+            return
+
+        try:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+            logger.debug(
+                f"[{self.workspace}] MilvusClient for '{self.namespace}' closed"
+            )
+        except Exception as close_error:
+            logger.warning(
+                f"[{self.workspace}] Failed to close MilvusClient for "
+                f"'{self.namespace}': {close_error}"
+            )
+
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         # logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
         if not data:
             return
 
-        # Ensure collection is loaded before upserting
-        self._ensure_collection_loaded()
-
         import time
 
         current_time = int(time.time())
 
-        list_data: list[dict[str, Any]] = [
-            {
+        import json
+
+        list_data: list[dict[str, Any]] = []
+        for k, v in data.items():
+            base_dict = {
                 "id": k,
                 "created_at": current_time,
                 "workspace_id": self.workspace,
-                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
             }
-            for k, v in data.items()
-        ]
+            
+            meta_dict = {k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields}
+            
+            # Enforce dynamic field size limit (~65536 bytes)
+            # 1. Truncate specific known fields first
+            for field in ["entity_name", "src_id", "tgt_id"]:
+                if field in meta_dict and isinstance(meta_dict[field], str):
+                    encoded = meta_dict[field].encode("utf-8")
+                    if len(encoded) > 512:
+                        meta_dict[field] = encoded[:512].decode("utf-8", errors="ignore")
+            
+            MAX_DYN_SIZE = 60000
+            
+            # 2. Iterate to reduce size if necessary
+            for attempt in range(5):
+                try:
+                    # Estimate dynamic field size by json dumping meta_dict
+                    encoded_size = len(json.dumps(meta_dict, ensure_ascii=False).encode("utf-8"))
+                    if encoded_size <= MAX_DYN_SIZE:
+                        break
+                except Exception:
+                    pass
+                
+                # Find largest string field
+                longest_key = None
+                max_len = -1
+                for mk, mv in meta_dict.items():
+                    if isinstance(mv, str):
+                        l = len(mv.encode("utf-8"))
+                        if l > max_len:
+                            max_len = l
+                            longest_key = mk
+                
+                if longest_key is None or max_len < 500:
+                    # If strings are small, the size is likely caused by lists/dicts. Stringify and truncate them.
+                    for mk, mv in meta_dict.items():
+                        if isinstance(mv, (list, dict)):
+                            meta_dict[mk] = json.dumps(mv, ensure_ascii=False)[:2000]
+                    continue
+                
+                # Truncate the largest string
+                excess = encoded_size - MAX_DYN_SIZE
+                target_len = max(100, max_len - excess - 500)
+                meta_dict[longest_key] = meta_dict[longest_key].encode("utf-8")[:target_len].decode("utf-8", errors="ignore")
+            
+            base_dict.update(meta_dict)
+            list_data.append(base_dict)
         import re
         
         # Helper to strip HTML tags for cleaner embeddings
@@ -1619,13 +1805,230 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeddings = np.concatenate(embeddings_list)
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i]
-        results = self._milvus_call(
-            "upsert",
-            lambda client: client.upsert(
-                collection_name=self.final_namespace, data=list_data
-            ),
+        upsert_batch_size = max(1, _get_env_int("MILVUS_UPSERT_BATCH_SIZE", 256))
+        results = []
+        for i in range(0, len(list_data), upsert_batch_size):
+            batch_data = list_data[i : i + upsert_batch_size]
+            result = self._milvus_call(
+                "upsert",
+                lambda client, batch_data=batch_data: client.upsert(
+                    collection_name=self.final_namespace, data=batch_data
+                ),
+            )
+            results.append(result)
+        return results[-1] if len(results) == 1 else results
+
+    async def bulk_upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        """
+        Gom dữ liệu thành file JSON, đẩy lên MinIO và dùng API do_bulk_insert của Milvus để ingest tốc độ cao.
+        """
+        if not data:
+            return
+
+        import time
+        import os
+        import json
+        import aioboto3
+        import uuid
+        import re
+
+        current_time = int(time.time())
+
+        list_data: list[dict[str, Any]] = []
+        for k, v in data.items():
+            base_dict = {
+                "id": k,
+                "created_at": current_time,
+                "workspace_id": self.workspace,
+            }
+            
+            meta_dict = {k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields}
+            
+            for field in ["entity_name", "src_id", "tgt_id"]:
+                if field in meta_dict and isinstance(meta_dict[field], str):
+                    encoded = meta_dict[field].encode("utf-8")
+                    if len(encoded) > 512:
+                        meta_dict[field] = encoded[:512].decode("utf-8", errors="ignore")
+            
+            MAX_DYN_SIZE = 60000
+            
+            for attempt in range(5):
+                try:
+                    encoded_size = len(json.dumps(meta_dict, ensure_ascii=False).encode("utf-8"))
+                    if encoded_size <= MAX_DYN_SIZE:
+                        break
+                except Exception:
+                    pass
+                
+                longest_key = None
+                max_len = -1
+                for mk, mv in meta_dict.items():
+                    if isinstance(mv, str):
+                        l = len(mv.encode("utf-8"))
+                        if l > max_len:
+                            max_len = l
+                            longest_key = mk
+                
+                if longest_key is None or max_len < 500:
+                    for mk, mv in meta_dict.items():
+                        if isinstance(mv, (list, dict)):
+                            meta_dict[mk] = json.dumps(mv, ensure_ascii=False)[:2000]
+                    continue
+                
+                excess = encoded_size - MAX_DYN_SIZE
+                target_len = max(100, max_len - excess - 500)
+                meta_dict[longest_key] = meta_dict[longest_key].encode("utf-8")[:target_len].decode("utf-8", errors="ignore")
+            
+            base_dict.update(meta_dict)
+            list_data.append(base_dict)
+
+        def clean_for_embedding(text: str) -> str:
+            if not isinstance(text, str):
+                return text
+            cleaned = re.sub(r"<[^>]+>", " ", text)
+            return re.sub(r"\s+", " ", cleaned).strip()
+
+        contents = [v["content"] for v in data.values()]
+        embedding_contents = [clean_for_embedding(c) for c in contents]
+
+        batches = [
+            embedding_contents[i : i + self._max_batch_size]
+            for i in range(0, len(embedding_contents), self._max_batch_size)
+        ]
+
+        embedding_tasks = [self.embedding_func(batch) for batch in batches]
+        embeddings_list = await asyncio.gather(*embedding_tasks)
+        embeddings = np.concatenate(embeddings_list)
+
+        # Chèn vector vào dict
+        rows = []
+        for i, d in enumerate(list_data):
+            d["vector"] = embeddings[i].tolist()
+            rows.append(d)
+
+        json_payload = {"rows": rows}
+        file_content = json.dumps(json_payload).encode("utf-8")
+
+        # Upload to MinIO
+        endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+        access_key = os.environ.get("S3_ACCESS_KEY") or os.environ.get(
+            "S3_ACCESS_KEY_ID"
         )
-        return results
+        secret_key = os.environ.get("S3_SECRET_KEY") or os.environ.get(
+            "S3_SECRET_ACCESS_KEY"
+        )
+        bucket = (
+            os.environ.get("MILVUS_BULK_INSERT_BUCKET")
+            or os.environ.get("S3_BUCKET")
+            or "lightrag-markdown"
+        )
+
+        if not all([endpoint_url, access_key, secret_key]):
+            logger.warning("MinIO credentials missing. Falling back to standard upsert.")
+            return await self.upsert(data)
+
+        object_key = f"bulk_insert/{self.final_namespace}_{uuid.uuid4().hex}.json"
+
+        session = aioboto3.Session()
+        async with session.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        ) as s3:
+            await s3.put_object(Bucket=bucket, Key=object_key, Body=file_content)
+            await self._cleanup_expired_bulk_insert_objects(
+                s3,
+                bucket,
+                current_key=object_key,
+            )
+
+        logger.info(f"Uploaded bulk insert data to {bucket}/{object_key}")
+
+        # Trigger Milvus bulk insert
+        from pymilvus import connections, utility
+
+        try:
+            conn_alias = f"bulk_insert_{uuid.uuid4().hex}"
+            self._connect_bulk_insert_alias(conn_alias)
+
+            try:
+                db_name = self._get_milvus_db_name() or "default"
+                if not utility.has_collection(
+                    self.final_namespace, using=conn_alias
+                ):
+                    raise ValueError(
+                        f"Collection {self.final_namespace} does not exist "
+                        f"in Milvus database {db_name}"
+                    )
+
+                task_id = self._milvus_call(
+                    "do_bulk_insert",
+                    lambda client: self._do_bulk_insert(
+                        collection_name=self.final_namespace,
+                        files=[object_key],
+                        using=conn_alias,
+                    ),
+                )
+                logger.info(f"Started Milvus bulk insert task: {task_id}")
+                
+                # Start background task to poll status and cleanup file
+                async def _poll_and_cleanup(tid, s3_session, endpoint, access, secret, bucket_name, obj_key):
+                    import asyncio
+                    from pymilvus import connections, utility
+                    poll_alias = f"poll_bulk_insert_{uuid.uuid4().hex}"
+                    
+                    try:
+                        await asyncio.to_thread(self._connect_bulk_insert_alias, poll_alias)
+                        
+                        while True:
+                            try:
+                                def _get_state():
+                                    return utility.get_bulk_insert_state(task_id=tid, using=poll_alias)
+                                    
+                                state_obj = await asyncio.to_thread(_get_state)
+                                state_val = getattr(state_obj, "state", getattr(state_obj, "state_name", str(state_obj)))
+                                state_str = str(state_val).lower()
+                                
+                                # BulkInsertState.ImportCompleted = 6, ImportFailed = 7, ImportFailedAndCleaned = 8
+                                if "completed" in state_str or "failed" in state_str or getattr(state_obj, "state", -1) in (6, 7, 8):
+                                    break
+                            except Exception as poll_err:
+                                logger.warning(f"Error polling bulk insert state for task {tid}: {poll_err}")
+                                break
+                            
+                            await asyncio.sleep(5)
+                            
+                        # Delete file from MinIO
+                        try:
+                            async with s3_session.client(
+                                "s3",
+                                endpoint_url=endpoint,
+                                aws_access_key_id=access,
+                                aws_secret_access_key=secret,
+                            ) as s3_client:
+                                await s3_client.delete_object(Bucket=bucket_name, Key=obj_key)
+                                logger.info(f"Successfully cleaned up bulk insert file: {bucket_name}/{obj_key}")
+                        except Exception as s3_err:
+                            logger.error(f"Failed to delete bulk insert file {obj_key}: {s3_err}")
+                    finally:
+                        try:
+                            await asyncio.to_thread(connections.disconnect, poll_alias)
+                        except Exception:
+                            pass
+                            
+                asyncio.create_task(
+                    _poll_and_cleanup(
+                        task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
+                    )
+                )
+                
+                return task_id
+            finally:
+                connections.disconnect(conn_alias)
+        except Exception as e:
+            logger.error(f"Milvus do_bulk_insert failed: {e}. Falling back to standard upsert.")
+            return await self.upsert(data)
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
@@ -1797,21 +2200,31 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         Args:
             ids: List of vector IDs to be deleted
         """
+        if not ids:
+            return
+
         try:
             # Ensure collection is loaded before deleting
             self._ensure_collection_loaded()
 
-            # Delete vectors by IDs
-            result = self._milvus_call(
-                "delete",
-                lambda client: client.delete(
-                    collection_name=self.final_namespace, pks=ids
-                ),
-            )
+            batch_size = 1000
+            total_deleted = 0
 
-            if result and result.get("delete_count", 0) > 0:
+            # Delete vectors by IDs in batches
+            for i in range(0, len(ids), batch_size):
+                batch_ids = ids[i:i + batch_size]
+                result = self._milvus_call(
+                    "delete",
+                    lambda client, b=batch_ids: client.delete(
+                        collection_name=self.final_namespace, pks=b
+                    ),
+                )
+                if result:
+                    total_deleted += result.get("delete_count", 0)
+
+            if total_deleted > 0:
                 logger.debug(
-                    f"[{self.workspace}] Successfully deleted {result.get('delete_count', 0)} vectors from {self.namespace}"
+                    f"[{self.workspace}] Successfully deleted {total_deleted} vectors from {self.namespace}"
                 )
             else:
                 logger.debug(
@@ -1878,30 +2291,32 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
-            # Prepare the ID filter expression
-            id_list = '", "'.join(ids)
-            filter_expr = f'id in ["{id_list}"]'
-
-            # Query Milvus with the filter
-            result = self._milvus_call(
-                "query",
-                lambda client: client.query(
-                    collection_name=self.final_namespace,
-                    filter=filter_expr,
-                    output_fields=output_fields,
-                ),
-            )
-
-            if not result:
-                return []
-
+            batch_size = 1000
             result_map: dict[str, dict[str, Any]] = {}
-            for row in result:
-                if not row:
-                    continue
-                row_id = row.get("id")
-                if row_id is not None:
-                    result_map[str(row_id)] = row
+
+            # Process in batches to avoid Milvus expression length limits
+            for i in range(0, len(ids), batch_size):
+                batch_ids = ids[i:i + batch_size]
+                id_list = '", "'.join(batch_ids)
+                filter_expr = f'id in ["{id_list}"]'
+
+                # Query Milvus with the filter
+                result = self._milvus_call(
+                    "query",
+                    lambda client, f=filter_expr: client.query(
+                        collection_name=self.final_namespace,
+                        filter=f,
+                        output_fields=output_fields,
+                    ),
+                )
+
+                if result:
+                    for row in result:
+                        if not row:
+                            continue
+                        row_id = row.get("id")
+                        if row_id is not None:
+                            result_map[str(row_id)] = row
 
             ordered_results: list[dict[str, Any] | None] = []
             for requested_id in ids:
@@ -1910,7 +2325,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return ordered_results
         except Exception as e:
             logger.error(
-                f"[{self.workspace}] Error retrieving vector data for IDs {ids}: {e}"
+                f"[{self.workspace}] Error retrieving vector data for IDs {len(ids)} items: {e}"
             )
             return []
 
@@ -1931,28 +2346,33 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Ensure collection is loaded before querying
             self._ensure_collection_loaded()
 
-            # Prepare the ID filter expression
-            id_list = '", "'.join(ids)
-            filter_expr = f'id in ["{id_list}"]'
-
-            # Query Milvus with the filter, requesting only vector field
-            result = self._milvus_call(
-                "query",
-                lambda client: client.query(
-                    collection_name=self.final_namespace,
-                    filter=filter_expr,
-                    output_fields=["vector"],
-                ),
-            )
-
             vectors_dict = {}
-            for item in result:
-                if item and "vector" in item and "id" in item:
-                    # Convert numpy array to list if needed
-                    vector_data = item["vector"]
-                    if isinstance(vector_data, np.ndarray):
-                        vector_data = vector_data.tolist()
-                    vectors_dict[item["id"]] = vector_data
+            batch_size = 1000
+
+            # Process in batches to avoid Milvus expression length limits
+            for i in range(0, len(ids), batch_size):
+                batch_ids = ids[i:i + batch_size]
+                id_list = '", "'.join(batch_ids)
+                filter_expr = f'id in ["{id_list}"]'
+
+                # Query Milvus with the filter, requesting only vector field
+                result = self._milvus_call(
+                    "query",
+                    lambda client, f=filter_expr: client.query(
+                        collection_name=self.final_namespace,
+                        filter=f,
+                        output_fields=["vector"],
+                    ),
+                )
+
+                if result:
+                    for item in result:
+                        if item and "vector" in item and "id" in item:
+                            # Convert numpy array to list if needed
+                            vector_data = item["vector"]
+                            if isinstance(vector_data, np.ndarray):
+                                vector_data = vector_data.tolist()
+                            vectors_dict[str(item["id"])] = vector_data
 
             return vectors_dict
         except Exception as e:

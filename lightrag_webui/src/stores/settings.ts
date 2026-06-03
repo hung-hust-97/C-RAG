@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { createSelectors } from '@/lib/utils'
 import { defaultQueryLabel } from '@/lib/constants'
-import { Message, QueryRequest } from '@/api/lightrag'
+import { Message, QueryRequest, WorkspaceItem } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
@@ -10,9 +10,12 @@ type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
 
 interface SettingsState {
   selectedWorkspaceId: string
-  setSelectedWorkspaceId: (workspaceId: string) => void
+  setSelectedWorkspaceId: (workspaceId: string, workspaceName?: string) => void
   workspaceHistory: string[]
   addWorkspaceToHistory: (workspaceId: string) => void
+  workspaceNamesById: Record<string, string>
+  workspaceFlagsById: Record<string, boolean>
+  setWorkspaceNames: (workspaces: WorkspaceItem[]) => void
 
   // Document manager settings
   showFileName: boolean
@@ -101,6 +104,9 @@ const useSettingsStoreBase = create<SettingsState>()(
       language: 'en',
       selectedWorkspaceId: 'default',
       workspaceHistory: ['default'],
+      workspaceNamesById: {},
+      workspaceFlagsById: {},
+
       showPropertyPanel: true,
       showNodeSearchBar: true,
       showLegend: false,
@@ -151,16 +157,35 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setTheme: (theme: Theme) => set({ theme }),
 
-      setSelectedWorkspaceId: (workspaceId: string) => {
+      setSelectedWorkspaceId: (workspaceId: string, workspaceName?: string) => {
         const normalized = workspaceId.trim() || 'default'
         set((state) => {
           const nextHistory = [normalized, ...state.workspaceHistory.filter((id) => id !== normalized)].slice(0, 20)
           const nextRetrievalHistory = state.retrievalHistoryByWorkspace[normalized] || []
+          const nextNamesById = workspaceName
+            ? { ...state.workspaceNamesById, [normalized]: workspaceName }
+            : state.workspaceNamesById
           return {
             selectedWorkspaceId: normalized,
             workspaceHistory: nextHistory,
-            retrievalHistory: nextRetrievalHistory
+            retrievalHistory: nextRetrievalHistory,
+            workspaceNamesById: nextNamesById
           }
+        })
+      },
+
+      setWorkspaceNames: (workspaces: WorkspaceItem[]) => {
+        set((state) => {
+          const updatedNames = { ...state.workspaceNamesById }
+          const updatedFlags = { ...state.workspaceFlagsById }
+          for (const { workspace_id, workspace_name, is_legal_document_workspace } of workspaces) {
+            const id = workspace_id?.trim()
+            if (id) {
+              updatedNames[id] = workspace_name?.trim() || id
+              updatedFlags[id] = !!is_legal_document_workspace
+            }
+          }
+          return { workspaceNamesById: updatedNames, workspaceFlagsById: updatedFlags }
         })
       },
 
@@ -311,8 +336,17 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 21,
+      version: 22,
       migrate: (state: any, version: number) => {
+        if (version < 22) {
+          // Add workspaceNamesById field for older versions
+          if (!state.workspaceNamesById || typeof state.workspaceNamesById !== 'object') {
+            state.workspaceNamesById = {}
+          }
+          if (!state.workspaceFlagsById || typeof state.workspaceFlagsById !== 'object') {
+            state.workspaceFlagsById = {}
+          }
+        }
         if (version < 21) {
           const selectedWorkspaceId = state.selectedWorkspaceId || 'default'
           const legacyHistory = Array.isArray(state.retrievalHistory) ? state.retrievalHistory : []

@@ -58,7 +58,7 @@ class S3KVStorage(BaseKVStorage):
         ws = self.workspace if self.workspace else "default"
         is_full_docs = is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS)
         if is_full_docs:
-            return f"{self.namespace}/{ws}/{doc_id}.md"
+            return f"{self.namespace}/{ws}/{doc_id}/{doc_id}.md"
         else:
             return f"{self.namespace}/{ws}/{doc_id}.json"
 

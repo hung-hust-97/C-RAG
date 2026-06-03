@@ -27,7 +27,7 @@ LightRAG dynamically installs packages for:
 - **LLM Providers**: `openai`, `anthropic`, `ollama`, `zhipuai`, `aioboto3`, `voyageai`, `llama-index`, `lmdeploy`, `transformers`, `torch`
 - **Tiktoken Models**: BPE encoding models downloaded from OpenAI CDN
 
-**Note**: Document processing dependencies (`pypdf`, `python-docx`, `python-pptx`, `openpyxl`) are now pre-installed with the `api` extras group and no longer require dynamic installation.
+**Note**: Document processing dependencies (`python-docx`, `python-pptx`, `openpyxl`) are now pre-installed with the `api` extras group and no longer require dynamic installation.
 
 ## Quick Start
 

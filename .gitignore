@@ -85,6 +85,9 @@ CLAUDE.md
 # Kiro
 .kiro
 .kiro/
+.agent/
+.agents/
+.codex/
 
 # Test
 test/

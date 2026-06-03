@@ -203,7 +203,7 @@ export const ChatMessage = ({
                     // Add silent error handling to avoid console noise
                     errorCallback: (error: string, latex: string) => {
                       // Only show detailed errors in development environment
-                      if (process.env.NODE_ENV === 'development') {
+                      if (import.meta.env.DEV) {
                         console.warn('KaTeX rendering error in thinking content:', error, 'for LaTeX:', latex);
                       }
                     }
@@ -244,7 +244,7 @@ export const ChatMessage = ({
                     // Add silent error handling to avoid console noise
                     errorCallback: (error: string, latex: string) => {
                       // Only show detailed errors in development environment
-                      if (process.env.NODE_ENV === 'development') {
+                      if (import.meta.env.DEV) {
                         console.warn('KaTeX rendering error in main content:', error, 'for LaTeX:', latex);
                       }
                     }

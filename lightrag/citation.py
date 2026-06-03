@@ -53,7 +53,7 @@ class CitationMetadata:
     content_preview: str = ""  # First 100 chars of content
     
     # Legal-specific metadata (optional, only populated when doc_type="LEGAL")
-    legal_info: Optional[Dict[str, str]] = None
+    legal_info: Optional[Dict[str, Any]] = None
     # Expected keys when doc_type="LEGAL":
     # {
     #     "article": "Điều 8",
@@ -107,6 +107,48 @@ class CitationList:
     general_count: int = 0  # Number of general citations
 
 
+def _legal_info_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    legal_info = metadata.get("legal_info", {})
+    if not isinstance(legal_info, dict):
+        legal_info = {}
+
+    for key in (
+        "legal_status",
+        "legal_status_code",
+        "legal_status_priority",
+        "legal_statuses",
+        "legal_status_codes",
+        "legal_document_ids",
+    ):
+        if key in metadata and metadata[key] not in (None, ""):
+            legal_info[key] = metadata[key]
+
+    raw_status = legal_info.get("legal_status") or legal_info.get("legal_status_code")
+    if raw_status:
+        try:
+            from lightrag.legal_document.status import normalize_legal_document_status
+
+            legal_info.update(normalize_legal_document_status(raw_status))
+        except Exception:
+            pass
+
+    return legal_info
+
+
+def _legal_status_priority_for_citation(cit: CitationMetadata) -> int:
+    try:
+        from lightrag.legal_document.status import legal_status_sort_priority
+
+        return legal_status_sort_priority(cit.legal_info)
+    except Exception:
+        if not isinstance(cit.legal_info, dict):
+            return 0
+        priority = cit.legal_info.get("legal_status_priority")
+        if isinstance(priority, (int, float)):
+            return int(priority)
+        return 0
+
+
 def compute_confidence_level(relevance_score: float) -> Literal["high", "medium", "low"]:
     """Compute confidence level based on relevance score.
     
@@ -148,7 +190,7 @@ def create_legal_citation_metadata(
     workspace: str,
     file_path: str,
     hierarchy_path: List[str],
-    legal_info: Dict[str, str],
+    legal_info: Dict[str, Any],
     relevance_score: float,
     content_preview: str,
 ) -> CitationMetadata:
@@ -432,7 +474,7 @@ class CitationTracker:
         
         # Create citation metadata based on document type
         if doc_type == "LEGAL":
-            legal_info = metadata.get("legal_info", {})
+            legal_info = _legal_info_from_metadata(metadata)
             citation = create_legal_citation_metadata(
                 citation_id=self._next_id,
                 doc_id=doc_id,
@@ -506,13 +548,15 @@ class CitationTracker:
         metadata = entity_data.get("metadata", {})
         description = entity_data.get("description", "")
         relevance_score = metadata.get("relevance_score", 0.0)
+        legal_info = _legal_info_from_metadata(metadata)
+        doc_type = "LEGAL" if legal_info else "GENERAL"
         
         # Create citation metadata for entity
         citation = CitationMetadata(
             citation_id=self._next_id,
             doc_id="",  # Entities don't have doc_id
             chunk_id=None,
-            doc_type="GENERAL",
+            doc_type=doc_type,
             source_type="entity",
             entity_name=entity_name,
             workspace=workspace,
@@ -520,6 +564,7 @@ class CitationTracker:
             hierarchy_path=[],
             relevance_score=relevance_score,
             content_preview=description[:100] if description else "",
+            legal_info=legal_info if legal_info else None,
             formatted_ref=f"Entity: {entity_name}",
             retrieved_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -574,13 +619,15 @@ class CitationTracker:
         metadata = relation_data.get("metadata", {})
         description = relation_data.get("description", "")
         relevance_score = metadata.get("relevance_score", 0.0)
+        legal_info = _legal_info_from_metadata(metadata)
+        doc_type = "LEGAL" if legal_info else "GENERAL"
         
         # Create citation metadata for relation
         citation = CitationMetadata(
             citation_id=self._next_id,
             doc_id="",  # Relations don't have doc_id
             chunk_id=None,
-            doc_type="GENERAL",
+            doc_type=doc_type,
             source_type="relation",
             relation_key=relation_key,
             workspace=workspace,
@@ -588,6 +635,7 @@ class CitationTracker:
             hierarchy_path=[],
             relevance_score=relevance_score,
             content_preview=description[:100] if description else "",
+            legal_info=legal_info if legal_info else None,
             formatted_ref=f"Relation: {relation_key}",
             retrieved_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -1562,11 +1610,25 @@ class CitationRenderer:
         else:
             footnotes = ["\n\n---\n## Footnotes\n"]
         
-        for id in sorted(used_ids):
+        citations = []
+        for id in used_ids:
             cit = self.tracker.get_citation(id)
             if cit:
-                footnote = self._format_footnote(cit)
-                footnotes.append(footnote)
+                citations.append(cit)
+        if self.citation_order == "relevance":
+            citations.sort(
+                key=lambda c: (
+                    -_legal_status_priority_for_citation(c),
+                    -c.relevance_score,
+                    c.citation_id,
+                )
+            )
+        else:
+            citations.sort(key=lambda c: c.citation_id)
+
+        for cit in citations:
+            footnote = self._format_footnote(cit)
+            footnotes.append(footnote)
         
         rendered_response = response + "\n".join(footnotes)
         citation_list = self._build_citation_list()
@@ -1624,8 +1686,13 @@ class CitationRenderer:
         
         # Order citations based on citation_order parameter
         if self.citation_order == "relevance":
-            # Sort by relevance_score (descending), then by citation_id for stability
-            citations.sort(key=lambda c: (-c.relevance_score, c.citation_id))
+            citations.sort(
+                key=lambda c: (
+                    -_legal_status_priority_for_citation(c),
+                    -c.relevance_score,
+                    c.citation_id,
+                )
+            )
         elif self.citation_order == "appearance":
             # Keep appearance order (already in used_ids_ordered)
             pass  # citations is already in appearance order
@@ -1949,8 +2016,14 @@ class CitationRenderer:
             
             # Order citations based on citation_order parameter
             if self.citation_order == "relevance":
-                # Sort by relevance_score (descending), then by citation_id for stability
-                citations = sorted(citations, key=lambda c: (-c.relevance_score, c.citation_id))
+                citations = sorted(
+                    citations,
+                    key=lambda c: (
+                        -_legal_status_priority_for_citation(c),
+                        -c.relevance_score,
+                        c.citation_id,
+                    ),
+                )
             # For "appearance", keep the order from tracker (which is by citation_id)
         
         workspaces = list(set(c.workspace for c in citations))

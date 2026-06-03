@@ -4,6 +4,44 @@
 
 Milvus index parameters can be configured through `vector_db_storage_cls_kwargs`, which is the **recommended approach** for framework integration scenarios (e.g., when using RAGAnything or other frameworks built on top of LightRAG).
 
+## Milvus Object Storage Layout
+
+The bundled Docker Milvus stack stores durable vector data and index files in MinIO/S3-compatible object storage. The Milvus process still mounts `/var/lib/milvus` for runtime/cache/local state, so the target architecture is **persistent vector/index data in MinIO**, not a fully diskless Milvus container.
+
+LightRAG connects to Milvus through `MILVUS_URI`; no LightRAG API or schema change is required for this storage layout.
+
+### Bundled Compose Defaults
+
+- Milvus image: `milvusdb/milvus:v2.6.11` for the root compose stack and setup templates.
+- Milvus config mount: `scripts/setup/templates/milvus-user.yaml` -> `/milvus/configs/user.yaml`.
+- Object bucket: `milvus-vectors`.
+- Object prefix: `lightrag/milvus`.
+- Message queue/WAL: Woodpecker with `woodpecker.storage.type: minio`.
+- Metadata: etcd remains the source of truth for Milvus metadata.
+- Local path: `/var/lib/milvus` remains mounted for cache and runtime files.
+
+### Backup Boundaries
+
+Back up all three Milvus dependency layers together:
+
+- MinIO bucket/prefix `milvus-vectors/lightrag/milvus` for vector data, binlogs, indexes, and Woodpecker objects.
+- etcd data or snapshots for Milvus metadata.
+- The local Milvus volume only if operational cache/runtime recovery is required; it is not the primary durable vector store.
+
+### Validation Checklist
+
+Use `.kiro/scripts/check_milvus_minio_storage.sh` after ingesting sample data:
+
+```bash
+.kiro/scripts/check_milvus_minio_storage.sh docker-compose.yml
+```
+
+Expected result:
+
+- MinIO contains objects under `milvus-vectors/lightrag/milvus`.
+- `/var/lib/milvus` may contain local files, but deleting only this local Milvus volume should not be treated as a complete data loss test unless etcd and MinIO are preserved.
+- Deleting or disconnecting MinIO should make Milvus fail to recover vector/index data.
+
 ## Why Use vector_db_storage_cls_kwargs?
 
 ✅ **Framework Integration**: Allows configuration to be passed through framework layers without environment variable changes

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { createSelectors } from '@/lib/utils'
-import { DirectedGraph } from 'graphology'
+import Graph from 'graphology'
 import MiniSearch from 'minisearch'
 import { resolveNodeColor, DEFAULT_NODE_COLOR } from '@/utils/graphColor'
 
@@ -17,6 +17,7 @@ export type RawNodeType = {
   color: string
 
   degree: number
+  level?: number
 }
 
 export type RawEdgeType = {
@@ -90,7 +91,7 @@ interface GraphState {
   focusedEdge: string | null
 
   rawGraph: RawGraph | null
-  sigmaGraph: DirectedGraph | null
+  sigmaGraph: Graph | null
   sigmaInstance: any | null
 
   searchEngine: MiniSearch | null
@@ -119,7 +120,7 @@ interface GraphState {
   setLastSuccessfulQueryLabel: (label: string) => void
 
   setRawGraph: (rawGraph: RawGraph | null) => void
-  setSigmaGraph: (sigmaGraph: DirectedGraph | null) => void
+  setSigmaGraph: (sigmaGraph: Graph | null) => void
   setIsFetching: (isFetching: boolean) => void
 
   // Legend color mapping methods
@@ -213,7 +214,7 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
       rawGraph
     }),
 
-  setSigmaGraph: (sigmaGraph: DirectedGraph | null) => {
+  setSigmaGraph: (sigmaGraph: Graph | null) => {
     // Replace graph instance, no need to keep WebGL context
     set({ sigmaGraph });
   },
@@ -399,7 +400,7 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
       const edgeIndex = rawGraph.edgeIdMap[String(edgeId)]
       if (edgeIndex !== undefined && rawGraph.edges[edgeIndex]) {
         rawGraph.edges[edgeIndex].properties[propertyName] = newValue
-        if(dynamicId !== undefined && propertyName === 'keywords') {
+        if (dynamicId !== undefined && propertyName === 'keywords') {
           sigmaGraph.setEdgeAttribute(dynamicId, 'label', newValue)
         }
       }

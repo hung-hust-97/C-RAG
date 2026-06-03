@@ -1,8 +1,9 @@
 import { ButtonVariantType } from '@/components/ui/Button'
 
 // Backend URL configuration - can be set via VITE_BACKEND_URL environment variable
-// Defaults to empty string (relative URLs) for production builds served by Nginx
-export const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || ''
+// Defaults to empty string so builds served from /webui on port 9621 call the same origin.
+const viteEnv = (import.meta as any).env || {}
+export const backendBaseUrl = viteEnv.VITE_BACKEND_URL || ''
 export const webuiPrefix = '/webui/'
 
 export const controlButtonVariant: ButtonVariantType = 'ghost'

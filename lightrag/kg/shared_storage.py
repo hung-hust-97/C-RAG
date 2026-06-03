@@ -590,10 +590,10 @@ class KeyedUnifiedLock:
             self._async_lock_count.clear()
             self._async_lock_cleanup_data.clear()
             self._pid = current_pid
-        
+
         async_lock = self._async_lock.get(combined_key)
         count = self._async_lock_count.get(combined_key, 0)
-        
+
         if async_lock is None:
             async_lock = asyncio.Lock()
             self._async_lock[combined_key] = async_lock

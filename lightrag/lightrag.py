@@ -88,12 +88,10 @@ from lightrag.base import (
 )
 from lightrag.namespace import NameSpace
 from lightrag.operate import (
-    chunking_by_token_size,
     semantic_chunking_markdown,
-    legal_chunking_markdown,
-    general_semantic_chunking_markdown,
     select_chunking_function,
     extract_entities,
+    extract_legal_entities,
     merge_nodes_and_edges,
     kg_query,
     naive_query,
@@ -151,6 +149,7 @@ def _resolve_default_embedding_timeout() -> int:
     if candidates:
         return max(candidates)
     return DEFAULT_EMBEDDING_TIMEOUT
+
 
 # TODO: TO REMOVE @Yannick
 config = configparser.ConfigParser()
@@ -637,6 +636,7 @@ class LightRAG:
                 llm_timeout=self.default_embedding_timeout,
                 queue_name="Embedding func",
             )(self.embedding_func.func)
+
             # Use dataclasses.replace() to create a new instance, leaving the original unchanged
             self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 
@@ -728,19 +728,52 @@ class LightRAG:
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            meta_fields={
+                "entity_name",
+                "source_id",
+                "content",
+                "file_path",
+                "legal_status",
+                "legal_status_code",
+                "legal_status_priority",
+                "legal_statuses",
+                "legal_status_codes",
+                "legal_document_ids",
+            },
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+            meta_fields={
+                "src_id",
+                "tgt_id",
+                "source_id",
+                "content",
+                "file_path",
+                "legal_status",
+                "legal_status_code",
+                "legal_status_priority",
+                "legal_statuses",
+                "legal_status_codes",
+                "legal_document_ids",
+            },
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "file_path",
+                "doc_type",
+                "context",
+                "legal_document_id",
+                "legal_status",
+                "legal_status_code",
+                "legal_status_priority",
+            },
         )
 
         # Initialize document status storage
@@ -769,8 +802,18 @@ class LightRAG:
 
         self._storages_status = StoragesStatus.CREATED
 
-    async def initialize_storages(self):
+    async def initialize_storages(self, profile: str | None = None):
         """Storage initialization must be called one by one to prevent deadlock"""
+        if self._storages_status not in {
+            StoragesStatus.CREATED,
+            StoragesStatus.INITIALIZED,
+        }:
+            return
+
+        profile_name = getattr(profile, "value", profile)
+        profile_name = str(profile_name) if profile_name else None
+        initialized_storage_names = getattr(self, "_initialized_storage_names", set())
+
         if self._storages_status == StoragesStatus.CREATED:
             # Set the first initialized workspace will set the default workspace
             # Allows namespace operation without specifying workspace for backward compatibility
@@ -788,26 +831,69 @@ class LightRAG:
 
             await initialize_pipeline_status(workspace=self.workspace)
 
-            for storage in (
-                self.full_docs,
-                self.text_chunks,
-                self.full_entities,
-                self.full_relations,
-                self.entity_chunks,
-                self.relation_chunks,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-                self.llm_response_cache,
-                self.doc_status,
-            ):
-                if storage:
-                    # logger.debug(f"Initializing storage: {storage}")
-                    await storage.initialize()
+        # Determine which VDBs to initialize based on pipeline profile.
+        # Merge/extraction/finalize stages do not need Milvus collections loaded.
+        init_chunks_vdb = True
+        init_entities_vdb = True
+        init_relationships_vdb = True
 
-            self._storages_status = StoragesStatus.INITIALIZED
-            logger.debug("All storage types initialized")
+        no_vector_profiles = {
+            "extraction",
+            "chunking",
+            "entity_extraction",
+            "kg_merge",
+            "finalize",
+        }
+        if profile_name in no_vector_profiles:
+            init_chunks_vdb = False
+            init_entities_vdb = False
+            init_relationships_vdb = False
+        elif profile_name == "chunk_embedding":
+            init_entities_vdb = False
+            init_relationships_vdb = False
+        elif profile_name == "kg_embedding":
+            init_chunks_vdb = False
+
+        storages_to_init = [
+            ("full_docs", self.full_docs),
+            ("text_chunks", self.text_chunks),
+            ("full_entities", self.full_entities),
+            ("full_relations", self.full_relations),
+            ("entity_chunks", self.entity_chunks),
+            ("relation_chunks", self.relation_chunks),
+        ]
+
+        if init_entities_vdb:
+            storages_to_init.append(("entities_vdb", self.entities_vdb))
+        if init_relationships_vdb:
+            storages_to_init.append(("relationships_vdb", self.relationships_vdb))
+        if init_chunks_vdb:
+            storages_to_init.append(("chunks_vdb", self.chunks_vdb))
+
+        storages_to_init.extend(
+            [
+                ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
+                ("llm_response_cache", self.llm_response_cache),
+                ("doc_status", self.doc_status),
+            ]
+        )
+
+        initialized_now = []
+        for storage_name, storage in storages_to_init:
+            if not storage or storage_name in initialized_storage_names:
+                continue
+            await storage.initialize()
+            initialized_storage_names.add(storage_name)
+            initialized_now.append(storage_name)
+
+        self._initialized_storage_names = initialized_storage_names
+        self._storages_status = StoragesStatus.INITIALIZED
+        logger.debug(
+            "Initialized storages profile=%s workspace=%s storages=%s",
+            profile_name or "full",
+            self.workspace,
+            initialized_now,
+        )
 
     async def finalize_storages(self):
         """Asynchronously finalize the storages with improved error handling"""
@@ -855,12 +941,22 @@ class LightRAG:
             else:
                 logger.debug("All storages finalized successfully")
 
+            if hasattr(self, "_initialized_storage_names"):
+                self._initialized_storage_names.clear()
             self._storages_status = StoragesStatus.FINALIZED
 
     async def check_and_migrate_data(self):
         """Check if data migration is needed and perform migration if necessary"""
         async with get_data_init_lock():
             try:
+                if os.getenv(
+                    "LIGHTRAG_ENABLE_STARTUP_DATA_MIGRATION", "false"
+                ).lower() not in {"1", "true", "yes", "on"}:
+                    logger.info(
+                        "Startup graph data migration disabled by LIGHTRAG_ENABLE_STARTUP_DATA_MIGRATION=false"
+                    )
+                    return
+
                 # Check if migration is needed:
                 # 1. chunk_entity_relation_graph has entities and relations (count > 0)
                 # 2. full_entities and full_relations are empty
@@ -874,12 +970,26 @@ class LightRAG:
                     logger.debug("No entities found in graph, skipping migration check")
                     return
 
+                max_graph_items = int(
+                    os.getenv("LIGHTRAG_STARTUP_MIGRATION_MAX_GRAPH_ITEMS", "100000")
+                )
+                if len(all_entity_labels) > max_graph_items:
+                    logger.warning(
+                        "Skipping startup graph data migration: graph has %s labels, limit is %s. "
+                        "This avoids loading the entire graph into memory.",
+                        len(all_entity_labels),
+                        max_graph_items,
+                    )
+                    return
+
                 try:
                     # Initialize chunk tracking storage after migration
                     await self._migrate_chunk_tracking_storage()
                 except Exception as e:
-                    logger.error(f"Error during chunk_tracking migration: {e}")
-                    raise e
+                    logger.warning(
+                        f"Non-critical: chunk_tracking migration failed, will retry on next startup: {e}"
+                    )
+                    # Do NOT re-raise — migration is non-critical, server must continue starting up
 
                 # Check if full_entities and full_relations are empty
                 # Get all processed documents to check their entity/relation data
@@ -920,12 +1030,14 @@ class LightRAG:
                     await self._migrate_entity_relation_data(processed_docs)
 
                 except Exception as e:
-                    logger.error(f"Error during migration check: {e}")
-                    raise e
+                    logger.warning(
+                        f"Non-critical: entity/relation migration failed, will retry on next startup: {e}"
+                    )
+                    # Do NOT re-raise — migration is non-critical
 
             except Exception as e:
-                logger.error(f"Error in data migration check: {e}")
-                raise e
+                logger.warning(f"Non-critical: data migration check failed: {e}")
+                # Do NOT re-raise — migration is non-critical, server must start up regardless
 
     async def _migrate_entity_relation_data(self, processed_docs: dict):
         """Migrate existing entity and relation data to full_entities and full_relations storage"""
@@ -946,9 +1058,25 @@ class LightRAG:
         doc_entities = {}  # doc_id -> set of entity_names
         doc_relations = {}  # doc_id -> set of relation_pairs (as tuples)
 
-        # Get all nodes and edges from graph
-        all_nodes = await self.chunk_entity_relation_graph.get_all_nodes()
-        all_edges = await self.chunk_entity_relation_graph.get_all_edges()
+        # Get all nodes from graph — guard against Neo4j OOM on large graphs
+        try:
+            all_nodes = await self.chunk_entity_relation_graph.get_all_nodes()
+        except Exception as e:
+            logger.warning(
+                f"Could not fetch all nodes during migration (possibly Neo4j OOM): {e}. "
+                "Skipping entity migration — will retry on next startup."
+            )
+            all_nodes = []
+
+        # Get all edges from graph — guard against Neo4j OOM on large graphs
+        try:
+            all_edges = await self.chunk_entity_relation_graph.get_all_edges()
+        except Exception as e:
+            logger.warning(
+                f"Could not fetch all edges during migration (possibly Neo4j OOM): {e}. "
+                "Skipping relation migration — will retry on next startup."
+            )
+            all_edges = []
 
         # Process all nodes once
         for node in all_nodes:
@@ -1167,6 +1295,7 @@ class LightRAG:
         node_label: str,
         max_depth: int = 3,
         max_nodes: int = None,
+        is_legal_document_workspace: bool = False,
     ) -> KnowledgeGraph:
         """Get knowledge graph for a given label
 
@@ -1185,9 +1314,15 @@ class LightRAG:
             # Limit max_nodes to not exceed self.max_graph_nodes
             max_nodes = min(max_nodes, self.max_graph_nodes)
 
-        return await self.chunk_entity_relation_graph.get_knowledge_graph(
-            node_label, max_depth, max_nodes
-        )
+        graph_getter = self.chunk_entity_relation_graph.get_knowledge_graph
+        if "is_legal_document_workspace" in inspect.signature(graph_getter).parameters:
+            return await graph_getter(
+                node_label,
+                max_depth,
+                max_nodes,
+                is_legal_document_workspace=is_legal_document_workspace,
+            )
+        return await graph_getter(node_label, max_depth, max_nodes)
 
     def _get_storage_class(self, storage_name: str) -> Callable[..., Any]:
         # Direct imports for default storage implementations
@@ -1300,7 +1435,9 @@ class LightRAG:
 
             # Process cleaned texts
             if doc_id is None:
-                doc_key = compute_mdhash_id(full_text, prefix="doc-")
+                doc_key = compute_mdhash_id(
+                    full_text, prefix="doc-", workspace=self.workspace
+                )
             else:
                 doc_key = doc_id
             new_docs = {doc_key: {"content": full_text, "file_path": file_path}}
@@ -1316,7 +1453,9 @@ class LightRAG:
 
             inserting_chunks: dict[str, Any] = {}
             for index, chunk_text in enumerate(text_chunks):
-                chunk_key = compute_mdhash_id(chunk_text, prefix="chunk-")
+                chunk_key = compute_mdhash_id(
+                    chunk_text, prefix="chunk-", workspace=self.workspace
+                )
                 tokens = len(self.tokenizer.encode(chunk_text))
                 inserting_chunks[chunk_key] = {
                     "content": chunk_text,
@@ -1438,7 +1577,7 @@ class LightRAG:
         for id_, content_data in contents.items():
             # Compute content_hash for each document
             content_hash = compute_content_hash(content_data["content"], self.workspace)
-            
+
             new_docs[id_] = {
                 "status": DocStatus.EXTRACTED,  # Initial status for direct text input
                 "content_summary": get_content_summary(content_data["content"]),
@@ -1458,14 +1597,18 @@ class LightRAG:
         final_ids = []
         unique_new_doc_ids = []
         duplicate_docs: dict[str, Any] = {}
-        
+
         for doc_id in all_doc_ids:
             doc_info = new_docs[doc_id]
-            is_dup, existing_id = await self.doc_status.check_duplicate_by_content_hash(doc_info["content_hash"])
-            
+            is_dup, existing_id = await self.doc_status.check_duplicate_by_content_hash(
+                doc_info["content_hash"]
+            )
+
             if is_dup:
-                logger.warning(f"Duplicate document detected by content_hash: {doc_id} matches {existing_id} ({doc_info['file_path']})")
-                
+                logger.warning(
+                    f"Duplicate document detected by content_hash: {doc_id} matches {existing_id} ({doc_info['file_path']})"
+                )
+
                 # Create a record for the duplicate attempt with DUPLICATED status
                 dup_record_id = generate_doc_id("dup-")
                 final_ids.append(dup_record_id)
@@ -1495,10 +1638,7 @@ class LightRAG:
             logger.info(f"Created {len(duplicate_docs)} duplicate document records")
 
         # Filter new_docs to only include documents with unique content
-        final_new_docs = {
-            doc_id: new_docs[doc_id]
-            for doc_id in unique_new_doc_ids
-        }
+        final_new_docs = {doc_id: new_docs[doc_id] for doc_id in unique_new_doc_ids}
 
         if not final_new_docs:
             logger.warning("No new unique documents were found.")
@@ -1596,7 +1736,7 @@ class LightRAG:
         inconsistent_docs = []
         failed_docs_to_preserve = []
         successful_deletions = 0
-        
+
         # Get active Celery tasks to avoid marking active tasks as FAILED
         active_task_ids = set()
         workspace_is_being_chunked = False
@@ -1604,8 +1744,9 @@ class LightRAG:
 
         try:
             from celery_worker.app import celery_app
+
             i = celery_app.control.inspect()
-            
+
             # Combine all task states
             all_tasks_data = []
             active_data = i.active() or {}
@@ -1614,28 +1755,38 @@ class LightRAG:
             for d in [active_data, reserved_data, scheduled_data]:
                 for worker_tasks in d.values():
                     all_tasks_data.extend(worker_tasks)
-            
+
             for t in all_tasks_data:
                 # Get task ID safely
-                t_id = t.get("id") or (t.get("request", {}).get("id") if isinstance(t.get("request"), dict) else None)
+                t_id = t.get("id") or (
+                    t.get("request", {}).get("id")
+                    if isinstance(t.get("request"), dict)
+                    else None
+                )
                 if t_id:
                     active_task_ids.add(t_id)
-                
+
                 t_name = t.get("name")
                 t_args = t.get("args") or []
-                
+
                 # Detect if any task is processing THIS workspace
                 if t_name == "celery_worker.tasks.task_chunk_and_graph":
                     if len(t_args) > 0 and t_args[0] == self.workspace:
                         workspace_is_being_chunked = True
-                
+
                 if t_name == "celery_worker.tasks.task_extract_and_enqueue":
                     if len(t_args) > 2 and t_args[0] == self.workspace:
-                        docs_being_extracted.add(t_args[2]) # doc_id is the 3rd argument
-            
-            logger.info(f"[Reprocess] Celery status: workspace_busy={workspace_is_being_chunked}, active_tasks={len(active_task_ids)}, docs_extracting={len(docs_being_extracted)}")
+                        docs_being_extracted.add(
+                            t_args[2]
+                        )  # doc_id is the 3rd argument
+
+            logger.info(
+                f"[Reprocess] Celery status: workspace_busy={workspace_is_being_chunked}, active_tasks={len(active_task_ids)}, docs_extracting={len(docs_being_extracted)}"
+            )
         except ImportError:
-            logger.warning("[Reprocess] Celery not available, cannot check active tasks")
+            logger.warning(
+                "[Reprocess] Celery not available, cannot check active tasks"
+            )
         except Exception as e:
             logger.warning(f"[Reprocess] Failed to check Celery active tasks: {e}")
 
@@ -1643,7 +1794,7 @@ class LightRAG:
         docs_to_reextract = []  # Documents that need re-extraction
         docs_to_mark_failed: dict[str, dict[str, Any]] = {}
         docs_to_skip = []  # Documents to skip from current processing loop
-        
+
         doc_ids_to_check = list(to_process_docs.keys())
         for doc_id in doc_ids_to_check:
             status_doc = to_process_docs.get(doc_id)
@@ -1662,10 +1813,10 @@ class LightRAG:
                 # Check if task is still running in Celery
                 metadata = getattr(status_doc, "metadata", {}) or {}
                 task_id = metadata.get("task_id")
-                
+
                 status_label = (
-                    status_doc.status.value 
-                    if hasattr(status_doc.status, "value") 
+                    status_doc.status.value
+                    if hasattr(status_doc.status, "value")
                     else status_doc.status
                 )
                 # If the task is still visible in the active pool, skip it
@@ -1674,31 +1825,48 @@ class LightRAG:
                 # 2. There is a general CHUNKING task for this workspace
                 # 3. There is an EXTRACTION task for this specific document
                 is_active = (
-                    (task_id and task_id in active_task_ids) or 
-                    (status_doc.status == DocStatus.CHUNKING and workspace_is_being_chunked) or
-                    (status_doc.status == DocStatus.EXTRACTING and doc_id in docs_being_extracted)
+                    (task_id and task_id in active_task_ids)
+                    or (
+                        status_doc.status == DocStatus.CHUNKING
+                        and workspace_is_being_chunked
+                    )
+                    or (
+                        status_doc.status == DocStatus.EXTRACTING
+                        and doc_id in docs_being_extracted
+                    )
                 )
-                
+
                 if is_active:
-                    logger.info(f"[Reprocess] Document {doc_id} is in {status_label} but task is still active (task_id={task_id}, ws_busy={workspace_is_being_chunked}). Skipping.")
+                    logger.info(
+                        f"[Reprocess] Document {doc_id} is in {status_label} but task is still active (task_id={task_id}, ws_busy={workspace_is_being_chunked}). Skipping."
+                    )
                     docs_to_skip.append(doc_id)
                     continue
-                
+
                 # Check grace period (10 minutes) before marking as FAILED
                 import time
+
                 current_time = int(time.time())
                 processing_start_time = metadata.get("processing_start_time", 0)
                 # If processing_start_time is completely missing, we check created_at
-                if not processing_start_time and hasattr(status_doc, "created_at") and status_doc.created_at:
+                if (
+                    not processing_start_time
+                    and hasattr(status_doc, "created_at")
+                    and status_doc.created_at
+                ):
                     try:
-                        dt = datetime.fromisoformat(status_doc.created_at.replace("Z", "+00:00"))
+                        dt = datetime.fromisoformat(
+                            status_doc.created_at.replace("Z", "+00:00")
+                        )
                         processing_start_time = int(dt.timestamp())
                     except Exception:
                         processing_start_time = current_time - 601  # Force timeout
-                
+
                 grace_period = 600  # 10 minutes (visibility_timeout)
                 if current_time - processing_start_time < grace_period:
-                    logger.info(f"[Reprocess] Document {doc_id} is in {status_label} and task is missing, but within {grace_period}s grace period. Skipping.")
+                    logger.info(
+                        f"[Reprocess] Document {doc_id} is in {status_label} and task is missing, but within {grace_period}s grace period. Skipping."
+                    )
                     docs_to_skip.append(doc_id)
                     continue
 
@@ -1739,11 +1907,11 @@ class LightRAG:
                     f"[Reprocess] {status_label} document {doc_id} will be marked as FAILED"
                 )
                 continue
-            
+
             if not content_data:
                 # Document has no content - need to check if we can re-extract
                 file_path = getattr(status_doc, "file_path", None)
-                
+
                 # Check if this is a failed document
                 if (
                     hasattr(status_doc, "status")
@@ -1753,13 +1921,16 @@ class LightRAG:
                     if reprocess_failed and file_path:
                         # Check if file exists in inputs or __enqueued__ directory
                         from pathlib import Path
-                        base_input_dir = Path(os.getenv("INPUT_DIR", "/app/data/inputs"))
+
+                        base_input_dir = Path(
+                            os.getenv("INPUT_DIR", "/app/data/inputs")
+                        )
                         input_dir = base_input_dir / self.workspace
                         enqueued_dir = input_dir / "__enqueued__"
-                        
+
                         file_exists = False
                         actual_file_path = None
-                        
+
                         # Check in inputs directory
                         if (input_dir / file_path).exists():
                             file_exists = True
@@ -1768,15 +1939,17 @@ class LightRAG:
                         elif (enqueued_dir / file_path).exists():
                             file_exists = True
                             actual_file_path = enqueued_dir / file_path
-                        
+
                         if file_exists:
                             # File exists - mark for re-extraction
-                            docs_to_reextract.append({
-                                "doc_id": doc_id,
-                                "file_path": str(actual_file_path),
-                                "original_file_name": file_path
-                            })
-                            
+                            docs_to_reextract.append(
+                                {
+                                    "doc_id": doc_id,
+                                    "file_path": str(actual_file_path),
+                                    "original_file_name": file_path,
+                                }
+                            )
+
                             # Remove from current processing list
                             to_process_docs.pop(doc_id, None)
                         else:
@@ -1793,13 +1966,11 @@ class LightRAG:
             await self.doc_status.upsert(docs_to_mark_failed)
 
             async with pipeline_status_lock:
-                reset_extracting_message = (
-                    f"Marked {len(docs_to_mark_failed)} stuck EXTRACTING/CHUNKING documents as FAILED"
-                )
+                reset_extracting_message = f"Marked {len(docs_to_mark_failed)} stuck EXTRACTING/CHUNKING documents as FAILED"
                 logger.info(reset_extracting_message)
                 pipeline_status["latest_message"] = reset_extracting_message
                 pipeline_status["history_messages"].append(reset_extracting_message)
-        
+
         # Trigger re-extraction for documents with files
         if docs_to_reextract:
             async with pipeline_status_lock:
@@ -1807,23 +1978,25 @@ class LightRAG:
                 logger.info(reextract_message)
                 pipeline_status["latest_message"] = reextract_message
                 pipeline_status["history_messages"].append(reextract_message)
-            
+
             # Import Celery task here to avoid circular dependency
             try:
                 from celery_worker.tasks import task_extract_and_enqueue
-                
+
                 for doc_info in docs_to_reextract:
-                    logger.info(f"[Reprocess] Triggering re-extraction for {doc_info['doc_id']} ({doc_info['original_file_name']})")
+                    logger.info(
+                        f"[Reprocess] Triggering re-extraction for {doc_info['doc_id']} ({doc_info['original_file_name']})"
+                    )
                     task_extract_and_enqueue.delay(
                         workspace_id=self.workspace,
-                        file_path_str=doc_info['file_path'],
-                        doc_id=doc_info['doc_id']
+                        file_path_str=doc_info["file_path"],
+                        doc_id=doc_info["doc_id"],
                     )
             except ImportError as e:
                 logger.error(f"[Reprocess] Failed to import Celery task: {e}")
                 # If Celery is not available, mark these documents as inconsistent
                 for doc_info in docs_to_reextract:
-                    inconsistent_docs.append(doc_info['doc_id'])
+                    inconsistent_docs.append(doc_info["doc_id"])
 
         # Log information about failed documents that will be preserved
         if failed_docs_to_preserve:
@@ -1892,6 +2065,159 @@ class LightRAG:
 
         return to_process_docs
 
+    async def apipeline_process_chunking_stage(
+        self,
+        content: str | None = None,
+        file_path: str | None = None,
+        doc_id: str | None = None,
+        legal_document_id: int | None = None,
+        doc_type: str = "general",
+        chunking_func: Callable[..., Any] | None = None,
+        batch_docs: list[dict] | None = None,
+    ) -> dict:
+        """
+        Process a single document or a batch of documents by splitting them into chunks, performing
+        entity/relation extraction, and merging nodes & edges into graph and DB.
+        """
+        import inspect
+        from .operate import select_chunking_function
+
+        docs_to_process = []
+        if batch_docs:
+            docs_to_process = batch_docs
+        elif content is not None:
+            docs_to_process = [
+                {
+                    "content": content,
+                    "file_path": file_path,
+                    "doc_id": doc_id,
+                    "legal_document_id": legal_document_id,
+                    "doc_type": doc_type,
+                    "chunking_func": chunking_func,
+                }
+            ]
+        else:
+            return {}
+
+        logger.info(f"Starting chunking stage for {len(docs_to_process)} document(s).")
+
+        all_chunks: dict[str, Any] = {}
+        doc_results: dict[str, dict] = {}
+
+        # 1 & 2. Chunking all documents and building chunks dict
+        for doc_item in docs_to_process:
+            c_content = doc_item.get("content", "")
+            c_file_path = doc_item.get("file_path", "")
+            c_doc_id = doc_item.get("doc_id")
+            c_legal_document_id = doc_item.get("legal_document_id")
+            c_doc_type = doc_item.get("doc_type", "general")
+            c_chunking_func = doc_item.get("chunking_func")
+
+            if c_doc_id and c_doc_id.isdigit():
+                c_doc_type = "legal"
+                if not c_legal_document_id:
+                    c_legal_document_id = int(c_doc_id)
+            if c_legal_document_id and c_doc_type == "general":
+                c_doc_type = "legal"
+
+            if not c_doc_id and c_legal_document_id:
+                c_doc_id = f"legal-{c_legal_document_id}"
+                logger.info(f"Using fallback doc_id: {c_doc_id} for legal document")
+
+            c_doc_extension = os.path.splitext(c_file_path or "")[1].lower().lstrip(".")
+
+            if c_chunking_func is not None:
+                selected_func = c_chunking_func
+            elif self.chunking_func != semantic_chunking_markdown:
+                selected_func = self.chunking_func
+            else:
+                selected_func = select_chunking_function(c_doc_type, c_doc_extension)
+
+            try:
+                chunking_result = selected_func(
+                    self.tokenizer,
+                    c_content,
+                    None,  # split_by_character
+                    False,  # split_by_character_only
+                    self.chunk_overlap_token_size,
+                    self.chunk_token_size,
+                    doc_id=c_doc_id,
+                )
+                if inspect.isawaitable(chunking_result):
+                    chunking_result = await chunking_result
+
+                if not isinstance(chunking_result, (list, tuple)):
+                    raise TypeError(
+                        f"chunking_func must return list or tuple, got {type(chunking_result)}"
+                    )
+
+                for dp in chunking_result:
+                    chunk_key = compute_mdhash_id(
+                        dp["content"], prefix="chunk-", workspace=self.workspace
+                    )
+                    all_chunks[chunk_key] = {
+                        **dp,
+                        "full_doc_id": c_doc_id,
+                        "file_path": c_file_path,
+                        "doc_type": c_doc_type,
+                        "llm_cache_list": [],
+                        "legal_document_id": c_legal_document_id,
+                    }
+                doc_results[c_doc_id] = {"success": True}
+            except Exception as e:
+                logger.error(
+                    f"Error chunking document {c_doc_id}: {e}\n{traceback.format_exc()}"
+                )
+                doc_results[c_doc_id] = {"error": str(e)}
+
+        if not all_chunks:
+            logger.warning("No chunks generated for the entire batch.")
+            return doc_results
+
+        # 3. Save all chunks in parallel
+        await asyncio.gather(
+            self.chunks_vdb.upsert(all_chunks),
+            self.text_chunks.upsert(all_chunks),
+        )
+        # 4. Extract entities and relationships
+        pipeline_status = {
+            "latest_message": "",
+            "history_messages": [],
+            "cur_batch": 1,
+            "busy": True,
+        }
+        pipeline_status_lock = asyncio.Lock()
+
+        # Note: We pass doc_type="batch" here or just use general if mixed. _process_extract_entities uses it for logging mostly.
+        chunk_results = await self._process_extract_entities(
+            all_chunks, pipeline_status, pipeline_status_lock, doc_type="general"
+        )
+
+        # 5. Merge nodes & edges
+        await merge_nodes_and_edges(
+            chunk_results=chunk_results,
+            knowledge_graph_inst=self.chunk_entity_relation_graph,
+            entity_vdb=self.entities_vdb,
+            relationships_vdb=self.relationships_vdb,
+            global_config=asdict(self),
+            full_entities_storage=self.full_entities,
+            full_relations_storage=self.full_relations,
+            doc_id="batch",
+            pipeline_status=pipeline_status,
+            pipeline_status_lock=pipeline_status_lock,
+            llm_response_cache=self.llm_response_cache,
+            entity_chunks_storage=self.entity_chunks,
+            relation_chunks_storage=self.relation_chunks,
+            current_file_number=1,
+            total_files=1,
+            file_path="batch",
+        )
+
+        # 6. Call _insert_done to commit/persist if needed
+        await self._insert_done(pipeline_status, pipeline_status_lock)
+
+        return doc_results
+
     async def apipeline_process_enqueue_documents(
         self,
         split_by_character: str | None = None,
@@ -1926,7 +2252,12 @@ class LightRAG:
                 # Pick up documents in all states that need processing or recovery
                 # DocProcessingStatus.__post_init__ handles backward compatibility mapping
                 # for PENDING -> EXTRACTED and PROCESSING -> CHUNKING
-                extracted_docs, chunking_docs, failed_docs, extracting_docs = await asyncio.gather(
+                (
+                    extracted_docs,
+                    chunking_docs,
+                    failed_docs,
+                    extracting_docs,
+                ) = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                     self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
@@ -1937,7 +2268,9 @@ class LightRAG:
                 to_process_docs.update(extracted_docs)
                 to_process_docs.update(chunking_docs)
                 to_process_docs.update(failed_docs)
-                to_process_docs.update(extracting_docs)  # Include stuck EXTRACTING documents
+                to_process_docs.update(
+                    extracting_docs
+                )  # Include stuck EXTRACTING documents
 
                 # Create a static copy to avoid RuntimeError: dictionary changed size during iteration
                 to_process_docs_static = dict(to_process_docs)
@@ -1945,10 +2278,9 @@ class LightRAG:
                 if not to_process_docs_static:
                     logger.info("No documents to process")
                     return
-                
+
                 # Use the static copy for the rest of the function
                 to_process_docs = to_process_docs_static
-
 
                 pipeline_status.update(
                     {
@@ -2146,6 +2478,32 @@ class LightRAG:
                                         pipeline_status["history_messages"][-5000:]
                                     )
 
+                            # Get doc_type and metadata to select appropriate chunking function
+                            metadata = getattr(status_doc, "metadata", {}) or {}
+                            doc_type = metadata.get("doc_type", "general")
+
+                            # Fallback auto-detection for legal documents
+                            legal_document_id = metadata.get("legal_document_id")
+                            if doc_id and doc_id.isdigit():
+                                doc_type = "legal"
+                                if not legal_document_id:
+                                    legal_document_id = int(doc_id)
+                                    metadata["legal_document_id"] = legal_document_id
+                                    metadata["doc_type"] = "legal"
+                                logger.info(
+                                    f"Auto-detected doc_id {doc_id} as legal document (id={legal_document_id})"
+                                )
+
+                            if legal_document_id and doc_type == "general":
+                                doc_type = "legal"
+
+                            # Handle null doc_id for legal documents
+                            if not doc_id and legal_document_id:
+                                doc_id = f"legal-{legal_document_id}"
+                                logger.info(
+                                    f"Using fallback doc_id: {doc_id} for legal document"
+                                )
+
                             # Get document content from full_docs
                             content_data = await self.full_docs.get_by_id(doc_id)
                             if not content_data:
@@ -2154,10 +2512,10 @@ class LightRAG:
                                 )
                             content = content_data["content"]
 
-                            # Get doc_type from metadata to select appropriate chunking function
-                            metadata = getattr(status_doc, "metadata", {}) or {}
-                            doc_type = metadata.get("doc_type", "general")
-                            
+                            doc_extension = (
+                                os.path.splitext(file_path or "")[1].lower().lstrip(".")
+                            )
+
                             # Select chunking function based on doc_type
                             # If user has set a custom chunking_func, use it; otherwise use doc_type-based selection
                             if self.chunking_func != semantic_chunking_markdown:
@@ -2165,8 +2523,10 @@ class LightRAG:
                                 selected_chunking_func = self.chunking_func
                             else:
                                 # Use doc_type-based selection
-                                selected_chunking_func = select_chunking_function(doc_type)
-                            
+                                selected_chunking_func = select_chunking_function(
+                                    doc_type, doc_extension
+                                )
+
                             # Call chunking function, supporting both sync and async implementations
                             chunking_result = selected_chunking_func(
                                 self.tokenizer,
@@ -2175,6 +2535,7 @@ class LightRAG:
                                 split_by_character_only,
                                 self.chunk_overlap_token_size,
                                 self.chunk_token_size,
+                                doc_id=doc_id,
                             )
 
                             # If result is awaitable, await to get actual result
@@ -2188,13 +2549,59 @@ class LightRAG:
                                     f"got {type(chunking_result)}"
                                 )
 
+                            # Enforce strict token limit for all chunks to prevent LLM context length errors
+                            enforced_chunking_result = []
+                            for chunk in chunking_result:
+                                chunk_tokens = chunk.get(
+                                    "tokens",
+                                    len(self.tokenizer.encode(chunk["content"])),
+                                )
+                                if chunk_tokens > self.chunk_token_size:
+                                    logger.warning(
+                                        f"Chunk exceeds token limit ({chunk_tokens} > {self.chunk_token_size}). Splitting forcibly."
+                                    )
+                                    encoded = self.tokenizer.encode(chunk["content"])
+                                    for start in range(
+                                        0,
+                                        len(encoded),
+                                        self.chunk_token_size
+                                        - self.chunk_overlap_token_size,
+                                    ):
+                                        sub_encoded = encoded[
+                                            start : start + self.chunk_token_size
+                                        ]
+                                        sub_content = self.tokenizer.decode(sub_encoded)
+                                        new_chunk = {
+                                            **chunk,
+                                            "content": sub_content.strip(),
+                                            "tokens": len(sub_encoded),
+                                        }
+                                        if "chunk_order_index" in new_chunk:
+                                            new_chunk["chunk_order_index"] = len(
+                                                enforced_chunking_result
+                                            )
+                                        enforced_chunking_result.append(new_chunk)
+                                else:
+                                    if "chunk_order_index" in chunk:
+                                        chunk["chunk_order_index"] = len(
+                                            enforced_chunking_result
+                                        )
+                                    enforced_chunking_result.append(chunk)
+                            chunking_result = enforced_chunking_result
+
                             # Build chunks dictionary
                             chunks: dict[str, Any] = {
-                                compute_mdhash_id(dp["content"], prefix="chunk-"): {
+                                compute_mdhash_id(
+                                    dp["content"],
+                                    prefix="chunk-",
+                                    workspace=self.workspace,
+                                ): {
                                     **dp,
                                     "full_doc_id": doc_id,
                                     "file_path": file_path,  # Add file path to each chunk
+                                    "doc_type": doc_type,
                                     "llm_cache_list": [],  # Initialize empty LLM cache list for each chunk
+                                    "legal_document_id": legal_document_id,
                                 }
                                 for dp in chunking_result
                             }
@@ -2212,7 +2619,7 @@ class LightRAG:
 
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
-                            
+
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
                                     {
@@ -2221,9 +2628,7 @@ class LightRAG:
                                             "error_msg": None,
                                             "error_stage": None,
                                             "chunks_count": len(chunks),
-                                            "chunks_list": list(
-                                                chunks.keys()
-                                            ),  # Save chunks list
+                                            "chunks_list": list(chunks.keys()),
                                             "content_summary": status_doc.content_summary,
                                             "content_length": status_doc.content_length,
                                             "created_at": status_doc.created_at,
@@ -2234,9 +2639,13 @@ class LightRAG:
                                             "metadata": {
                                                 **getattr(status_doc, "metadata", {}),
                                                 "processing_start_time": processing_start_time,
-                                                **({"task_id": task_id} if task_id else {})
+                                                **(
+                                                    {"task_id": task_id}
+                                                    if task_id
+                                                    else {}
+                                                ),
                                             },
-                                        }
+                                        },
                                     }
                                 )
                             )
@@ -2261,7 +2670,10 @@ class LightRAG:
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
                             entity_relation_task = asyncio.create_task(
                                 self._process_extract_entities(
-                                    chunks, pipeline_status, pipeline_status_lock
+                                    chunks,
+                                    pipeline_status,
+                                    pipeline_status_lock,
+                                    doc_type=doc_type,
                                 )
                             )
                             chunk_results = await entity_relation_task
@@ -2365,7 +2777,7 @@ class LightRAG:
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                             },
-                                        }
+                                        },
                                     }
                                 )
 
@@ -2463,7 +2875,12 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
                 # Check for pending documents again
-                extracted_docs, chunking_docs, failed_docs, extracting_docs = await asyncio.gather(
+                (
+                    extracted_docs,
+                    chunking_docs,
+                    failed_docs,
+                    extracting_docs,
+                ) = await asyncio.gather(
                     self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
                     self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
                     self.doc_status.get_docs_by_status(DocStatus.FAILED),
@@ -2489,17 +2906,34 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
     async def _process_extract_entities(
-        self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
+        self,
+        chunk: dict[str, Any],
+        pipeline_status=None,
+        pipeline_status_lock=None,
+        doc_type: str = "general",
     ) -> list:
         try:
-            chunk_results = await extract_entities(
-                chunk,
-                global_config=asdict(self),
-                pipeline_status=pipeline_status,
-                pipeline_status_lock=pipeline_status_lock,
-                llm_response_cache=self.llm_response_cache,
-                text_chunks_storage=self.text_chunks,
-            )
+            is_legal = doc_type == "legal"
+
+            if is_legal:
+                logger.info("Using extract_legal_entities for legal document")
+                chunk_results = await extract_legal_entities(
+                    chunk,
+                    global_config=asdict(self),
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                    llm_response_cache=self.llm_response_cache,
+                    text_chunks_storage=self.text_chunks,
+                )
+            else:
+                chunk_results = await extract_entities(
+                    chunk,
+                    global_config=asdict(self),
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                    llm_response_cache=self.llm_response_cache,
+                    text_chunks_storage=self.text_chunks,
+                )
             return chunk_results
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"
@@ -2566,7 +3000,9 @@ class LightRAG:
                     if "chunk_order_index" not in chunk_data.keys()
                     else chunk_data["chunk_order_index"]
                 )
-                chunk_id = compute_mdhash_id(chunk_content, prefix="chunk-")
+                chunk_id = compute_mdhash_id(
+                    chunk_content, prefix="chunk-", workspace=self.workspace
+                )
 
                 chunk_entry = {
                     "content": chunk_content,
@@ -2686,7 +3122,9 @@ class LightRAG:
 
             # Insert entities into vector storage with consistent format
             data_for_vdb = {
-                compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                compute_mdhash_id(
+                    dp["entity_name"], prefix="ent-", workspace=self.workspace
+                ): {
                     "content": dp["entity_name"] + "\n" + dp["description"],
                     "entity_name": dp["entity_name"],
                     "source_id": dp["source_id"],
@@ -2700,7 +3138,9 @@ class LightRAG:
 
             # Insert relationships into vector storage with consistent format
             data_for_vdb = {
-                compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
+                compute_mdhash_id(
+                    dp["src_id"] + dp["tgt_id"], prefix="rel-", workspace=self.workspace
+                ): {
                     "src_id": dp["src_id"],
                     "tgt_id": dp["tgt_id"],
                     "source_id": dp["source_id"],
@@ -3063,8 +3503,7 @@ class LightRAG:
                 if not system_prompt:
                     prompt_manager = PromptManager(PROMPTS)
                     system_prompt = prompt_manager.get_prompt(
-                        "bypass_system_prompt",
-                        auto_detect_text=query.strip()
+                        "bypass_system_prompt", auto_detect_text=query.strip()
                     )
 
                 param.stream = True if param.stream is None else param.stream
@@ -3755,8 +4194,12 @@ class LightRAG:
                     for src, tgt in relationships_to_delete:
                         rel_ids_to_delete.extend(
                             [
-                                compute_mdhash_id(src + tgt, prefix="rel-"),
-                                compute_mdhash_id(tgt + src, prefix="rel-"),
+                                compute_mdhash_id(
+                                    src + tgt, prefix="rel-", workspace=self.workspace
+                                ),
+                                compute_mdhash_id(
+                                    tgt + src, prefix="rel-", workspace=self.workspace
+                                ),
                             ]
                         )
                     await self.relationships_vdb.delete(rel_ids_to_delete)
@@ -3834,8 +4277,16 @@ class LightRAG:
                         for src, tgt in edges_to_delete:
                             rel_ids_to_delete.extend(
                                 [
-                                    compute_mdhash_id(src + tgt, prefix="rel-"),
-                                    compute_mdhash_id(tgt + src, prefix="rel-"),
+                                    compute_mdhash_id(
+                                        src + tgt,
+                                        prefix="rel-",
+                                        workspace=self.workspace,
+                                    ),
+                                    compute_mdhash_id(
+                                        tgt + src,
+                                        prefix="rel-",
+                                        workspace=self.workspace,
+                                    ),
                                 ]
                             )
                         await self.relationships_vdb.delete(rel_ids_to_delete)
@@ -3859,7 +4310,9 @@ class LightRAG:
 
                     # Delete from vector vdb
                     entity_vdb_ids = [
-                        compute_mdhash_id(entity, prefix="ent-")
+                        compute_mdhash_id(
+                            entity, prefix="ent-", workspace=self.workspace
+                        )
                         for entity in entities_to_delete
                     ]
                     await self.entities_vdb.delete(entity_vdb_ids)

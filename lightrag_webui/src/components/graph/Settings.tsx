@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect} from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
 import Checkbox from '@/components/ui/Checkbox'
 import Button from '@/components/ui/Button'

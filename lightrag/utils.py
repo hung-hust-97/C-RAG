@@ -72,6 +72,74 @@ class SafeStreamHandler(logging.StreamHandler):
             pass
 
 
+class GMT7Formatter(logging.Formatter):
+    """Custom formatter to display timestamps in UTC+7 (Asia/Ho_Chi_Minh)."""
+
+    def formatTime(self, record, datefmt=None):
+        import datetime
+
+        tz = datetime.timezone(datetime.timedelta(hours=7))
+        dt = datetime.datetime.fromtimestamp(record.created, tz)
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M:%S") + f",{int(record.msecs):03d} +07:00"
+
+
+class ColoredGMT7Formatter(GMT7Formatter):
+    """Custom GMT-7 Formatter with ANSI colors for console logging."""
+
+    # ANSI escape sequences for colors
+    GREY = "\x1b[38;20m"
+    GREEN = "\x1b[32;20m"
+    YELLOW = "\x1b[33;20m"
+    RED = "\x1b[31;20m"
+    BOLD_RED = "\x1b[31;1m"
+    CYAN = "\x1b[36;20m"
+    RESET = "\x1b[0m"
+
+    # Map logging levels to colors
+    COLORS = {
+        logging.DEBUG: CYAN,
+        logging.INFO: GREEN,
+        logging.WARNING: YELLOW,
+        logging.ERROR: RED,
+        logging.CRITICAL: BOLD_RED,
+    }
+
+    def format(self, record):
+        # Save original attributes to restore them after formatting
+        orig_levelname = record.levelname
+        orig_msg = record.msg
+
+        # Determine color based on record level
+        color = self.COLORS.get(record.levelno, self.RESET)
+
+        # Style levelname and message
+        record.levelname = f"{color}{orig_levelname}{self.RESET}"
+
+        msg_str = str(record.msg)
+        if "[Extract]" in msg_str:
+            msg_str = msg_str.replace("[Extract]", "\x1b[1;35m[Extract]\x1b[0m")
+        if "[Chunking]" in msg_str:
+            msg_str = msg_str.replace("[Chunking]", "\x1b[1;36m[Chunking]\x1b[0m")
+        if "[MinIO]" in msg_str:
+            msg_str = msg_str.replace("[MinIO]", "\x1b[1;34m[MinIO]\x1b[0m")
+        if "[Kafka]" in msg_str:
+            msg_str = msg_str.replace("[Kafka]", "\x1b[1;33m[Kafka]\x1b[0m")
+
+        record.msg = msg_str
+
+        # Format with parent
+        formatted = super().format(record)
+
+        # Restore original values
+        record.levelname = orig_levelname
+        record.msg = orig_msg
+
+        return formatted
+
+
 # Initialize logger with basic configuration
 logger = logging.getLogger("lightrag")
 logger.propagate = False  # prevent log message send to root logger
@@ -81,7 +149,7 @@ logger.setLevel(logging.INFO)
 if not logger.handlers:
     console_handler = SafeStreamHandler()
     console_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(levelname)s: %(message)s")
+    formatter = ColoredGMT7Formatter("[%(asctime)s] %(levelname)s: %(message)s")
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
@@ -332,10 +400,10 @@ def setup_logger(
         enable_file_logging: Whether to enable logging to a file (defaults to True)
     """
     # Configure formatters
-    detailed_formatter = logging.Formatter(
+    detailed_formatter = GMT7Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    simple_formatter = logging.Formatter("%(levelname)s: %(message)s")
+    simple_formatter = ColoredGMT7Formatter("[%(asctime)s] %(levelname)s: %(message)s")
 
     logger_instance = logging.getLogger(logger_name)
     logger_instance.setLevel(level)
@@ -548,26 +616,30 @@ def compute_args_hash(*args: Any) -> str:
         return md5(safe_bytes).hexdigest()
 
 
-def compute_mdhash_id(content: str, prefix: str = "") -> str:
-    """Compute a unique MD5-based ID for a given content string.
+def compute_mdhash_id(
+    content: str, prefix: str = "", workspace: str = "default"
+) -> str:
+    """Compute a deterministic UUIDv5-based ID for a given content string and workspace.
 
-    The ID is a combination of the given prefix and the MD5 hash of the content string.
-    This is commonly used for generating deterministic IDs for entities, chunks, and cache keys.
+    The ID is a combination of the given prefix and the UUIDv5 hash of the content string
+    using the workspace UUID as the namespace. This ensures exact UUID matching across
+    PostgreSQL, Milvus, and Neo4j.
 
     Args:
         content: The content string to hash
         prefix: Optional prefix to prepend to the hash. Default is empty string.
+        workspace: The workspace string to use as the UUID namespace. Default is "default".
 
     Returns:
-        str: The computed ID in format "{prefix}{md5_hash}"
-
-    Examples:
-        >>> compute_mdhash_id("Hello World", "entity-")
-        'entity-b10a8db164e0754105b7a99be72e3fe5'
-        >>> compute_mdhash_id("Hello World")
-        'b10a8db164e0754105b7a99be72e3fe5'
+        str: The computed ID in format "{prefix}{uuid5_hash}"
     """
-    return prefix + compute_args_hash(content)
+    try:
+        ws_uuid = uuid.UUID(workspace)
+    except ValueError:
+        ws_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, workspace)
+
+    content_uuid = uuid.uuid5(ws_uuid, str(content))
+    return f"{prefix}{content_uuid}"
 
 
 def generate_cache_key(mode: str, cache_type: str, hash_value: str) -> str:
@@ -657,14 +729,45 @@ def priority_limit_async_func_call(
         Decorator function
     """
 
+    def _env_float(name: str) -> float | None:
+        value = os.getenv(name)
+        if value is None or not value.strip():
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            logger.warning("Invalid %s=%r, ignoring timeout override", name, value)
+            return None
+
     def final_decro(func):
+        nonlocal max_execution_timeout, max_task_duration
+
         # Ensure func is callable
         if not callable(func):
             raise TypeError(f"Expected a callable object, got {type(func)}")
 
+        if queue_name == "LLM func":
+            if max_execution_timeout is None:
+                max_execution_timeout_override = _env_float(
+                    "LLM_WORKER_EXECUTION_TIMEOUT_SECONDS"
+                )
+                max_execution_timeout = (
+                    max_execution_timeout_override
+                    if max_execution_timeout_override is not None
+                    else 300.0
+                )
+            if max_task_duration is None:
+                max_task_duration_override = _env_float(
+                    "LLM_TASK_HEALTH_TIMEOUT_SECONDS"
+                )
+                max_task_duration = (
+                    max_task_duration_override
+                    if max_task_duration_override is not None
+                    else 330.0
+                )
+
         # Calculate timeout hierarchy if llm_timeout is provided (Dynamic Timeout Calculation)
         if llm_timeout is not None:
-            nonlocal max_execution_timeout, max_task_duration
             if max_execution_timeout is None:
                 max_execution_timeout = (
                     llm_timeout * 2
@@ -729,10 +832,26 @@ def priority_limit_async_func_call(
 
                         try:
                             # Execute function with timeout protection
+                            worker_timeout_triggered = False
                             if max_execution_timeout is not None:
-                                result = await asyncio.wait_for(
-                                    func(*args, **kwargs), timeout=max_execution_timeout
+                                execution_task = asyncio.create_task(
+                                    func(*args, **kwargs)
                                 )
+                                try:
+                                    result = await asyncio.wait_for(
+                                        execution_task,
+                                        timeout=max_execution_timeout,
+                                    )
+                                except asyncio.TimeoutError as timeout_exc:
+                                    if (
+                                        execution_task.done()
+                                        and not execution_task.cancelled()
+                                    ):
+                                        inner_exc = execution_task.exception()
+                                        if inner_exc is not None:
+                                            raise inner_exc
+                                    worker_timeout_triggered = True
+                                    raise timeout_exc
                             else:
                                 result = await func(*args, **kwargs)
 
@@ -740,17 +859,20 @@ def priority_limit_async_func_call(
                             if not task_state.future.done():
                                 task_state.future.set_result(result)
 
-                        except asyncio.TimeoutError:
+                        except asyncio.TimeoutError as e:
                             # Worker-level timeout (max_execution_timeout exceeded)
-                            logger.warning(
-                                f"{queue_name}: Worker timeout for task {task_id} after {max_execution_timeout}s"
-                            )
-                            if not task_state.future.done():
-                                task_state.future.set_exception(
-                                    WorkerTimeoutError(
-                                        max_execution_timeout, "execution"
-                                    )
+                            if worker_timeout_triggered:
+                                logger.warning(
+                                    f"{queue_name}: Worker timeout for task {task_id} after {max_execution_timeout}s"
                                 )
+                                if not task_state.future.done():
+                                    task_state.future.set_exception(
+                                        WorkerTimeoutError(
+                                            max_execution_timeout, "execution"
+                                        )
+                                    )
+                            elif not task_state.future.done():
+                                task_state.future.set_exception(e)
                         except asyncio.CancelledError:
                             # Task was cancelled during execution
                             if not task_state.future.done():
@@ -1024,32 +1146,32 @@ def priority_limit_async_func_call(
                 # Wait for result with timeout handling
                 try:
                     if _timeout is not None:
-                        return await asyncio.wait_for(future, _timeout)
-                    else:
-                        return await future
-                except asyncio.TimeoutError:
-                    # This is user-level timeout (asyncio.wait_for caused)
-                    # Mark cancellation request
-                    async with task_states_lock:
-                        if task_id in task_states:
-                            task_states[task_id].cancellation_requested = True
+                        try:
+                            return await asyncio.wait_for(future, _timeout)
+                        except asyncio.TimeoutError:
+                            # This is user-level timeout (asyncio.wait_for caused)
+                            # Mark cancellation request
+                            async with task_states_lock:
+                                if task_id in task_states:
+                                    task_states[task_id].cancellation_requested = True
 
-                    # Cancel future
-                    if not future.done():
-                        future.cancel()
+                            # Cancel future
+                            if not future.done():
+                                future.cancel()
 
-                    # Wait for worker cleanup with timeout
-                    cleanup_start = asyncio.get_event_loop().time()
-                    while (
-                        task_id in task_states
-                        and asyncio.get_event_loop().time() - cleanup_start
-                        < cleanup_timeout
-                    ):
-                        await asyncio.sleep(0.1)
+                            # Wait for worker cleanup with timeout
+                            cleanup_start = asyncio.get_event_loop().time()
+                            while (
+                                task_id in task_states
+                                and asyncio.get_event_loop().time() - cleanup_start
+                                < cleanup_timeout
+                            ):
+                                await asyncio.sleep(0.1)
 
-                    raise TimeoutError(
-                        f"{queue_name}: User timeout after {_timeout} seconds"
-                    )
+                            raise TimeoutError(
+                                f"{queue_name}: User timeout after {_timeout} seconds"
+                            )
+                    return await future
                 except WorkerTimeoutError as e:
                     # This is Worker-level timeout, directly propagate exception information
                     raise TimeoutError(f"{queue_name}: {str(e)}")
@@ -2026,6 +2148,8 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    queryparam: dict | None = None,
+    response_format: Any = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -2044,6 +2168,7 @@ async def use_llm_func_with_cache(
         chunk_id: Chunk identifier to store in cache
         text_chunks_storage: Text chunks storage to update llm_cache_list
         cache_keys_collector: Optional list to collect cache keys for batch processing
+        queryparam: Optional query parameters to store in cache
 
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
@@ -2077,6 +2202,10 @@ async def use_llm_func_with_cache(
             prompt_parts.append(safe_system_prompt)
         if history:
             prompt_parts.append(history)
+        if response_format is not None:
+            prompt_parts.append(
+                f"response_format={getattr(response_format, '__name__', str(response_format))}"
+            )
         _prompt = "\n".join(prompt_parts)
 
         arg_hash = compute_args_hash(_prompt)
@@ -2108,6 +2237,8 @@ async def use_llm_func_with_cache(
             kwargs["history_messages"] = safe_history_messages
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         kwargs["cache_type"] = cache_type
 
         res: str = await use_llm_func(
@@ -2143,6 +2274,8 @@ async def use_llm_func_with_cache(
         kwargs["history_messages"] = safe_history_messages
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if response_format is not None:
+        kwargs["response_format"] = response_format
     kwargs["cache_type"] = cache_type
 
     try:
@@ -2526,6 +2659,7 @@ async def pick_by_vector_similarity(
     entity_info: list[dict[str, Any]],
     embedding_func: callable,
     query_embedding=None,
+    chunks_vdbs: dict[str, "BaseVectorStorage"] = None,
 ) -> list[str]:
     """
     Vector similarity-based text chunk selection algorithm.
@@ -2585,7 +2719,38 @@ async def pick_by_vector_similarity(
             )
 
         # Get chunk embeddings from vector database
-        chunk_vectors = await chunks_vdb.get_vectors_by_ids(all_chunk_ids)
+        chunk_to_workspace = {}
+        if entity_info:
+            for entity in entity_info:
+                ws = entity.get("entity_data", {}).get("workspace", "")
+                if not ws:
+                    ws = entity.get("relation_data", {}).get("workspace", "")
+                for chunk_id in entity.get("sorted_chunks", []):
+                    if chunk_id not in chunk_to_workspace and ws:
+                        chunk_to_workspace[chunk_id] = ws
+
+        if chunks_vdbs and chunk_to_workspace:
+            grouped_cids = {}
+            for cid in all_chunk_ids:
+                ws = chunk_to_workspace.get(cid, "")
+                grouped_cids.setdefault(ws, []).append(cid)
+            
+            fetch_tasks = []
+            ws_keys = []
+            for ws, cids in grouped_cids.items():
+                vdb = chunks_vdbs.get(ws, chunks_vdb)
+                fetch_tasks.append(vdb.get_vectors_by_ids(cids))
+                ws_keys.append(ws)
+            
+            import asyncio
+            fetch_results = await asyncio.gather(*fetch_tasks)
+            
+            chunk_vectors = {}
+            for ws, vectors in zip(ws_keys, fetch_results):
+                if vectors:
+                    chunk_vectors.update(vectors)
+        else:
+            chunk_vectors = await chunks_vdb.get_vectors_by_ids(all_chunk_ids)
         logger.debug(
             f"Vector similarity chunk selection: {len(chunk_vectors)} chunk vectors Retrieved"
         )
@@ -3028,9 +3193,11 @@ def subtract_source_ids(
     ]
 
 
-def make_relation_chunk_key(src: str, tgt: str) -> str:
+def make_relation_chunk_key(src: str, tgt: str, directed: bool = False) -> str:
     """Create a deterministic storage key for relation chunk tracking."""
 
+    if directed:
+        return GRAPH_FIELD_SEP.join((src, tgt))
     return GRAPH_FIELD_SEP.join(sorted((src, tgt)))
 
 
@@ -3084,9 +3251,7 @@ def generate_doc_id(prefix: str = "doc-") -> str:
 
 
 async def generate_doc_id_with_retry(
-    doc_status_storage,
-    prefix: str = "doc-",
-    max_retries: int = 3
+    doc_status_storage, prefix: str = "doc-", max_retries: int = 3
 ) -> str:
     """Generate a unique UUID-based document identifier with collision retry.
 
@@ -3113,26 +3278,26 @@ async def generate_doc_id_with_retry(
     """
     for attempt in range(max_retries):
         doc_id = generate_doc_id(prefix)
-        
+
         # Check if doc_id already exists
         try:
             existing_doc = await doc_status_storage.get_by_id(doc_id)
-            
+
             if existing_doc is None:
                 # No collision, doc_id is unique
                 return doc_id
-            
+
             # Collision detected - log and retry
             logger.warning(
                 f"UUID collision detected for doc_id: {doc_id} "
                 f"(attempt {attempt + 1}/{max_retries}). Retrying with new UUID."
             )
-            
+
         except Exception as e:
             # If get_by_id fails (e.g., doc doesn't exist), assume doc_id is unique
             logger.debug(f"Error checking doc_id existence: {e}. Assuming unique.")
             return doc_id
-    
+
     # Max retries exhausted
     error_msg = f"Failed to generate unique doc_id after {max_retries} attempts"
     logger.error(error_msg)
@@ -3317,6 +3482,20 @@ def fix_tuple_delimiter_corruption(
         record,
     )
 
+    # Fix: |#|#| -> <|#|> (repeated core without angle brackets)
+    record = re.sub(
+        rf"\|{escaped_delimiter_core}\|{escaped_delimiter_core}\|",
+        tuple_delimiter,
+        record,
+    )
+
+    # Fix: |#| -> <|#|> (missing both < and >)
+    record = re.sub(
+        rf"(?<!<)\|{escaped_delimiter_core}\|(?!>)",
+        tuple_delimiter,
+        record,
+    )
+
     return record
 
 
@@ -3491,62 +3670,62 @@ def generate_reference_list_from_chunks(
 ) -> tuple[list[dict], list[dict]]:
     """
     Generate reference list from chunks, prioritizing by occurrence frequency.
-
-    This function extracts file_paths from chunks, counts their occurrences,
-    sorts by frequency and first appearance order, creates reference_id mappings,
-    and builds a reference_list structure.
-
-    Args:
-        chunks: List of chunk dictionaries with file_path information
-
-    Returns:
-        tuple: (reference_list, updated_chunks_with_reference_ids)
-            - reference_list: List of dicts with reference_id and file_path
-            - updated_chunks_with_reference_ids: Original chunks with reference_id field added
+    Ensures file_path is deduplicated per workspace (allows identical file names in different workspaces).
     """
     if not chunks:
         return [], []
 
-    # 1. Extract all valid file_paths and count their occurrences
-    file_path_counts = {}
+    # 1. Extract all valid (file_path, workspace) pairs and count their occurrences
+    path_ws_counts = {}
     for chunk in chunks:
         file_path = chunk.get("file_path", "")
+        workspace = chunk.get("workspace", "")
         if file_path and file_path != "unknown_source":
-            file_path_counts[file_path] = file_path_counts.get(file_path, 0) + 1
+            key = (file_path, workspace)
+            path_ws_counts[key] = path_ws_counts.get(key, 0) + 1
 
-    # 2. Sort file paths by frequency (descending), then by first appearance order
-    # Create a list of (file_path, count, first_index) tuples
-    file_path_with_indices = []
-    seen_paths = set()
+    # 2. Sort key by frequency (descending), then by first appearance order
+    path_ws_with_indices = []
+    seen_keys = set()
     for i, chunk in enumerate(chunks):
         file_path = chunk.get("file_path", "")
-        if file_path and file_path != "unknown_source" and file_path not in seen_paths:
-            file_path_with_indices.append((file_path, file_path_counts[file_path], i))
-            seen_paths.add(file_path)
+        workspace = chunk.get("workspace", "")
+        if file_path and file_path != "unknown_source":
+            key = (file_path, workspace)
+            if key not in seen_keys:
+                path_ws_with_indices.append((key, path_ws_counts[key], i))
+                seen_keys.add(key)
 
-    # Sort by count (descending), then by first appearance index (ascending)
-    sorted_file_paths = sorted(file_path_with_indices, key=lambda x: (-x[1], x[2]))
-    unique_file_paths = [item[0] for item in sorted_file_paths]
+    sorted_keys = sorted(path_ws_with_indices, key=lambda x: (-x[1], x[2]))
+    unique_keys = [item[0] for item in sorted_keys]
 
-    # 3. Create mapping from file_path to reference_id (prioritized by frequency)
-    file_path_to_ref_id = {}
-    for i, file_path in enumerate(unique_file_paths):
-        file_path_to_ref_id[file_path] = str(i + 1)
+    # 3. Create mapping from key to reference_id
+    key_to_ref_id = {}
+    for i, key in enumerate(unique_keys):
+        key_to_ref_id[key] = str(i + 1)
 
     # 4. Add reference_id field to each chunk
     updated_chunks = []
     for chunk in chunks:
         chunk_copy = chunk.copy()
         file_path = chunk_copy.get("file_path", "")
+        workspace = chunk_copy.get("workspace", "")
         if file_path and file_path != "unknown_source":
-            chunk_copy["reference_id"] = file_path_to_ref_id[file_path]
+            key = (file_path, workspace)
+            chunk_copy["reference_id"] = key_to_ref_id.get(key, "")
         else:
             chunk_copy["reference_id"] = ""
         updated_chunks.append(chunk_copy)
 
     # 5. Build reference_list
     reference_list = []
-    for i, file_path in enumerate(unique_file_paths):
-        reference_list.append({"reference_id": str(i + 1), "file_path": file_path})
+    for i, (file_path, workspace) in enumerate(unique_keys):
+        ref_item = {
+            "reference_id": str(i + 1),
+            "file_path": file_path,
+        }
+        if workspace:
+            ref_item["workspace"] = workspace
+        reference_list.append(ref_item)
 
     return reference_list, updated_chunks

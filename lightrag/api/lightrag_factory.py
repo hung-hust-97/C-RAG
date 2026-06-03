@@ -4,11 +4,6 @@ Extracted from lightrag_server.py to support standalone usage (e.g. Celery worke
 """
 
 import os
-import json
-import asyncio
-import re
-import logging
-from pathlib import Path
 from lightrag import LightRAG
 from lightrag.utils import logger, get_env_value, EmbeddingFunc
 from lightrag.constants import (
@@ -57,6 +52,10 @@ class LLMConfigCache:
             extract_max_tokens = os.getenv("OPENAI_LLM_MAX_TOKENS_EXTRACT")
             if extract_max_tokens and extract_max_tokens.strip():
                 self.openai_llm_options_extract["max_tokens"] = int(extract_max_tokens)
+            else:
+                self.openai_llm_options_extract["max_tokens"] = int(
+                    os.getenv("OPENAI_LLM_DEFAULT_MAX_TOKENS_EXTRACT", "1024")
+                )
 
             extract_max_completion_tokens = os.getenv(
                 "OPENAI_LLM_MAX_COMPLETION_TOKENS_EXTRACT"
@@ -64,6 +63,12 @@ class LLMConfigCache:
             if extract_max_completion_tokens and extract_max_completion_tokens.strip():
                 self.openai_llm_options_extract["max_completion_tokens"] = int(
                     extract_max_completion_tokens
+                )
+            else:
+                self.openai_llm_options_extract["max_completion_tokens"] = int(
+                    os.getenv(
+                        "OPENAI_LLM_DEFAULT_MAX_COMPLETION_TOKENS_EXTRACT", "1024"
+                    )
                 )
 
             if (
@@ -140,10 +145,39 @@ class LLMConfigCache:
         return dict(self.openai_llm_options)
 
 def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_timeout: int):
+    from lightrag.llm.load_balancer import LLMLoadBalancer
+
+    # Initialize the load balancer with hosts, API keys, models, and max_async
+    lb = LLMLoadBalancer(
+        hosts=args.llm_binding_host,
+        api_keys=args.llm_binding_api_key,
+        models=args.llm_model,
+        max_async=args.max_async
+    )
+    node_internal_retry_attempts = max(
+        1,
+        int(
+            os.getenv(
+                "LLM_LOAD_BALANCER_NODE_INTERNAL_RETRY_ATTEMPTS",
+                "1" if len(lb.nodes) > 1 else "3",
+            )
+        ),
+    )
+
     async def optimized_openai_alike_model_complete(
         prompt, system_prompt=None, history_messages=None, keyword_extraction=False, **kwargs
     ) -> str:
         from lightrag.llm.openai import openai_complete_if_cache
+        from tenacity import stop_after_attempt
+
+        complete_func = openai_complete_if_cache
+        if node_internal_retry_attempts != 3 and hasattr(
+            openai_complete_if_cache, "retry_with"
+        ):
+            complete_func = openai_complete_if_cache.retry_with(
+                stop=stop_after_attempt(node_internal_retry_attempts)
+            )
+
         keyword_extraction = kwargs.pop("keyword_extraction", None)
         request_cache_type = kwargs.pop("cache_type", "query")
         if keyword_extraction:
@@ -154,11 +188,16 @@ def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_tim
         openai_options = config_cache.get_openai_llm_options(request_cache_type)
         if openai_options:
             kwargs.update(openai_options)
-        return await openai_complete_if_cache(
-            args.llm_model, prompt, system_prompt=system_prompt,
-            history_messages=history_messages, base_url=args.llm_binding_host,
-            api_key=args.llm_binding_api_key, **kwargs
-        )
+
+        # Define node completion callback for execute_with_fallback
+        async def _call_node(node):
+            return await complete_func(
+                node.model, prompt, system_prompt=system_prompt,
+                history_messages=history_messages, base_url=node.host,
+                api_key=node.api_key, **kwargs
+            )
+
+        return await lb.execute_with_fallback(_call_node, scope=request_cache_type)
     return optimized_openai_alike_model_complete
 
 def create_optimized_azure_openai_llm_func(config_cache: LLMConfigCache, args, llm_timeout: int):
@@ -298,25 +337,29 @@ def create_optimized_embedding_function(config_cache: LLMConfigCache, binding, m
                     from lightrag.llm.binding_options import OllamaEmbeddingOptions
                     ollama_options = OllamaEmbeddingOptions.options_dict(args)
                 kwargs = {"texts": texts, "host": host, "api_key": api_key, "options": ollama_options, "max_token_size": max_token_size}
-                if model: kwargs["embed_model"] = model
+                if model:
+                    kwargs["embed_model"] = model
                 return await actual_func(**kwargs)
             elif binding == "azure_openai":
                 from lightrag.llm.azure_openai import azure_openai_embed
                 actual_func = azure_openai_embed.func if isinstance(azure_openai_embed, EmbeddingFunc) else azure_openai_embed
                 kwargs = {"texts": texts, "api_key": api_key, "embedding_dim": embedding_dim, "max_token_size": max_token_size}
-                if model: kwargs["model"] = model
+                if model:
+                    kwargs["model"] = model
                 return await actual_func(**kwargs)
             elif binding == "aws_bedrock":
                 from lightrag.llm.bedrock import bedrock_embed
                 actual_func = bedrock_embed.func if isinstance(bedrock_embed, EmbeddingFunc) else bedrock_embed
                 kwargs = {"texts": texts}
-                if model: kwargs["model"] = model
+                if model:
+                    kwargs["model"] = model
                 return await actual_func(**kwargs)
             elif binding == "jina":
                 from lightrag.llm.jina import jina_embed
                 actual_func = jina_embed.func if isinstance(jina_embed, EmbeddingFunc) else jina_embed
                 kwargs = {"texts": texts, "embedding_dim": embedding_dim, "base_url": host, "api_key": api_key, "max_token_size": max_token_size}
-                if model: kwargs["model"] = model
+                if model:
+                    kwargs["model"] = model
                 return await actual_func(**kwargs)
             elif binding == "gemini":
                 from lightrag.llm.gemini import gemini_embed
@@ -327,13 +370,15 @@ def create_optimized_embedding_function(config_cache: LLMConfigCache, binding, m
                     from lightrag.llm.binding_options import GeminiEmbeddingOptions
                     gemini_options = GeminiEmbeddingOptions.options_dict(args)
                 kwargs = {"texts": texts, "base_url": host, "api_key": api_key, "embedding_dim": embedding_dim, "task_type": gemini_options.get("task_type", "RETRIEVAL_DOCUMENT"), "max_token_size": max_token_size}
-                if model: kwargs["model"] = model
+                if model:
+                    kwargs["model"] = model
                 return await actual_func(**kwargs)
             else:
                 from lightrag.llm.openai import openai_embed
                 actual_func = openai_embed.func if isinstance(openai_embed, EmbeddingFunc) else openai_embed
                 kwargs = {"texts": texts, "base_url": host, "api_key": api_key, "embedding_dim": embedding_dim, "max_token_size": max_token_size}
-                if model: kwargs["model"] = model
+                if model:
+                    kwargs["model"] = model
                 return await actual_func(**kwargs)
         except ImportError as e:
             raise Exception(f"Failed to import {binding} embedding: {e}")

@@ -24,7 +24,7 @@ DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 # Maximum token size sent to LLM for summary
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
 # Maximum token size allowed for entity extraction input context
-DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 20480
+DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 15500
 # Default entities to extract if ENTITY_TYPES is not specified in .env
 DEFAULT_ENTITY_TYPES = [
     "Person",

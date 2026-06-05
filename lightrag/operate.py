@@ -2029,6 +2029,8 @@ async def _merge_edges_then_upsert(
     entity_chunks_storage: BaseKVStorage = None,
     new_entity_chunks_to_upsert: dict | None = None,
     entity_vdb: BaseVectorStorage = None,
+    existing_nodes_cache: dict[str, dict | None] | None = None,
+    existing_entity_chunks_cache: dict[str, list[str] | None] | None = None,
 ):
     node_updates = []
     node_vdb_updates = {}
@@ -2318,8 +2320,13 @@ async def _merge_edges_then_upsert(
 
     # 11. Update both graph and vector db
     for need_insert_id in [src_id, tgt_id]:
-        # Optimization: Use get_node instead of has_node + get_node
-        existing_node = await knowledge_graph_inst.get_node(need_insert_id)
+        if existing_nodes_cache is not None and need_insert_id in existing_nodes_cache:
+            existing_node = existing_nodes_cache[need_insert_id]
+        else:
+            # Optimization: Use get_node instead of has_node + get_node.
+            existing_node = await knowledge_graph_inst.get_node(need_insert_id)
+            if existing_nodes_cache is not None:
+                existing_nodes_cache[need_insert_id] = existing_node
 
         if existing_node is None:
             # Node doesn't exist - create new node
@@ -2335,6 +2342,8 @@ async def _merge_edges_then_upsert(
                 **legal_status_metadata,
             }
             await knowledge_graph_inst.upsert_node(need_insert_id, node_data=node_data)
+            if existing_nodes_cache is not None:
+                existing_nodes_cache[need_insert_id] = node_data
 
             # Update entity_chunks_storage for the newly created entity
             if (
@@ -2347,6 +2356,8 @@ async def _merge_edges_then_upsert(
                         "chunk_ids": chunk_ids,
                         "count": len(chunk_ids),
                     }
+                    if existing_entity_chunks_cache is not None:
+                        existing_entity_chunks_cache[need_insert_id] = chunk_ids
 
             if entity_vdb is not None:
                 entity_vdb_id = compute_mdhash_id(
@@ -2391,8 +2402,28 @@ async def _merge_edges_then_upsert(
             updated = False  # Track if any update occurred
 
             # 1. Get existing full source_ids from entity_chunks_storage
-            existing_full_source_ids = []
-            if entity_chunks_storage is not None:
+            if (
+                existing_entity_chunks_cache is not None
+                and need_insert_id in existing_entity_chunks_cache
+            ):
+                existing_full_source_ids = [
+                    chunk_id
+                    for chunk_id in existing_entity_chunks_cache.get(
+                        need_insert_id, []
+                    )
+                    if chunk_id
+                ]
+            else:
+                existing_full_source_ids = []
+
+            if (
+                not existing_full_source_ids
+                and entity_chunks_storage is not None
+                and (
+                    existing_entity_chunks_cache is None
+                    or need_insert_id not in existing_entity_chunks_cache
+                )
+            ):
                 stored_chunks = await entity_chunks_storage.get_by_id(need_insert_id)
                 if stored_chunks and isinstance(stored_chunks, dict):
                     existing_full_source_ids = [
@@ -2400,6 +2431,8 @@ async def _merge_edges_then_upsert(
                         for chunk_id in stored_chunks.get("chunk_ids", [])
                         if chunk_id
                     ]
+                if existing_entity_chunks_cache is not None:
+                    existing_entity_chunks_cache[need_insert_id] = existing_full_source_ids
 
             # If not in entity_chunks_storage, get from graph database
             if not existing_full_source_ids:
@@ -2427,6 +2460,8 @@ async def _merge_edges_then_upsert(
                     "chunk_ids": merged_full_source_ids,
                     "count": len(merged_full_source_ids),
                 }
+                if existing_entity_chunks_cache is not None:
+                    existing_entity_chunks_cache[need_insert_id] = merged_full_source_ids
 
             # 4. Apply source_ids limit for graph and vector db
             limit_method = global_config.get(
@@ -2450,6 +2485,8 @@ async def _merge_edges_then_upsert(
                     "source_id": limited_source_id_str,
                 }
                 node_updates.append((need_insert_id, updated_node_data))
+                if existing_nodes_cache is not None:
+                    existing_nodes_cache[need_insert_id] = updated_node_data
 
                 # Update vector database
                 if entity_vdb is not None:
@@ -2484,6 +2521,8 @@ async def _merge_edges_then_upsert(
                     **legal_status_metadata,
                 }
                 node_updates.append((need_insert_id, updated_node_data))
+                if existing_nodes_cache is not None:
+                    existing_nodes_cache[need_insert_id] = updated_node_data
                 if entity_vdb is not None:
                     entity_vdb_id = compute_mdhash_id(
                         need_insert_id,
@@ -2921,6 +2960,36 @@ async def merge_nodes_and_edges(
                         ):
                             _relation_cache[k_f] = None
 
+                uncached_endpoint_names = [
+                    name for name in flat_lock_keys if name not in _entity_cache
+                ]
+                if uncached_endpoint_names:
+                    fetched_nodes = await knowledge_graph_inst.get_nodes_batch(
+                        uncached_endpoint_names
+                    )
+                    _entity_cache.update(fetched_nodes)
+                    for name in uncached_endpoint_names:
+                        if name not in _entity_cache:
+                            _entity_cache[name] = None
+
+                uncached_endpoint_chunk_names = [
+                    name for name in flat_lock_keys if name not in _entity_chunks_cache
+                ]
+                if entity_chunks_storage is not None and uncached_endpoint_chunk_names:
+                    chunk_results = await entity_chunks_storage.get_by_ids(
+                        uncached_endpoint_chunk_names
+                    )
+                    for idx, result in enumerate(chunk_results):
+                        name = uncached_endpoint_chunk_names[idx]
+                        if result and isinstance(result, dict):
+                            _entity_chunks_cache[name] = [
+                                chunk_id
+                                for chunk_id in result.get("chunk_ids", [])
+                                if chunk_id
+                            ]
+                        else:
+                            _entity_chunks_cache[name] = []
+
                 storage_keys = []
                 for edge_key in keys_batch:
                     is_directed = any(
@@ -2994,6 +3063,8 @@ async def merge_nodes_and_edges(
                                 entity_chunks_storage=entity_chunks_storage,
                                 new_entity_chunks_to_upsert=new_entity_chunks_to_upsert,
                                 entity_vdb=entity_vdb,
+                                existing_nodes_cache=_entity_cache,
+                                existing_entity_chunks_cache=_entity_chunks_cache,
                             )
                             return (
                                 edge_key,
@@ -3620,7 +3691,7 @@ async def extract_entities(
         1, _env_int("LLM_EXTRACT_MODEL_CONTEXT_TOKENS", 16384)
     )
     extract_context_safety_margin = max(
-        0, _env_int("LLM_EXTRACT_CONTEXT_SAFETY_MARGIN", 256)
+        0, _env_int("LLM_EXTRACT_CONTEXT_SAFETY_MARGIN", 512)
     )
     extract_min_output_tokens = max(
         1, _env_int("ENTITY_EXTRACTION_MIN_OUTPUT_TOKENS", 512)

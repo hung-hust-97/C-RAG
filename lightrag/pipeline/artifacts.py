@@ -210,13 +210,41 @@ class S3PipelineArtifactStore(PipelineArtifactStore):
             await s3.put_object(Bucket=self.bucket, Key=key, Body=payload)
 
     async def _get(self, uri: str) -> bytes:
+        from botocore.exceptions import ClientError
+
         parsed = urlparse(uri)
         bucket = parsed.netloc or self.bucket
         key = parsed.path.lstrip("/")
-        async with await self._client() as s3:
-            response = await s3.get_object(Bucket=bucket, Key=key)
-            async with response["Body"] as stream:
-                return await stream.read()
+
+        max_retries = int(os.getenv("PIPELINE_ARTIFACT_S3_RETRY_ATTEMPTS", "3"))
+        base_delay = float(os.getenv("PIPELINE_ARTIFACT_S3_RETRY_DELAY", "2.0"))
+
+        last_exc: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with await self._client() as s3:
+                    response = await s3.get_object(Bucket=bucket, Key=key)
+                    async with response["Body"] as stream:
+                        return await stream.read()
+            except ClientError as exc:
+                error_code = exc.response.get("Error", {}).get("Code", "")
+                # NoSuchKey is not retryable
+                if error_code == "NoSuchKey":
+                    raise
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                from lightrag.utils import logger as _logger
+                _logger.warning(
+                    "[Pipeline] S3 get retry attempt=%s/%s delay=%.1fs uri=%s error=%s",
+                    attempt, max_retries, delay, uri, last_exc,
+                )
+                await asyncio.sleep(delay)
+
+        raise last_exc  # type: ignore[misc]
 
     async def write_jsonl(
         self,

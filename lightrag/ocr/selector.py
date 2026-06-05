@@ -69,20 +69,13 @@ class OCREngineSelector:
         # Step 1: Check explicit engine selection
         if self.config.engine != "auto":
             if self.config.engine == "deepseek":
-                if self._is_deepseek_available():
-                    logger.info(
-                        "Selected DeepSeek OCR engine (explicit configuration)"
-                    )
-                    return "deepseek"
-                else:
-                    logger.warning(
-                        f"Requested engine 'deepseek' not available "
-                        f"(API: {self.config.deepseek_api_url})"
-                    )
-                    if not self.config.enable_fallback:
-                        logger.warning("Fallback disabled, no OCR engine available")
-                        return "none"
-
+                logger.warning(
+                    "DeepSeek OCR engine is DEPRECATED and no longer supported. "
+                    "Falling back to MinerU or Docling."
+                )
+                if not self.config.enable_fallback:
+                    return "none"
+                # Fall through to auto-selection if fallback is enabled
             elif self.config.engine == "mineru":
                 if self._is_mineru_available():
                     logger.info("Selected MinerU OCR engine (explicit configuration)")
@@ -113,7 +106,7 @@ class OCREngineSelector:
                 logger.info("OCR disabled by configuration")
                 return "none"
         
-        # Step 2: Auto-selection with priority: mineru > deepseek > docling > none
+        # Step 2: Auto-selection with priority: mineru > docling > none
         for priority, engine in enumerate(self.get_auto_engine_candidates(), start=1):
             logger.info(
                 "Selected %s OCR engine (auto-selection, priority %s)",
@@ -131,9 +124,6 @@ class OCREngineSelector:
 
         if self._is_mineru_available():
             candidates.append("mineru")
-
-        if self._is_deepseek_available():
-            candidates.append("deepseek")
 
         if self._is_docling_available():
             candidates.append("docling")

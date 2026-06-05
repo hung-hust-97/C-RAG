@@ -9,7 +9,7 @@ import traceback
 from aiohttp import web
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
-from aiokafka.errors import IllegalStateError
+from aiokafka.errors import CommitFailedError, IllegalStateError
 
 from kafka_worker.config import (
     KAFKA_BOOTSTRAP_SERVERS,
@@ -297,6 +297,7 @@ async def _handle_message(
     return outcome.status in {
         "done",
         "already_completed",
+        "already_running",
         "failed",
         "failed_attempt_recorded",
     }
@@ -338,13 +339,14 @@ async def _commit_partition_offset(
     try:
         await consumer.commit({commit_tp: offset})
         return True
-    except IllegalStateError:
+    except (CommitFailedError, IllegalStateError) as exc:
         logger.warning(
             "[Pipeline] Commit skipped after Kafka rebalance "
-            "topic=%s partition=%s offset=%s",
+            "topic=%s partition=%s offset=%s error=%s",
             tp.topic,
             tp.partition,
             offset,
+            exc,
         )
         return False
 

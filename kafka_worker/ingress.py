@@ -14,9 +14,11 @@ from kafka_worker.config import (
     PIPELINE_GENERAL_CHUNKING_TOPIC,
     PIPELINE_LEGAL_CHUNKING_TOPIC,
 )
+import os
 from kafka_worker.models import KmsEvent
 from lightrag.pipeline.models import PipelineStageEvent, StageName
 from lightrag.pipeline.partitioning import create_partition_allocator_from_env
+from lightrag.pipeline.coordinator import create_coordinator_from_env
 from lightrag.kg.postgres_impl import ClientManager
 from lightrag.kg.postgres_impl import to_uuid
 from kafka_worker.partitioned_publish import publish_pipeline_event
@@ -71,6 +73,7 @@ class IngressAdapter:
         self.consumer = None
         self.producer = None
         self.partition_allocator = create_partition_allocator_from_env()
+        self.coordinator = create_coordinator_from_env()
         self.running = False
         self.mapping = {
             KMS_EXTRACTING_TOPIC: (StageName.EXTRACTION, "general", PIPELINE_GENERAL_EXTRACTION_TOPIC),
@@ -166,6 +169,16 @@ class IngressAdapter:
             metadata=metadata
         )
         
+        paused_stages_env = os.getenv("PIPELINE_PAUSED_STAGES", "")
+        paused_stages = {s.strip().lower() for s in paused_stages_env.split(",") if s.strip()}
+        
+        if stage_name.value in paused_stages:
+            logger.info(
+                f"[Ingress] Stage {stage_name.value} is in PIPELINE_PAUSED_STAGES. Pausing document {doc_id}"
+            )
+            await self.coordinator.register_paused(pipeline_event)
+            return
+
         await publish_pipeline_event(
             self.producer,
             self.partition_allocator,
@@ -180,6 +193,7 @@ class IngressAdapter:
         if self.producer:
             await self.producer.stop()
         await self.partition_allocator.finalize()
+        await self.coordinator.finalize()
         logger.info("Ingress adapter stopped.")
 
 

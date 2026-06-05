@@ -51,6 +51,9 @@ function TabsNavigation() {
         <NavigationTab value="api" currentTab={currentTab}>
           {t('header.api')}
         </NavigationTab>
+        <NavigationTab value="monitor" currentTab={currentTab}>
+          {t('header.monitor')}
+        </NavigationTab>
       </TabsList>
     </div>
   )
@@ -200,7 +203,7 @@ export default function SiteHeader() {
 
       <nav className="min-w-[420px] flex items-center justify-end">
         <div className="flex items-center gap-2">
-          {(currentTab === 'documents' || currentTab === 'knowledge-graph' || currentTab === 'retrieval') && (
+          {(currentTab === 'documents' || currentTab === 'knowledge-graph' || currentTab === 'retrieval' || currentTab === 'monitor') && (
             <div className="flex items-center gap-2">
               <span className="text-xs text-gray-500 dark:text-gray-400">Workspace</span>
               <select

@@ -977,6 +977,108 @@ class StatusCountsResponse(BaseModel):
     )
 
 
+class ReprocessRequest(BaseModel):
+    """Request model for reprocessing specific documents"""
+
+    doc_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document IDs to reprocess. If not provided, all failed/stuck documents in the workspace are reprocessed."
+    )
+
+
+class PipelineStageRunsRequest(BaseModel):
+    """Request model for retrieving pipeline stage runs"""
+
+    workspace_id: Optional[str] = Field(default=None, description="Workspace ID")
+    stage: Optional[str] = Field(default=None, description="Filter by stage name")
+    status: Optional[list[str]] = Field(default=None, description="Filter by status list (e.g. ['running', 'failed'])")
+    search: Optional[str] = Field(default=None, description="Search term for document title or ID")
+    page: int = Field(default=1, ge=1, description="Page number")
+    page_size: int = Field(default=10, ge=1, le=100, description="Items per page")
+
+
+class PipelineStageRunResponse(BaseModel):
+    """Model representing a single pipeline stage run"""
+
+    run_id: str = Field(description="Run ID")
+    stage: str = Field(description="Stage name")
+    shard_index: int = Field(description="Shard index")
+    shard_count: int = Field(description="Shard count")
+    workspace_id: str = Field(description="Workspace ID")
+    doc_id: str = Field(description="Document ID")
+    document_name: Optional[str] = Field(default=None, description="Document name / title")
+    status: str = Field(description="Status of the stage run")
+    attempt: int = Field(description="Attempt number")
+    error_json: Optional[Any] = Field(default=None, description="Error JSON structure if failed")
+    started_at: Optional[datetime] = Field(default=None, description="Start timestamp")
+    completed_at: Optional[datetime] = Field(default=None, description="Completion timestamp")
+    updated_at: datetime = Field(description="Last update timestamp")
+
+
+class PaginatedPipelineStageRunsResponse(BaseModel):
+    """Paginated list of pipeline stage runs with counts matrix"""
+
+    runs: List[PipelineStageRunResponse] = Field(description="List of stage runs")
+    total: int = Field(description="Total number of runs matching filters")
+    page: int = Field(description="Current page")
+    page_size: int = Field(description="Page size")
+    status_matrix: Dict[str, Dict[str, int]] = Field(
+        default_factory=dict,
+        description="Nested dictionary of counts grouped by stage and status"
+    )
+
+
+class ApproveStageRequest(BaseModel):
+    """Request model for approving a paused pipeline stage"""
+
+    run_id: str = Field(description="Run ID")
+    stage: str = Field(description="Stage name")
+    shard_index: int = Field(default=0, description="Shard index")
+    workspace_id: Optional[str] = Field(default=None, description="Workspace ID")
+
+
+class ApproveStageResponse(BaseModel):
+    """Response model for stage approval"""
+
+    status: str = Field(description="Response status")
+    message: str = Field(description="Message detailing the result of the action")
+
+
+class BulkApproveStageRequest(BaseModel):
+    """Request model for bulk-approving all paused runs of a specific stage"""
+
+    stage: str = Field(description="Stage name to approve all paused runs for")
+    workspace_id: Optional[str] = Field(default=None, description="Workspace ID")
+
+
+class StageSpeedEntry(BaseModel):
+    """Speed statistics for a single stage"""
+
+    stage: str
+    docs_completed_1m: int = Field(default=0, description="Documents completed in the last 1 minute")
+    docs_completed_5m: int = Field(default=0, description="Documents completed in the last 5 minutes")
+    avg_duration_seconds: Optional[float] = Field(default=None, description="Average processing duration in seconds")
+
+
+class PipelineConfigResponse(BaseModel):
+    """Current pipeline configuration"""
+
+    entity_extraction_model: str = Field(default="", description="Entity extraction LLM model name")
+    entity_extraction_host: str = Field(default="", description="Entity extraction LLM host(s)")
+    entity_extraction_api_key: str = Field(default="", description="Entity extraction LLM API key(s)")
+    paused_stages: str = Field(default="", description="Comma-separated paused stage names")
+
+
+class PipelineConfigUpdateRequest(BaseModel):
+    """Request to update pipeline configuration"""
+
+    entity_extraction_model: Optional[str] = Field(default=None, description="Entity extraction model")
+    entity_extraction_host: Optional[str] = Field(default=None, description="Entity extraction host(s)")
+    entity_extraction_api_key: Optional[str] = Field(default=None, description="Entity extraction API key(s)")
+    paused_stages: Optional[str] = Field(default=None, description="Comma-separated paused stages")
+    restart_workers: bool = Field(default=True, description="Auto-restart workers after update")
+
+
 class PipelineStatusResponse(BaseModel):
     """Response model for pipeline status
 
@@ -3316,7 +3418,7 @@ def create_document_routes(
                     # Get document status and doc_id from existing document
                     status = existing_doc_data.get("status", "unknown")
                     existing_doc_id = existing_doc_data.get("id", "")
-                    logger.info(f"[insert_text] File source already exists, returning duplicated")
+                    logger.info("[insert_text] File source already exists, returning duplicated")
                     return InsertResponse(
                         status="duplicated",
                         message=f"File source '{request.file_source}' already exists in document storage (Status: {status}).",
@@ -3333,7 +3435,7 @@ def create_document_routes(
                 # Content already exists, return duplicated with existing doc_id
                 status = existing_doc.get("status", "unknown")
                 existing_doc_id = existing_doc.get("id", content_doc_id)
-                logger.info(f"[insert_text] Content already exists, returning duplicated")
+                logger.info("[insert_text] Content already exists, returning duplicated")
                 return InsertResponse(
                     status="duplicated",
                     message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
@@ -3355,7 +3457,7 @@ def create_document_routes(
                 doc_type=request.doc_type,
             )
 
-            logger.info(f"[insert_text] Returning success response")
+            logger.info("[insert_text] Returning success response")
             return InsertResponse(
                 status="success",
                 message=f"Text successfully received with title '{request.file_source}'. Processing will continue in background.",
@@ -4551,6 +4653,7 @@ def create_document_routes(
     async def reprocess_failed_documents(
         background_tasks: BackgroundTasks,
         request: Request,
+        reprocess_req: Optional[ReprocessRequest] = None,
         workspace_id: Optional[str] = None,
     ):
         """
@@ -4587,48 +4690,56 @@ def create_document_routes(
             documents_count = 0
             workspaces_to_process = []
             
-            try:
-                if workspace_id:
-                    # Single workspace - get counts for this workspace only
-                    status_counts = await current_rag.doc_status.get_all_status_counts()
-                    documents_count = (
-                        status_counts.get(DocStatus.FAILED.value, 0) +
-                        status_counts.get(DocStatus.PENDING.value, 0) +
-                        status_counts.get(DocStatus.PROCESSING.value, 0) +
-                        status_counts.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
-                    )
-                    if documents_count > 0:
-                        workspaces_to_process = [current_rag.workspace]
-                else:
-                    # All workspaces - get counts across all workspaces
-                    workspaces_stats = await current_rag.doc_status.get_status_counts_across_workspaces()
-                    
-                    # Find workspaces with failed/pending/processing/extracting documents
-                    for ws_id, ws_stats in workspaces_stats.items():
-                        ws_failed_count = (
-                            ws_stats.get(DocStatus.FAILED.value, 0) +
-                            ws_stats.get(DocStatus.PENDING.value, 0) +
-                            ws_stats.get(DocStatus.PROCESSING.value, 0) +
-                            ws_stats.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
-                        )
-                        if ws_failed_count > 0:
-                            workspaces_to_process.append(ws_id)
-                            documents_count += ws_failed_count
-                        
-            except Exception as count_error:
-                logger.warning(f"Failed to count documents for reprocessing: {str(count_error)}")
-                logger.warning(traceback.format_exc())
-                # Continue with reprocessing even if count fails
-                documents_count = 0
+            doc_ids = reprocess_req.doc_ids if reprocess_req is not None else None
+            
+            if doc_ids:
+                documents_count = len(doc_ids)
                 workspaces_to_process = [current_rag.workspace] if workspace_id else []
+            else:
+                try:
+                    if workspace_id:
+                        # Single workspace - get counts for this workspace only
+                        status_counts = await current_rag.doc_status.get_all_status_counts()
+                        documents_count = (
+                            status_counts.get(DocStatus.FAILED.value, 0) +
+                            status_counts.get(DocStatus.PENDING.value, 0) +
+                            status_counts.get(DocStatus.PROCESSING.value, 0) +
+                            status_counts.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
+                        )
+                        if documents_count > 0:
+                            workspaces_to_process = [current_rag.workspace]
+                    else:
+                        # All workspaces - get counts across all workspaces
+                        workspaces_stats = await current_rag.doc_status.get_status_counts_across_workspaces()
+                        
+                        # Find workspaces with failed/pending/processing/extracting documents
+                        for ws_id, ws_stats in workspaces_stats.items():
+                            ws_failed_count = (
+                                ws_stats.get(DocStatus.FAILED.value, 0) +
+                                ws_stats.get(DocStatus.PENDING.value, 0) +
+                                ws_stats.get(DocStatus.PROCESSING.value, 0) +
+                                ws_stats.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
+                            )
+                            if ws_failed_count > 0:
+                                workspaces_to_process.append(ws_id)
+                                documents_count += ws_failed_count
+                            
+                except Exception as count_error:
+                    logger.warning(f"Failed to count documents for reprocessing: {str(count_error)}")
+                    logger.warning(traceback.format_exc())
+                    # Continue with reprocessing even if count fails
+                    documents_count = 0
+                    workspaces_to_process = [current_rag.workspace] if workspace_id else []
 
             # Start the reprocessing in the background for each workspace
             if workspace_id:
                 # Single workspace reprocess
                 background_tasks.add_task(
-                    current_rag.apipeline_process_enqueue_documents, reprocess_failed=True
+                    current_rag.apipeline_process_enqueue_documents, reprocess_failed=True, doc_ids=doc_ids
                 )
                 workspace_msg = f"in workspace '{current_rag.workspace}'"
+                if doc_ids:
+                    workspace_msg += f" for {len(doc_ids)} document(s)"
             else:
                 # Multi-workspace reprocess - use Celery task for each workspace
                 try:
@@ -4639,7 +4750,8 @@ def create_document_routes(
                             # Trigger Celery task for each workspace
                             apipeline_process_enqueue_documents_task.delay(
                                 workspace_id=ws_id,
-                                reprocess_failed=True
+                                reprocess_failed=True,
+                                doc_ids=doc_ids
                             )
                             logger.info(f"Triggered reprocess Celery task for workspace: {ws_id}")
                         except Exception as e:
@@ -4662,6 +4774,772 @@ def create_document_routes(
 
         except Exception as e:
             logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/stage_runs",
+        response_model=PaginatedPipelineStageRunsResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_pipeline_stage_runs(
+        request: Request,
+        req: PipelineStageRunsRequest,
+    ):
+        """
+        Get paginated pipeline stage runs with status matrix and document names.
+        """
+        try:
+            from lightrag.kg.postgres_impl import ClientManager, to_uuid
+            
+            db = await ClientManager.get_client()
+            
+            # Resolve request context for workspace ID
+            resolved_workspace_id, current_rag, _ = await resolve_request_context(request, req.workspace_id)
+            
+            # 1. Fetch status matrix (counts grouped by stage and status)
+            matrix_sql = """
+                SELECT stage, status, COUNT(*) as cnt
+                FROM lightrag_pipeline_stage_runs
+                WHERE workspace_id = $1
+                GROUP BY stage, status
+            """
+            matrix_rows = await db.query(matrix_sql, [resolved_workspace_id], multirows=True)
+            
+            status_matrix = {}
+            for row in matrix_rows:
+                stage = row["stage"]
+                status = row["status"]
+                count = row["cnt"]
+                if stage not in status_matrix:
+                    status_matrix[stage] = {}
+                status_matrix[stage][status] = count
+                
+            # 2. Build paginated query with filters
+            query_parts = []
+            params = []
+            
+            # Param 1: workspace_id (string)
+            params.append(resolved_workspace_id)
+            query_parts.append("sr.workspace_id = $1")
+            
+            # Param 2: workspace_uuid (for joins)
+            workspace_uuid = to_uuid(resolved_workspace_id)
+            params.append(workspace_uuid)
+            workspace_join_ref = "$2"
+            
+            if req.stage:
+                params.append(req.stage)
+                query_parts.append(f"sr.stage = ${len(params)}")
+                
+            if req.status:
+                params.append(req.status)
+                query_parts.append(f"sr.status = ANY(${len(params)})")
+                
+            if req.search:
+                params.append(f"%{req.search}%")
+                query_parts.append(
+                    f"(COALESCE(d.document_name, ld.title) ILIKE ${len(params)} OR sr.doc_id ILIKE ${len(params)})"
+                )
+                
+            where_clause = " AND ".join(query_parts) if query_parts else "1=1"
+            
+            # Count query
+            count_sql = f"""
+                SELECT COUNT(*) as total
+                FROM lightrag_pipeline_stage_runs sr
+                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
+                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
+                WHERE {where_clause}
+            """
+            count_row = await db.query(count_sql, params)
+            total = count_row["total"] if count_row else 0
+            
+            # Data query
+            limit = req.page_size
+            offset = (req.page - 1) * req.page_size
+            
+            data_params = list(params)
+            data_params.append(limit)
+            limit_idx = len(data_params)
+            data_params.append(offset)
+            offset_idx = len(data_params)
+            
+            data_sql = f"""
+                SELECT 
+                    sr.run_id,
+                    sr.stage,
+                    sr.shard_index,
+                    sr.shard_count,
+                    sr.workspace_id,
+                    sr.doc_id,
+                    sr.status,
+                    sr.attempt,
+                    sr.error_json,
+                    sr.started_at,
+                    sr.completed_at,
+                    sr.updated_at,
+                    COALESCE(d.document_name, ld.title) as document_name
+                FROM lightrag_pipeline_stage_runs sr
+                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
+                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
+                WHERE {where_clause}
+                ORDER BY COALESCE(sr.started_at, sr.updated_at) DESC, sr.run_id DESC, sr.stage DESC, sr.shard_index DESC
+                LIMIT ${limit_idx} OFFSET ${offset_idx}
+            """
+            
+            data_rows = await db.query(data_sql, data_params, multirows=True)
+            
+            runs = []
+            for row in data_rows:
+                err_json = row["error_json"]
+                if isinstance(err_json, str):
+                    try:
+                        import json
+                        err_json = json.loads(err_json)
+                    except Exception:
+                        pass
+                
+                runs.append(
+                    PipelineStageRunResponse(
+                        run_id=row["run_id"],
+                        stage=row["stage"],
+                        shard_index=row["shard_index"],
+                        shard_count=row["shard_count"],
+                        workspace_id=row["workspace_id"],
+                        doc_id=row["doc_id"],
+                        document_name=row["document_name"],
+                        status=row["status"],
+                        attempt=row["attempt"],
+                        error_json=err_json,
+                        started_at=row["started_at"],
+                        completed_at=row["completed_at"],
+                        updated_at=row["updated_at"],
+                    )
+                )
+                
+            return PaginatedPipelineStageRunsResponse(
+                runs=runs,
+                total=total,
+                page=req.page,
+                page_size=req.page_size,
+                status_matrix=status_matrix,
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting pipeline stage runs: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/stage_runs/all",
+        response_model=PaginatedPipelineStageRunsResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_all_pipeline_stage_runs(
+        request: Request,
+        req: PipelineStageRunsRequest,
+    ):
+        """
+        Get paginated pipeline stage runs across all workspaces with status matrix and document names.
+        """
+        try:
+            from lightrag.kg.postgres_impl import ClientManager, to_uuid
+            
+            db = await ClientManager.get_client()
+            
+            # 1. Fetch status matrix (counts grouped by stage and status) across all workspaces
+            matrix_sql = """
+                SELECT stage, status, COUNT(*) as cnt
+                FROM lightrag_pipeline_stage_runs
+                GROUP BY stage, status
+            """
+            matrix_rows = await db.query(matrix_sql, [], multirows=True)
+            
+            status_matrix = {}
+            for row in matrix_rows:
+                stage = row["stage"]
+                status = row["status"]
+                count = row["cnt"]
+                if stage not in status_matrix:
+                    status_matrix[stage] = {}
+                status_matrix[stage][status] = count
+                
+            # 2. Build paginated query with filters
+            query_parts = []
+            params = []
+            
+            # Get distinct workspaces to build workspace map
+            workspace_rows = await db.query(
+                """
+                SELECT DISTINCT workspace_id
+                FROM lightrag_pipeline_stage_runs
+                """,
+                [],
+                multirows=True,
+            )
+            workspace_ids = [
+                str(row["workspace_id"]).strip()
+                for row in workspace_rows or []
+                if str(row["workspace_id"] or "").strip()
+            ]
+            workspace_uuids = [to_uuid(workspace_id) for workspace_id in workspace_ids]
+            params.extend([workspace_ids, workspace_uuids])
+            workspace_map_cte = """
+                WITH workspace_map(stage_workspace_id, workspace_uuid) AS (
+                    SELECT * FROM UNNEST($1::text[], $2::uuid[])
+                )
+            """
+            workspace_join_sql = """
+                LEFT JOIN workspace_map wm ON wm.stage_workspace_id = sr.workspace_id
+            """
+            workspace_join_ref = "wm.workspace_uuid"
+            
+            if req.stage:
+                params.append(req.stage)
+                query_parts.append(f"sr.stage = ${len(params)}")
+                
+            if req.status:
+                params.append(req.status)
+                query_parts.append(f"sr.status = ANY(${len(params)})")
+                
+            if req.search:
+                params.append(f"%{req.search}%")
+                query_parts.append(
+                    f"(COALESCE(d.document_name, ld.title) ILIKE ${len(params)} OR sr.doc_id ILIKE ${len(params)})"
+                )
+                
+            where_clause = " AND ".join(query_parts) if query_parts else "1=1"
+            
+            # Count query
+            count_sql = f"""
+                {workspace_map_cte}
+                SELECT COUNT(*) as total
+                FROM lightrag_pipeline_stage_runs sr
+                {workspace_join_sql}
+                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
+                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
+                WHERE {where_clause}
+            """
+            count_row = await db.query(count_sql, params)
+            total = count_row["total"] if count_row else 0
+            
+            # Data query
+            limit = req.page_size
+            offset = (req.page - 1) * req.page_size
+            
+            data_params = list(params)
+            data_params.append(limit)
+            limit_idx = len(data_params)
+            data_params.append(offset)
+            offset_idx = len(data_params)
+            
+            data_sql = f"""
+                {workspace_map_cte}
+                SELECT 
+                    sr.run_id,
+                    sr.stage,
+                    sr.shard_index,
+                    sr.shard_count,
+                    sr.workspace_id,
+                    sr.doc_id,
+                    sr.status,
+                    sr.attempt,
+                    sr.error_json,
+                    sr.started_at,
+                    sr.completed_at,
+                    sr.updated_at,
+                    COALESCE(d.document_name, ld.title) as document_name
+                FROM lightrag_pipeline_stage_runs sr
+                {workspace_join_sql}
+                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
+                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
+                WHERE {where_clause}
+                ORDER BY COALESCE(sr.started_at, sr.updated_at) DESC, sr.run_id DESC, sr.stage DESC, sr.shard_index DESC
+                LIMIT ${limit_idx} OFFSET ${offset_idx}
+            """
+            
+            data_rows = await db.query(data_sql, data_params, multirows=True)
+            
+            runs = []
+            for row in data_rows:
+                err_json = row["error_json"]
+                if isinstance(err_json, str):
+                    try:
+                        import json
+                        err_json = json.loads(err_json)
+                    except Exception:
+                        pass
+                
+                runs.append(
+                    PipelineStageRunResponse(
+                        run_id=row["run_id"],
+                        stage=row["stage"],
+                        shard_index=row["shard_index"],
+                        shard_count=row["shard_count"],
+                        workspace_id=row["workspace_id"],
+                        doc_id=row["doc_id"],
+                        document_name=row["document_name"],
+                        status=row["status"],
+                        attempt=row["attempt"],
+                        error_json=err_json,
+                        started_at=row["started_at"],
+                        completed_at=row["completed_at"],
+                        updated_at=row["updated_at"],
+                    )
+                )
+                
+            return PaginatedPipelineStageRunsResponse(
+                runs=runs,
+                total=total,
+                page=req.page,
+                page_size=req.page_size,
+                status_matrix=status_matrix,
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting all pipeline stage runs: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def publish_events_to_kafka(events):
+        from aiokafka import AIOKafkaProducer
+        from kafka_worker.config import KAFKA_BOOTSTRAP_SERVERS
+        from lightrag.pipeline.partitioning import create_partition_allocator_from_env
+        from kafka_worker.pipeline_main import (
+            STAGE_TOPICS,
+            _canonical_doc_type,
+            _normalize_event_doc_type,
+        )
+
+        if not events:
+            return 0, 0
+
+        producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+        partition_allocator = create_partition_allocator_from_env()
+        partition_counts: dict[str, int] = {}
+        published_count = 0
+        failed_count = 0
+
+        await producer.start()
+        try:
+            for event in events:
+                try:
+                    normalized_event = _normalize_event_doc_type(event)
+                    doc_type = _canonical_doc_type(normalized_event)
+                    topic = STAGE_TOPICS[normalized_event.stage_name][doc_type]
+                    partition_count = partition_counts.get(topic)
+                    if partition_count is None:
+                        partitions = await producer.partitions_for(topic)
+                        if not partitions:
+                            raise RuntimeError(
+                                f"Kafka topic has no available partitions: {topic}"
+                            )
+                        partition_count = len(partitions)
+                        partition_counts[topic] = partition_count
+
+                    partition = await partition_allocator.allocate(
+                        topic, partition_count
+                    )
+                    await producer.send_and_wait(
+                        topic,
+                        normalized_event.model_dump_json(by_alias=True).encode(
+                            "utf-8"
+                        ),
+                        key=normalized_event.partition_key().encode("utf-8"),
+                        partition=partition,
+                    )
+                    published_count += 1
+                except Exception as event_error:
+                    failed_count += 1
+                    logger.error(
+                        "[ApproveStage] Failed to publish stage event run_id=%s stage=%s workspace_id=%s: %s",
+                        getattr(event, "run_id", "unknown"),
+                        getattr(event, "stage", "unknown"),
+                        getattr(event, "workspace_id", "unknown"),
+                        event_error,
+                    )
+        finally:
+            await producer.stop()
+            await partition_allocator.finalize()
+
+        return published_count, failed_count
+
+    async def publish_event_to_kafka(event):
+        published_count, failed_count = await publish_events_to_kafka([event])
+        if published_count != 1 or failed_count:
+            raise RuntimeError("Failed to publish approved stage event")
+
+    def build_stage_event_from_row(row, PipelineStageEvent, json):
+        raw_event_json = row["event_json"]
+        if isinstance(raw_event_json, str):
+            event_dict = json.loads(raw_event_json)
+        else:
+            event_dict = raw_event_json
+
+        event = PipelineStageEvent.model_validate(event_dict)
+        normalized_event = event.model_copy(deep=True)
+        normalized_event.run_id = str(row["run_id"])
+        normalized_event.stage = row["stage"]
+        normalized_event.shard_index = int(row["shard_index"])
+        normalized_event.shard_count = int(row["shard_count"])
+        normalized_event.workspace_id = str(row["workspace_id"])
+        normalized_event.doc_id = str(row["doc_id"])
+        return normalized_event
+
+    @router.post(
+        "/approve_stage",
+        response_model=ApproveStageResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def approve_stage(
+        request: Request,
+        req: ApproveStageRequest,
+    ):
+        """
+        Approve/resume a paused stage run in the pipeline.
+        """
+        try:
+            from lightrag.kg.postgres_impl import ClientManager
+            from lightrag.pipeline.models import PipelineStageEvent
+            import json
+
+            resolved_workspace_id, _, _ = await resolve_request_context(
+                request, req.workspace_id
+            )
+
+            db = await ClientManager.get_client()
+
+            row = await db.query(
+                """
+                SELECT run_id, stage, shard_index, shard_count, workspace_id,
+                       doc_id, status, event_json
+                FROM lightrag_pipeline_stage_runs
+                WHERE run_id = $1 AND stage = $2 AND shard_index = $3 AND workspace_id = $4
+                """,
+                [req.run_id, req.stage, req.shard_index, resolved_workspace_id],
+            )
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"No stage run found for run_id={req.run_id}, "
+                        f"stage={req.stage}, shard={req.shard_index}"
+                    ),
+                )
+
+            status = row["status"]
+            if status != "paused":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Stage run is not paused (current status: {status})",
+                )
+
+            event = build_stage_event_from_row(row, PipelineStageEvent, json)
+            await publish_event_to_kafka(event)
+
+            return ApproveStageResponse(
+                status="success",
+                message=(
+                    f"Stage {req.stage} for run {req.run_id} approved and "
+                    "resumed successfully."
+                ),
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error approving stage run: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/bulk_approve_stage",
+        response_model=ApproveStageResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def bulk_approve_stage(
+        request: Request,
+        req: BulkApproveStageRequest,
+        background_tasks: BackgroundTasks,
+    ):
+        """
+        Approve and resume ALL paused stage runs for a specific stage.
+        """
+        try:
+            from lightrag.kg.postgres_impl import ClientManager
+            from lightrag.pipeline.models import PipelineStageEvent
+            import json
+
+            db = await ClientManager.get_client()
+
+            query_all_workspaces = req.workspace_id == "all"
+            query_all_stages = req.stage == "all"
+
+            query_parts = ["status = 'paused'"]
+            params = []
+
+            if not query_all_stages:
+                params.append(req.stage)
+                query_parts.append(f"stage = ${len(params)}")
+
+            if not query_all_workspaces:
+                resolved_workspace_id, _, _ = await resolve_request_context(
+                    request, req.workspace_id
+                )
+                params.append(resolved_workspace_id)
+                query_parts.append(f"workspace_id = ${len(params)}")
+
+            where_clause = " AND ".join(query_parts)
+
+            rows = await db.query(
+                f"""
+                SELECT run_id, stage, shard_index, shard_count, workspace_id,
+                       doc_id, event_json
+                FROM lightrag_pipeline_stage_runs
+                WHERE {where_clause}
+                ORDER BY run_id
+                """,
+                params,
+                multirows=True,
+            )
+
+            if not rows:
+                stage_desc = "all stages" if query_all_stages else f"stage {req.stage}"
+                workspace_desc = (
+                    "all workspaces"
+                    if query_all_workspaces
+                    else f"workspace {req.workspace_id}"
+                )
+                return ApproveStageResponse(
+                    status="success",
+                    message=(
+                        f"No paused runs found for {stage_desc} in "
+                        f"{workspace_desc}"
+                    ),
+                )
+
+            events = []
+            parse_failed_count = 0
+            for row in rows:
+                try:
+                    events.append(
+                        build_stage_event_from_row(row, PipelineStageEvent, json)
+                    )
+                except Exception as e:
+                    parse_failed_count += 1
+                    logger.error(
+                        f"[BulkApprove] Failed to approve run_id={row['run_id']}: {e}"
+                    )
+
+            stage_desc = "all stages" if query_all_stages else f"stage {req.stage}"
+            background_threshold = max(
+                1, int(os.getenv("BULK_APPROVE_BACKGROUND_THRESHOLD", "100"))
+            )
+            if query_all_workspaces or len(events) > background_threshold:
+                background_tasks.add_task(publish_events_to_kafka, events)
+                failure_suffix = (
+                    f", {parse_failed_count} failed to parse"
+                    if parse_failed_count
+                    else ""
+                )
+                return ApproveStageResponse(
+                    status="success",
+                    message=(
+                        f"Queued {len(events)}/{len(rows)} paused runs for "
+                        f"{stage_desc} for background approval{failure_suffix}"
+                    ),
+                )
+
+            approved_count, publish_failed_count = await publish_events_to_kafka(events)
+            failure_count = parse_failed_count + publish_failed_count
+            failure_suffix = f", {failure_count} failed" if failure_count else ""
+            return ApproveStageResponse(
+                status="success",
+                message=(
+                    f"Queued {approved_count}/{len(rows)} paused runs for "
+                    f"{stage_desc}{failure_suffix}"
+                ),
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error bulk-approving stage: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/stage_speed",
+        response_model=list[StageSpeedEntry],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_stage_speed(
+        request: Request,
+        workspace_id: Optional[str] = None,
+    ):
+        """
+        Returns processing speed stats per stage: docs completed in 1m/5m, avg duration.
+        """
+        try:
+            from lightrag.kg.postgres_impl import ClientManager
+
+            resolved_workspace_id, _, _ = await resolve_request_context(request, workspace_id)
+
+            db = await ClientManager.get_client()
+
+            rows = await db.query(
+                """
+                SELECT
+                    stage,
+                    COUNT(*) FILTER (
+                        WHERE status = 'done' AND completed_at >= NOW() - INTERVAL '1 minute'
+                    ) AS docs_completed_1m,
+                    COUNT(*) FILTER (
+                        WHERE status = 'done' AND completed_at >= NOW() - INTERVAL '5 minutes'
+                    ) AS docs_completed_5m,
+                    AVG(
+                        EXTRACT(EPOCH FROM (completed_at - started_at))
+                    ) FILTER (
+                        WHERE status = 'done'
+                        AND completed_at IS NOT NULL
+                        AND started_at IS NOT NULL
+                        AND completed_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS avg_duration_seconds
+                FROM lightrag_pipeline_stage_runs
+                WHERE workspace_id = $1
+                GROUP BY stage
+                ORDER BY stage
+                """,
+                [resolved_workspace_id],
+                multirows=True,
+            )
+
+            result = []
+            for row in rows:
+                avg_dur = row.get("avg_duration_seconds")
+                result.append(
+                    StageSpeedEntry(
+                        stage=row["stage"],
+                        docs_completed_1m=int(row.get("docs_completed_1m", 0) or 0),
+                        docs_completed_5m=int(row.get("docs_completed_5m", 0) or 0),
+                        avg_duration_seconds=round(float(avg_dur), 2) if avg_dur is not None else None,
+                    )
+                )
+            return result
+
+        except Exception as e:
+            logger.error(f"Error getting stage speed: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/pipeline_config",
+        response_model=PipelineConfigResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_pipeline_config(request: Request):
+        """
+        Returns the current pipeline configuration from environment variables.
+        """
+        return PipelineConfigResponse(
+            entity_extraction_model=os.getenv("ENTITY_EXTRACTION_LLM_MODEL", ""),
+            entity_extraction_host=os.getenv("ENTITY_EXTRACTION_LLM_BINDING_HOST", ""),
+            entity_extraction_api_key=os.getenv("ENTITY_EXTRACTION_LLM_BINDING_API_KEY", ""),
+            paused_stages=os.getenv("PIPELINE_PAUSED_STAGES", ""),
+        )
+
+    @router.post(
+        "/pipeline_config",
+        response_model=ApproveStageResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def update_pipeline_config(
+        request: Request,
+        req: PipelineConfigUpdateRequest,
+    ):
+        """
+        Update .env pipeline config and optionally restart workers.
+        """
+        try:
+            env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), ".env")
+            if not os.path.exists(env_path):
+                raise HTTPException(status_code=404, detail=f".env file not found at {env_path}")
+
+            # Read existing .env
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            # Build update map
+            updates: dict[str, str] = {}
+            if req.entity_extraction_model is not None:
+                updates["ENTITY_EXTRACTION_LLM_MODEL"] = req.entity_extraction_model
+            if req.entity_extraction_host is not None:
+                updates["ENTITY_EXTRACTION_LLM_BINDING_HOST"] = req.entity_extraction_host
+            if req.entity_extraction_api_key is not None:
+                updates["ENTITY_EXTRACTION_LLM_BINDING_API_KEY"] = req.entity_extraction_api_key
+            if req.paused_stages is not None:
+                updates["PIPELINE_PAUSED_STAGES"] = req.paused_stages
+
+            if not updates:
+                return ApproveStageResponse(status="success", message="No changes to apply")
+
+            # Replace matching lines
+            updated_keys = set()
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                matched = False
+                for key, value in updates.items():
+                    if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+                        new_lines.append(f"{key}={value}\n")
+                        updated_keys.add(key)
+                        matched = True
+                        break
+                if not matched:
+                    new_lines.append(line)
+
+            # Append any keys not found
+            for key, value in updates.items():
+                if key not in updated_keys:
+                    new_lines.append(f"{key}={value}\n")
+
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+
+            # Also update current process env
+            for key, value in updates.items():
+                os.environ[key] = value
+
+            msg_parts = [f"Updated: {', '.join(updates.keys())}"]
+
+            # Auto-restart workers
+            if req.restart_workers:
+                import subprocess
+                compose_file = os.path.join(os.path.dirname(env_path), "docker-compose.dev.yml")
+                if os.path.exists(compose_file):
+                    try:
+                        result = subprocess.Popen(
+                            [
+                                "docker", "compose", "-f", compose_file,
+                                "--profile", "workers", "up", "-d", "--force-recreate",
+                            ],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            cwd=os.path.dirname(env_path),
+                        )
+                        msg_parts.append("Worker restart initiated")
+                    except Exception as e:
+                        msg_parts.append(f"Worker restart failed: {e}")
+                else:
+                    msg_parts.append("docker-compose.dev.yml not found, skipping restart")
+
+            return ApproveStageResponse(status="success", message=". ".join(msg_parts))
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating pipeline config: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

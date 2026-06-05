@@ -1891,46 +1891,39 @@ class LightRAG:
                     "status": DocStatus.FAILED,
                     "content_summary": status_doc.content_summary,
                     "content_length": status_doc.content_length,
-                    "chunks_count": preserved_chunks_count,
-                    "chunks_list": preserved_chunks_list,
-                    "created_at": status_doc.created_at,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "file_path": getattr(status_doc, "file_path", None)
-                    or "unknown_source",
                     "error_msg": error_msg,
                     "error_stage": error_stage,
                     "metadata": metadata,
                 }
                 status_doc.status = DocStatus.FAILED
-                failed_docs_to_preserve.append(doc_id)
                 logger.warning(
                     f"[Reprocess] {status_label} document {doc_id} will be marked as FAILED"
                 )
-                continue
+                # Do NOT continue here - let it fall through to content_data checks
+                # so it can be routed to re-extraction if needed
 
             if not content_data:
-                # Document has no content - need to check if we can re-extract
+                # Document has no content - check if we can re-extract
                 file_path = getattr(status_doc, "file_path", None)
+                is_failed = hasattr(status_doc, "status") and status_doc.status == DocStatus.FAILED
 
-                # Check if this is a failed document
-                if (
-                    hasattr(status_doc, "status")
-                    and status_doc.status == DocStatus.FAILED
-                ):
-                    # If reprocess_failed is True and we have a file path, try to re-extract
-                    if reprocess_failed and file_path:
-                        # Check if file exists in inputs or __enqueued__ directory
-                        from pathlib import Path
+                # If we have a file path, and either:
+                # 1. It's a FAILED doc and reprocess_failed is True
+                # 2. It's an EXTRACTED/CHUNKING doc (meaning KMS requested processing)
+                if file_path and (not is_failed or reprocess_failed):
+                    # Check if file exists in inputs or __enqueued__ directory
+                    from pathlib import Path
 
-                        base_input_dir = Path(
-                            os.getenv("INPUT_DIR", "/app/data/inputs")
-                        )
-                        input_dir = base_input_dir / self.workspace
-                        enqueued_dir = input_dir / "__enqueued__"
+                    base_input_dir = Path(
+                        os.getenv("INPUT_DIR", "/app/data/inputs")
+                    )
+                    input_dir = base_input_dir / self.workspace
+                    enqueued_dir = input_dir / "__enqueued__"
 
-                        file_exists = False
-                        actual_file_path = None
+                    file_exists = False
+                    actual_file_path = None
 
+                    try:
                         # Check in inputs directory
                         if (input_dir / file_path).exists():
                             file_exists = True
@@ -1939,28 +1932,41 @@ class LightRAG:
                         elif (enqueued_dir / file_path).exists():
                             file_exists = True
                             actual_file_path = enqueued_dir / file_path
+                    except OSError as e:
+                        logger.warning(f"Failed to check file existence for {file_path}: {e}")
+                        file_exists = False
 
-                        if file_exists:
-                            # File exists - mark for re-extraction
-                            docs_to_reextract.append(
-                                {
-                                    "doc_id": doc_id,
-                                    "file_path": str(actual_file_path),
-                                    "original_file_name": file_path,
-                                }
-                            )
+                    if file_exists:
+                        # File exists - mark for re-extraction
+                        docs_to_reextract.append(
+                            {
+                                "doc_id": doc_id,
+                                "file_path": str(actual_file_path),
+                                "original_file_name": file_path,
+                            }
+                        )
+                        # Remove from current processing list
+                        to_process_docs.pop(doc_id, None)
+                        continue
 
-                            # Remove from current processing list
-                            to_process_docs.pop(doc_id, None)
-                        else:
-                            # File doesn't exist - delete the document entry
-                            inconsistent_docs.append(doc_id)
-                    else:
-                        # Not reprocessing or no file path - preserve for manual review
-                        failed_docs_to_preserve.append(doc_id)
+                # If we couldn't re-extract (no file, or FAILED and not reprocess_failed)
+                if is_failed:
+                    # Preserve FAILED documents for manual review
+                    failed_docs_to_preserve.append(doc_id)
+                    to_process_docs.pop(doc_id, None)
                 else:
-                    # Not a failed document - delete inconsistent entry
-                    inconsistent_docs.append(doc_id)
+                    # Not a failed document and can't re-extract - mark as FAILED instead of deleting
+                    error_stage = "extraction" if getattr(status_doc, "status", None) == DocStatus.EXTRACTING else "chunking"
+                    docs_to_mark_failed[doc_id] = {
+                        "status": DocStatus.FAILED,
+                        "content_summary": getattr(status_doc, "content_summary", ""),
+                        "content_length": getattr(status_doc, "content_length", 0),
+                        "error_msg": f"Source file '{file_path}' not found locally. Cannot re-extract.",
+                        "error_stage": error_stage,
+                        "metadata": getattr(status_doc, "metadata", {}),
+                    }
+                    status_doc.status = DocStatus.FAILED
+                    to_process_docs.pop(doc_id, None)
 
         if docs_to_mark_failed:
             await self.doc_status.upsert(docs_to_mark_failed)
@@ -1994,28 +2000,27 @@ class LightRAG:
                     )
             except ImportError as e:
                 logger.error(f"[Reprocess] Failed to import Celery task: {e}")
-                # If Celery is not available, mark these documents as inconsistent
+                docs_to_mark_failed_celery = {}
                 for doc_info in docs_to_reextract:
-                    inconsistent_docs.append(doc_info["doc_id"])
+                    d_id = doc_info["doc_id"]
+                    docs_to_mark_failed_celery[d_id] = {
+                        "status": DocStatus.FAILED,
+                        "content_summary": "",
+                        "content_length": 0,
+                        "error_msg": "Failed to import Celery task. Cannot re-extract.",
+                        "error_stage": "extraction",
+                        "metadata": {},
+                    }
+                if docs_to_mark_failed_celery:
+                    await self.doc_status.upsert(docs_to_mark_failed_celery)
 
         # Log information about failed documents that will be preserved
         if failed_docs_to_preserve:
-            if not reprocess_failed:
-                async with pipeline_status_lock:
-                    preserve_message = f"Preserving {len(failed_docs_to_preserve)} failed document entries for manual review"
-                    logger.info(preserve_message)
-                    pipeline_status["latest_message"] = preserve_message
-                    pipeline_status["history_messages"].append(preserve_message)
-
-                # Remove failed documents from processing list but keep them in doc_status
-                for doc_id in failed_docs_to_preserve:
-                    to_process_docs.pop(doc_id, None)
-            else:
-                async with pipeline_status_lock:
-                    reprocess_message = f"Including {len(failed_docs_to_preserve)} failed document entries for reprocessing"
-                    logger.info(reprocess_message)
-                    pipeline_status["latest_message"] = reprocess_message
-                    pipeline_status["history_messages"].append(reprocess_message)
+            async with pipeline_status_lock:
+                preserve_message = f"Preserving {len(failed_docs_to_preserve)} failed document entries that cannot be re-extracted"
+                logger.info(preserve_message)
+                pipeline_status["latest_message"] = preserve_message
+                pipeline_status["history_messages"].append(preserve_message)
 
         # Delete inconsistent document entries(excluding failed documents)
         if inconsistent_docs:
@@ -2224,6 +2229,7 @@ class LightRAG:
         split_by_character_only: bool = False,
         reprocess_failed: bool = False,
         task_id: str | None = None,
+        doc_ids: list[str] | None = None,
     ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
@@ -2252,17 +2258,52 @@ class LightRAG:
                 # Pick up documents in all states that need processing or recovery
                 # DocProcessingStatus.__post_init__ handles backward compatibility mapping
                 # for PENDING -> EXTRACTED and PROCESSING -> CHUNKING
-                (
-                    extracted_docs,
-                    chunking_docs,
-                    failed_docs,
-                    extracting_docs,
-                ) = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
-                    self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
-                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.EXTRACTING),
-                )
+                if doc_ids:
+                    # Fetch only the specified document statuses
+                    docs_data = await self.doc_status.get_by_ids(doc_ids)
+                    extracted_docs = {}
+                    chunking_docs = {}
+                    failed_docs = {}
+                    extracting_docs = {}
+                    for doc in docs_data:
+                        if not doc:
+                            continue
+                        d_id = doc["id"]
+                        status = doc["status"]
+                        # Convert raw status if it's string/enum
+                        status_val = status.value if hasattr(status, "value") else status
+                        
+                        status_obj = DocProcessingStatus(
+                            content_summary=doc.get("content_summary", ""),
+                            content_length=doc.get("content_length", 0),
+                            status=status,
+                            created_at=doc.get("created_at"),
+                            updated_at=doc.get("updated_at"),
+                            file_path=doc.get("file_path"),
+                            metadata=doc.get("metadata", {}),
+                            error_msg=doc.get("error_msg"),
+                            content_hash=doc.get("content_hash"),
+                        )
+                        if status_val == DocStatus.EXTRACTED.value:
+                            extracted_docs[d_id] = status_obj
+                        elif status_val == DocStatus.CHUNKING.value:
+                            chunking_docs[d_id] = status_obj
+                        elif status_val == DocStatus.FAILED.value:
+                            failed_docs[d_id] = status_obj
+                        elif status_val == DocStatus.EXTRACTING.value:
+                            extracting_docs[d_id] = status_obj
+                else:
+                    (
+                        extracted_docs,
+                        chunking_docs,
+                        failed_docs,
+                        extracting_docs,
+                    ) = await asyncio.gather(
+                        self.doc_status.get_docs_by_status(DocStatus.EXTRACTED),
+                        self.doc_status.get_docs_by_status(DocStatus.CHUNKING),
+                        self.doc_status.get_docs_by_status(DocStatus.FAILED),
+                        self.doc_status.get_docs_by_status(DocStatus.EXTRACTING),
+                    )
 
                 to_process_docs: dict[str, DocProcessingStatus] = {}
                 to_process_docs.update(extracted_docs)

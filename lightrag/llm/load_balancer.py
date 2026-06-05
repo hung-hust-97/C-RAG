@@ -2,6 +2,7 @@ import logging
 import time
 import asyncio
 import hashlib
+import json
 import os
 import re
 import uuid
@@ -214,7 +215,7 @@ class RedisDistributedNodeHealth:
             await client.set(
                 self.failed_key,
                 reason[:500],
-                ex=int(max(self.unhealthy_ttl_seconds * 10, 3600)),
+                ex=int(max(self.unhealthy_ttl_seconds * 3, 180)),
             )
         except Exception as exc:
             logger.warning(
@@ -287,6 +288,49 @@ class LLMLoadBalancer:
     by enforcing per-node concurrency limits.
     """
 
+    @classmethod
+    def _parse_scope_limits(
+        cls, raw_limits: str | None, *, default_limit: int
+    ) -> dict[str, int]:
+        if raw_limits is None or not raw_limits.strip():
+            return {}
+
+        limits: dict[str, int] = {}
+        for item in raw_limits.split(","):
+            if not item.strip() or ":" not in item:
+                continue
+            raw_scope, raw_limit = item.split(":", 1)
+            scope = cls._normalize_scope(raw_scope)
+            try:
+                limit = int(raw_limit.strip())
+            except ValueError:
+                logger.warning(
+                    "[LoadBalancer] Invalid scope limit %r in LLM_LOAD_BALANCER_SCOPE_LIMITS",
+                    item,
+                )
+                continue
+            limits[scope] = limit
+            
+        return limits
+
+    @classmethod
+    def _parse_node_limits(cls, limits_str: str | None) -> dict[str, int]:
+        """Parse node specific limits, e.g. {"8004": 42, "8007": 34} or 8004=42,8007=34"""
+        if not limits_str or not limits_str.strip():
+            return {}
+        try:
+            if limits_str.strip().startswith('{'):
+                return json.loads(limits_str)
+            limits = {}
+            for item in limits_str.split(','):
+                if '=' in item:
+                    k, v = item.split('=', 1)
+                    limits[k.strip()] = int(v.strip())
+            return limits
+        except Exception as e:
+            logger.warning(f"Failed to parse node limits from '{limits_str}': {e}")
+            return {}
+
     def __init__(self, hosts: str, api_keys: Optional[str], models: str, max_async: int = 100):
         host_list = [h.strip() for h in hosts.split(",") if h.strip()] if hosts else []
         key_list = [k.strip() for k in api_keys.split(",") if k.strip()] if api_keys else []
@@ -341,14 +385,19 @@ class LLMLoadBalancer:
         scope_limits = self._parse_scope_limits(
             os.getenv(
                 "LLM_LOAD_BALANCER_SCOPE_LIMITS",
-                "extract:36,summary:8,query:5,default:45",
+                "extract:38,summary:12,query:8,default:45",
             ),
             default_limit=concurrency_per_node,
         )
+        
+        node_limits_map = self._parse_node_limits(
+            os.getenv("LLM_LOAD_BALANCER_NODE_LIMITS", "")
+        )
+        
         logger.info(
             f"Initializing LLMLoadBalancer with {num_nodes} nodes. "
             f"Total max_async: {max_async}, Concurrency per node limit: {concurrency_per_node}, "
-            f"distributed_limit={distributed_limit_enabled}, scope_limits={scope_limits}"
+            f"distributed_limit={distributed_limit_enabled}, scope_limits={scope_limits}, node_limits={node_limits_map}"
         )
 
         for i in range(num_nodes):
@@ -359,12 +408,21 @@ class LLMLoadBalancer:
             distributed_semaphore = None
             scoped_distributed_semaphores = None
             distributed_health = None
+            
+            # Determine specific limit for this node
+            node_limit = concurrency_per_node
+            for host_pattern, limit_val in node_limits_map.items():
+                if host_pattern in host:
+                    node_limit = min(limit_val, max_async)
+                    logger.info(f"Node {host} matched pattern '{host_pattern}', using specific limit: {node_limit}")
+                    break
+                    
             if distributed_limit_enabled:
                 host_hash = hashlib.sha1(host.encode("utf-8")).hexdigest()[:16]
                 distributed_semaphore = RedisDistributedSemaphore(
                     redis_url=redis_url,
                     key=f"{key_prefix}:node:{host_hash}",
-                    limit=concurrency_per_node,
+                    limit=node_limit,
                     lease_seconds=lease_seconds,
                     acquire_timeout_seconds=acquire_timeout_seconds,
                     required=distributed_required,
@@ -374,7 +432,7 @@ class LLMLoadBalancer:
                         scope: RedisDistributedSemaphore(
                             redis_url=redis_url,
                             key=f"{key_prefix}:scope:{scope}:node:{host_hash}",
-                            limit=min(limit, concurrency_per_node),
+                            limit=min(limit, node_limit),
                             lease_seconds=lease_seconds,
                             acquire_timeout_seconds=acquire_timeout_seconds,
                             required=distributed_required,
@@ -394,7 +452,7 @@ class LLMLoadBalancer:
                     host=host,
                     api_key=key,
                     model=model,
-                    semaphore=asyncio.Semaphore(concurrency_per_node),
+                    semaphore=asyncio.Semaphore(node_limit),
                     distributed_semaphore=distributed_semaphore,
                     scoped_distributed_semaphores=scoped_distributed_semaphores,
                     distributed_health=distributed_health,
@@ -407,32 +465,6 @@ class LLMLoadBalancer:
     def _normalize_scope(scope: str | None) -> str:
         normalized = re.sub(r"[^a-z0-9_]+", "_", (scope or "default").lower()).strip("_")
         return normalized or "default"
-
-    @classmethod
-    def _parse_scope_limits(
-        cls, raw_limits: str | None, *, default_limit: int
-    ) -> dict[str, int]:
-        if raw_limits is None or not raw_limits.strip():
-            return {}
-
-        limits: dict[str, int] = {}
-        for item in raw_limits.split(","):
-            if not item.strip() or ":" not in item:
-                continue
-            raw_scope, raw_limit = item.split(":", 1)
-            scope = cls._normalize_scope(raw_scope)
-            try:
-                limit = int(raw_limit.strip())
-            except ValueError:
-                logger.warning(
-                    "[LoadBalancer] Invalid scope limit %r in LLM_LOAD_BALANCER_SCOPE_LIMITS",
-                    item,
-                )
-                continue
-            if limit <= 0:
-                continue
-            limits[scope] = min(limit, default_limit)
-        return limits
 
     @staticmethod
     def _scoped_slot_context(node: LLMNode, scope: str | None):

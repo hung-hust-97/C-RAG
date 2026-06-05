@@ -6,7 +6,7 @@ import { Message, QueryRequest, WorkspaceItem } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
+type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api' | 'monitor'
 
 interface SettingsState {
   selectedWorkspaceId: string
@@ -336,8 +336,14 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 22,
+      version: 23,
       migrate: (state: any, version: number) => {
+        if (version < 23) {
+          // Add 'monitor' tab support
+          if (state.currentTab === 'monitor') {
+            state.currentTab = 'documents'
+          }
+        }
         if (version < 22) {
           // Add workspaceNamesById field for older versions
           if (!state.workspaceNamesById || typeof state.workspaceNamesById !== 'object') {

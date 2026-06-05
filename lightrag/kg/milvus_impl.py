@@ -1,7 +1,10 @@
 import asyncio
 import os
 import re
-from typing import Any, final, Optional, Dict, Callable
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, final, Optional, Dict, Callable, ClassVar, Iterator
 from dataclasses import dataclass, fields
 import numpy as np
 from lightrag.utils import logger, compute_mdhash_id
@@ -70,6 +73,43 @@ def _get_env_int(key: str, default: int) -> int:
                 f"Invalid integer value for {key}: {val}, using default {default}"
             )
     return default
+
+
+def _get_env_float(key: str, default: float) -> float:
+    """Parse environment variable as float"""
+    val = os.environ.get(key, "")
+    if val:
+        try:
+            return float(val)
+        except ValueError:
+            logger.warning(
+                f"Invalid float value for {key}: {val}, using default {default}"
+            )
+    return default
+
+
+def _get_env_optional_float(key: str) -> Optional[float]:
+    """Parse an optional float environment variable."""
+    val = os.environ.get(key, "")
+    if not val:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        logger.warning(f"Invalid float value for {key}: {val}, ignoring it")
+        return None
+
+
+def _get_env_optional_int(key: str) -> Optional[int]:
+    """Parse an optional integer environment variable."""
+    val = os.environ.get(key, "")
+    if not val:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        logger.warning(f"Invalid integer value for {key}: {val}, ignoring it")
+        return None
 
 
 @dataclass
@@ -223,11 +263,14 @@ class MilvusIndexConfig:
                 logger.info(
                     "Using AUTOINDEX with direct API fallback because IndexParams is unavailable"
                 )
+                params = {}
+                if _get_env_bool("MILVUS_ENABLE_MMAP_FOR_LARGE_COLLECTIONS", False):
+                    params["mmap.enabled"] = True
                 return {
                     "field_name": field_name,
                     "index_type": self.index_type,
                     "metric_type": self.metric_type,
-                    "params": {},
+                    "params": params,
                 }
             raise RuntimeError(
                 f"IndexParams not available but required for index type "
@@ -252,7 +295,34 @@ class MilvusIndexConfig:
         elif self.index_type in ("IVF_FLAT", "IVF_SQ8", "IVF_PQ"):
             params["nlist"] = self.ivf_nlist
 
-        # DISKANN / SCANN have no additional params
+        elif self.index_type == "DISKANN":
+            diskann_options = {
+                "MaxDegree": _get_env_optional_int("MILVUS_DISKANN_MAX_DEGREE"),
+                "SearchListSize": _get_env_optional_int(
+                    "MILVUS_DISKANN_SEARCH_LIST_SIZE"
+                ),
+                "PQCodeBugetGBRatio": _get_env_optional_float(
+                    "MILVUS_DISKANN_PQ_CODE_BUDGET_GB_RATIO"
+                ),
+                "SearchCacheBudgetGBRatio": _get_env_optional_float(
+                    "MILVUS_DISKANN_SEARCH_CACHE_BUDGET_GB_RATIO"
+                ),
+                "BeamWidthRatio": _get_env_optional_float(
+                    "MILVUS_DISKANN_BEAM_WIDTH_RATIO"
+                ),
+            }
+            params.update(
+                {
+                    key: value
+                    for key, value in diskann_options.items()
+                    if value is not None
+                }
+            )
+
+        # SCANN has no additional params
+
+        if _get_env_bool("MILVUS_ENABLE_MMAP_FOR_LARGE_COLLECTIONS", False):
+            params["mmap.enabled"] = True
 
         index_params.add_index(
             field_name=field_name,
@@ -328,9 +398,21 @@ class MilvusIndexConfig:
         }
 
 
+@dataclass
+class _MilvusCollectionLoadState:
+    collection_name: str
+    client: MilvusClient
+    loaded: bool
+    last_used_at: float
+    in_flight: int = 0
+
+
 @final
 @dataclass
 class MilvusVectorDBStorage(BaseVectorStorage):
+    _load_state_lock: ClassVar[threading.RLock] = threading.RLock()
+    _load_states: ClassVar[dict[str, _MilvusCollectionLoadState]] = {}
+
     def _get_milvus_connection_kwargs(self, include_db_name: bool = True) -> dict:
         """Build Milvus connection kwargs from env/config."""
         connection_kwargs = {
@@ -719,6 +801,50 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             description=description,
             enable_dynamic_field=True,  # Support dynamic fields
         )
+
+    def _mmap_enabled_for_namespace(self) -> bool:
+        """Return whether mmap should be enabled for this collection namespace."""
+        if not _get_env_bool("MILVUS_ENABLE_MMAP_FOR_LARGE_COLLECTIONS", False):
+            return False
+
+        configured = os.environ.get(
+            "MILVUS_MMAP_NAMESPACES", "entities,relationships"
+        )
+        namespace_suffixes = {
+            item.strip().lower()
+            for item in configured.split(",")
+            if item.strip()
+        }
+        if "*" in namespace_suffixes:
+            return True
+
+        namespace = self.namespace.lower()
+        return any(namespace.endswith(suffix) for suffix in namespace_suffixes)
+
+    def _create_collection_with_properties(
+        self, collection_name: str, schema: CollectionSchema
+    ) -> None:
+        """Create a collection and apply resource-saving properties when supported."""
+        create_kwargs: dict[str, Any] = {
+            "collection_name": collection_name,
+            "schema": schema,
+        }
+
+        if self._mmap_enabled_for_namespace():
+            create_kwargs["properties"] = {"mmap.enabled": "true"}
+
+        try:
+            self._client.create_collection(**create_kwargs)
+        except TypeError:
+            if "properties" not in create_kwargs:
+                raise
+
+            logger.warning(
+                f"[{self.workspace}] Milvus client does not support create_collection "
+                f"properties; creating {collection_name} without mmap properties"
+            )
+            create_kwargs.pop("properties", None)
+            self._client.create_collection(**create_kwargs)
 
     def _get_index_params(self):
         """Get IndexParams in a version-compatible way"""
@@ -1232,9 +1358,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Temporarily update final_namespace for index creation
             self.final_namespace = temp_collection_name
             new_schema = self._create_schema_for_namespace()
-            self._client.create_collection(
-                collection_name=temp_collection_name, schema=new_schema
-            )
+            self._create_collection_with_properties(temp_collection_name, new_schema)
             try:
                 self._create_indexes_after_collection()
             except Exception as index_error:
@@ -1422,9 +1546,178 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
         self._create_indexes_after_collection()
 
+    @staticmethod
+    def _release_idle_collections_enabled() -> bool:
+        return _get_env_bool("MILVUS_RELEASE_IDLE_COLLECTIONS", False)
+
+    def _collection_load_key(self) -> str:
+        connection_kwargs = self._get_milvus_connection_kwargs(include_db_name=True)
+        uri = connection_kwargs.get("uri", "")
+        db_name = connection_kwargs.get("db_name") or "default"
+        return f"{uri}|{db_name}|{self.final_namespace}"
+
+    def _release_state_locked(
+        self,
+        key: str,
+        state: _MilvusCollectionLoadState,
+        reason: str,
+    ) -> bool:
+        """Release a loaded collection. Caller must hold _load_state_lock."""
+        if not state.loaded:
+            return False
+        if state.in_flight > 0:
+            return False
+
+        try:
+            state.client.release_collection(state.collection_name)
+            state.loaded = False
+            state.last_used_at = time.monotonic()
+            if key == self._collection_load_key():
+                self._collection_loaded = False
+            logger.info(
+                f"[{self.workspace}] Released Milvus collection "
+                f"{state.collection_name} ({reason})"
+            )
+            return True
+        except Exception as release_error:
+            logger.warning(
+                f"[{self.workspace}] Failed to release Milvus collection "
+                f"{state.collection_name} ({reason}): {release_error}"
+            )
+            return False
+
+    def _release_idle_collections(self, preserve_key: Optional[str] = None) -> None:
+        """Release idle loaded collections according to TTL and max-loaded limits."""
+        if not self._release_idle_collections_enabled():
+            return
+
+        now = time.monotonic()
+        ttl_seconds = max(0, _get_env_int("MILVUS_COLLECTION_LOAD_TTL_SECONDS", 900))
+        max_loaded = _get_env_int("MILVUS_MAX_LOADED_COLLECTIONS", 3)
+
+        with self._load_state_lock:
+            for key, state in list(self._load_states.items()):
+                if key == preserve_key or not state.loaded or state.in_flight > 0:
+                    continue
+                if ttl_seconds > 0 and now - state.last_used_at >= ttl_seconds:
+                    self._release_state_locked(key, state, "idle ttl")
+
+            if max_loaded <= 0:
+                return
+
+            loaded_states = [
+                (key, state)
+                for key, state in self._load_states.items()
+                if state.loaded
+            ]
+            loaded_count = len(loaded_states)
+            if loaded_count <= max_loaded:
+                return
+
+            for key, state in sorted(loaded_states, key=lambda item: item[1].last_used_at):
+                if loaded_count <= max_loaded:
+                    break
+                if key == preserve_key or state.in_flight > 0:
+                    continue
+                if self._release_state_locked(key, state, "loaded collection limit"):
+                    loaded_count -= 1
+
+    def _register_collection_loaded(self) -> None:
+        if not self._release_idle_collections_enabled() or self._client is None:
+            return
+
+        key = self._collection_load_key()
+        now = time.monotonic()
+        with self._load_state_lock:
+            state = self._load_states.get(key)
+            if state is None:
+                state = _MilvusCollectionLoadState(
+                    collection_name=self.final_namespace,
+                    client=self._client,
+                    loaded=True,
+                    last_used_at=now,
+                )
+                self._load_states[key] = state
+            else:
+                state.collection_name = self.final_namespace
+                state.client = self._client
+                state.loaded = True
+                state.last_used_at = now
+
+    def _begin_collection_use(self) -> Optional[str]:
+        if not self._release_idle_collections_enabled():
+            return None
+
+        key = self._collection_load_key()
+        now = time.monotonic()
+        with self._load_state_lock:
+            state = self._load_states.get(key)
+            if state is None:
+                if self._client is None:
+                    return None
+                state = _MilvusCollectionLoadState(
+                    collection_name=self.final_namespace,
+                    client=self._client,
+                    loaded=True,
+                    last_used_at=now,
+                )
+                self._load_states[key] = state
+
+            state.in_flight += 1
+            state.last_used_at = now
+        return key
+
+    def _end_collection_use(self, key: Optional[str]) -> None:
+        if key is None or not self._release_idle_collections_enabled():
+            return
+
+        with self._load_state_lock:
+            state = self._load_states.get(key)
+            if state is None:
+                return
+            state.in_flight = max(0, state.in_flight - 1)
+            state.last_used_at = time.monotonic()
+
+    @contextmanager
+    def _loaded_collection_context(self) -> Iterator[None]:
+        self._ensure_collection_loaded()
+        key = self._begin_collection_use()
+        try:
+            yield
+        finally:
+            self._end_collection_use(key)
+
+    def _release_collection_on_finalize(self, client: MilvusClient) -> None:
+        if not self._release_idle_collections_enabled():
+            return
+
+        key = self._collection_load_key()
+        with self._load_state_lock:
+            state = self._load_states.get(key)
+            if state is None or state.client is not client or state.in_flight > 0:
+                return
+            self._release_state_locked(key, state, "storage finalize")
+
+    def _mark_collection_dropped(self) -> None:
+        key = self._collection_load_key()
+        with self._load_state_lock:
+            self._load_states.pop(key, None)
+        self._collection_loaded = False
+
     def _ensure_collection_loaded(self):
         """Ensure the collection is loaded into memory for search operations"""
-        if self._collection_loaded:
+        release_idle_enabled = self._release_idle_collections_enabled()
+        load_key = self._collection_load_key() if release_idle_enabled else None
+
+        if release_idle_enabled:
+            self._release_idle_collections(preserve_key=load_key)
+            with self._load_state_lock:
+                state = self._load_states.get(load_key)
+                if state is not None and state.loaded:
+                    state.last_used_at = time.monotonic()
+                    self._collection_loaded = True
+                    return
+        elif self._collection_loaded:
             return
 
         try:
@@ -1437,11 +1730,25 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 )
                 raise ValueError(f"Collection {self.final_namespace} does not exist")
 
+            # Verify index existence before loading
+            indexes = self._milvus_call(
+                "list_indexes",
+                lambda client: client.list_indexes(self.final_namespace),
+            )
+            if not indexes:
+                logger.warning(
+                    f"[{self.workspace}] Indexes not found during query load for {self.final_namespace}, creating them now"
+                )
+                self._create_indexes_after_collection()
+
             self._milvus_call(
                 "load_collection",
                 lambda client: client.load_collection(self.final_namespace),
             )
             self._collection_loaded = True
+            self._register_collection_loaded()
+            if load_key is not None:
+                self._release_idle_collections(preserve_key=load_key)
             return
 
         except Exception as e:
@@ -1526,16 +1833,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             logger.info(f"[{self.workspace}] Creating new collection: {self.namespace}")
             schema = self._create_schema_for_namespace()
 
-            # Create collection with schema only first
-            self._client.create_collection(
-                collection_name=self.final_namespace, schema=schema
-            )
+            # Create collection with schema first; indexes are built later.
+            self._create_collection_with_properties(self.final_namespace, schema)
 
-            # Then create indexes
-            self._create_indexes_after_collection()
-
+            # Index creation is deferred until index_done_callback() or first search query
             logger.info(
-                f"[{self.workspace}] Successfully created Milvus collection: {self.namespace}"
+                f"[{self.workspace}] Created collection: {self.namespace} (index building deferred)"
             )
 
         except RuntimeError:
@@ -1573,13 +1876,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
                 # Create fresh collection
                 schema = self._create_schema_for_namespace()
-                self._client.create_collection(
-                    collection_name=self.final_namespace, schema=schema
-                )
-                self._create_indexes_after_collection()
-
+                self._create_collection_with_properties(self.final_namespace, schema)
+                
+                # Index creation is deferred
                 logger.info(
-                    f"[{self.workspace}] Successfully force-created collection {self.namespace}"
+                    f"[{self.workspace}] Successfully force-created collection {self.namespace} (index building deferred)"
                 )
 
             except Exception as create_error:
@@ -1697,6 +1998,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         if client is None:
             return
 
+        self._release_collection_on_finalize(client)
+
         close = getattr(client, "close", None)
         if not callable(close):
             return
@@ -1714,15 +2017,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"'{self.namespace}': {close_error}"
             )
 
-    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        # logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
+    async def _upsert_grpc(self, data: dict[str, dict[str, Any]]) -> Any:
+        """Standard gRPC-based row-by-row upsert into Milvus."""
         if not data:
-            return
+            return None
 
         import time
-
         current_time = int(time.time())
-
         import json
 
         list_data: list[dict[str, Any]] = []
@@ -1760,9 +2061,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 max_len = -1
                 for mk, mv in meta_dict.items():
                     if isinstance(mv, str):
-                        l = len(mv.encode("utf-8"))
-                        if l > max_len:
-                            max_len = l
+                        val_len = len(mv.encode("utf-8"))
+                        if val_len > max_len:
+                            max_len = val_len
                             longest_key = mk
                 
                 if longest_key is None or max_len < 500:
@@ -1818,13 +2119,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             results.append(result)
         return results[-1] if len(results) == 1 else results
 
-    async def bulk_upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        """
-        Gom dữ liệu thành file JSON, đẩy lên MinIO và dùng API do_bulk_insert của Milvus để ingest tốc độ cao.
-        """
-        if not data:
-            return
-
+    async def _bulk_upsert_impl(self, data: dict[str, dict[str, Any]]) -> Any:
+        """Internal Bulk Insert implementation (uploads JSON to MinIO and registers import task)."""
         import time
         import os
         import json
@@ -1864,9 +2160,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 max_len = -1
                 for mk, mv in meta_dict.items():
                     if isinstance(mv, str):
-                        l = len(mv.encode("utf-8"))
-                        if l > max_len:
-                            max_len = l
+                        val_len = len(mv.encode("utf-8"))
+                        if val_len > max_len:
+                            max_len = val_len
                             longest_key = mk
                 
                 if longest_key is None or max_len < 500:
@@ -1900,7 +2196,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeddings_list = await asyncio.gather(*embedding_tasks)
         embeddings = np.concatenate(embeddings_list)
 
-        # Chèn vector vào dict
         rows = []
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i].tolist()
@@ -1924,8 +2219,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
 
         if not all([endpoint_url, access_key, secret_key]):
-            logger.warning("MinIO credentials missing. Falling back to standard upsert.")
-            return await self.upsert(data)
+            raise ValueError("MinIO credentials missing. Cannot run bulk insert.")
 
         object_key = f"bulk_insert/{self.final_namespace}_{uuid.uuid4().hex}.json"
 
@@ -1948,94 +2242,125 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Trigger Milvus bulk insert
         from pymilvus import connections, utility
 
+        conn_alias = f"bulk_insert_{uuid.uuid4().hex}"
+        self._connect_bulk_insert_alias(conn_alias)
+
         try:
-            conn_alias = f"bulk_insert_{uuid.uuid4().hex}"
-            self._connect_bulk_insert_alias(conn_alias)
-
-            try:
-                db_name = self._get_milvus_db_name() or "default"
-                if not utility.has_collection(
-                    self.final_namespace, using=conn_alias
-                ):
-                    raise ValueError(
-                        f"Collection {self.final_namespace} does not exist "
-                        f"in Milvus database {db_name}"
-                    )
-
-                task_id = self._milvus_call(
-                    "do_bulk_insert",
-                    lambda client: self._do_bulk_insert(
-                        collection_name=self.final_namespace,
-                        files=[object_key],
-                        using=conn_alias,
-                    ),
+            db_name = self._get_milvus_db_name() or "default"
+            if not utility.has_collection(
+                self.final_namespace, using=conn_alias
+            ):
+                raise ValueError(
+                    f"Collection {self.final_namespace} does not exist "
+                    f"in Milvus database {db_name}"
                 )
-                logger.info(f"Started Milvus bulk insert task: {task_id}")
+
+            task_id = self._milvus_call(
+                "do_bulk_insert",
+                lambda client: self._do_bulk_insert(
+                    collection_name=self.final_namespace,
+                    files=[object_key],
+                    using=conn_alias,
+                ),
+            )
+            logger.info(f"Started Milvus bulk insert task: {task_id}")
+            
+            # Start background task to poll status and cleanup file
+            async def _poll_and_cleanup(tid, s3_session, endpoint, access, secret, bucket_name, obj_key):
+                import asyncio
+                from pymilvus import connections, utility
+                poll_alias = f"poll_bulk_insert_{uuid.uuid4().hex}"
                 
-                # Start background task to poll status and cleanup file
-                async def _poll_and_cleanup(tid, s3_session, endpoint, access, secret, bucket_name, obj_key):
-                    import asyncio
-                    from pymilvus import connections, utility
-                    poll_alias = f"poll_bulk_insert_{uuid.uuid4().hex}"
+                try:
+                    await asyncio.to_thread(self._connect_bulk_insert_alias, poll_alias)
                     
-                    try:
-                        await asyncio.to_thread(self._connect_bulk_insert_alias, poll_alias)
-                        
-                        while True:
-                            try:
-                                def _get_state():
-                                    return utility.get_bulk_insert_state(task_id=tid, using=poll_alias)
-                                    
-                                state_obj = await asyncio.to_thread(_get_state)
-                                state_val = getattr(state_obj, "state", getattr(state_obj, "state_name", str(state_obj)))
-                                state_str = str(state_val).lower()
+                    while True:
+                        try:
+                            def _get_state():
+                                return utility.get_bulk_insert_state(task_id=tid, using=poll_alias)
                                 
-                                # BulkInsertState.ImportCompleted = 6, ImportFailed = 7, ImportFailedAndCleaned = 8
-                                if "completed" in state_str or "failed" in state_str or getattr(state_obj, "state", -1) in (6, 7, 8):
-                                    break
-                            except Exception as poll_err:
-                                logger.warning(f"Error polling bulk insert state for task {tid}: {poll_err}")
+                            state_obj = await asyncio.to_thread(_get_state)
+                            state_val = getattr(state_obj, "state", getattr(state_obj, "state_name", str(state_obj)))
+                            state_str = str(state_val).lower()
+                            
+                            # BulkInsertState.ImportCompleted = 6, ImportFailed = 7, ImportFailedAndCleaned = 8
+                            if "completed" in state_str or "failed" in state_str or getattr(state_obj, "state", -1) in (6, 7, 8):
                                 break
-                            
-                            await asyncio.sleep(5)
-                            
-                        # Delete file from MinIO
-                        try:
-                            async with s3_session.client(
-                                "s3",
-                                endpoint_url=endpoint,
-                                aws_access_key_id=access,
-                                aws_secret_access_key=secret,
-                            ) as s3_client:
-                                await s3_client.delete_object(Bucket=bucket_name, Key=obj_key)
-                                logger.info(f"Successfully cleaned up bulk insert file: {bucket_name}/{obj_key}")
-                        except Exception as s3_err:
-                            logger.error(f"Failed to delete bulk insert file {obj_key}: {s3_err}")
-                    finally:
-                        try:
-                            await asyncio.to_thread(connections.disconnect, poll_alias)
-                        except Exception:
-                            pass
-                            
-                asyncio.create_task(
-                    _poll_and_cleanup(
-                        task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
-                    )
+                        except Exception as poll_err:
+                            logger.warning(f"Error polling bulk insert state for task {tid}: {poll_err}")
+                            break
+                        
+                        await asyncio.sleep(5)
+                        
+                    # Delete file from MinIO
+                    try:
+                        async with s3_session.client(
+                            "s3",
+                            endpoint_url=endpoint,
+                            aws_access_key_id=access,
+                            aws_secret_access_key=secret,
+                        ) as s3_client:
+                            await s3_client.delete_object(Bucket=bucket_name, Key=obj_key)
+                            logger.info(f"Successfully cleaned up bulk insert file: {bucket_name}/{obj_key}")
+                    except Exception as s3_err:
+                        logger.error(f"Failed to delete bulk insert file {obj_key}: {s3_err}")
+                finally:
+                    try:
+                        await asyncio.to_thread(connections.disconnect, poll_alias)
+                    except Exception:
+                        pass
+                        
+            asyncio.create_task(
+                _poll_and_cleanup(
+                    task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
                 )
-                
-                return task_id
-            finally:
-                connections.disconnect(conn_alias)
+            )
+            
+            return task_id
+        finally:
+            connections.disconnect(conn_alias)
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> Any:
+        if not data:
+            return None
+
+        # Check if we should use bulk insert
+        bulk_insert_threshold = _get_env_int("MILVUS_BULK_INSERT_THRESHOLD", 100)
+        if bulk_insert_threshold > 0 and len(data) >= bulk_insert_threshold:
+            endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+            access_key = os.environ.get("S3_ACCESS_KEY") or os.environ.get("S3_ACCESS_KEY_ID")
+            secret_key = os.environ.get("S3_SECRET_KEY") or os.environ.get("S3_SECRET_ACCESS_KEY")
+            if all([endpoint_url, access_key, secret_key]):
+                logger.info(
+                    f"[{self.workspace}] Payload size {len(data)} >= threshold {bulk_insert_threshold}. "
+                    f"Routing to bulk_upsert for {self.final_namespace}."
+                )
+                try:
+                    return await self._bulk_upsert_impl(data)
+                except Exception as e:
+                    logger.error(
+                        f"[{self.workspace}] Bulk insert failed: {e}. "
+                        f"Falling back to standard gRPC upsert."
+                    )
+                    # Fall back to standard gRPC
+                    return await self._upsert_grpc(data)
+
+        # Fallback/standard path
+        return await self._upsert_grpc(data)
+
+    async def bulk_upsert(self, data: dict[str, dict[str, Any]]) -> Any:
+        """
+        Public bulk_upsert interface. Calls the implementation directly, falling back to standard gRPC on failure.
+        """
+        try:
+            return await self._bulk_upsert_impl(data)
         except Exception as e:
-            logger.error(f"Milvus do_bulk_insert failed: {e}. Falling back to standard upsert.")
-            return await self.upsert(data)
+            logger.error(f"Milvus do_bulk_insert failed: {e}. Falling back to standard gRPC upsert.")
+            return await self._upsert_grpc(data)
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
-        # Ensure collection is loaded before querying
-        self._ensure_collection_loaded()
-
         # Use provided embedding or compute it
         if query_embedding is not None:
             embedding = [query_embedding]  # Milvus expects a list of embeddings
@@ -2069,16 +2394,17 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             f"top_k: {top_k}, threshold: {self.cosine_better_than_threshold}"
         )
 
-        results = self._milvus_call(
-            "search",
-            lambda client: client.search(
-                collection_name=self.final_namespace,
-                data=embedding,
-                limit=top_k,
-                output_fields=output_fields,
-                search_params=search_params,
-            ),
-        )
+        with self._loaded_collection_context():
+            results = self._milvus_call(
+                "search",
+                lambda client: client.search(
+                    collection_name=self.final_namespace,
+                    data=embedding,
+                    limit=top_k,
+                    output_fields=output_fields,
+                    search_params=search_params,
+                ),
+            )
 
         # Post-filter by cosine similarity threshold.
         # NOTE: We apply threshold as a post-filter rather than via Milvus
@@ -2105,8 +2431,55 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         return filtered
 
     async def index_done_callback(self) -> None:
-        # Milvus handles persistence automatically
-        pass
+        """Build indexes and load the collection after insertion is done."""
+        if _get_env_bool("MILVUS_DEFER_INDEX_BUILDING", False):
+            logger.info(
+                f"[{self.workspace}] Index building is deferred for {self.final_namespace} (MILVUS_DEFER_INDEX_BUILDING=True)"
+            )
+            return
+
+        def _build_and_load():
+            try:
+                # Check if collection exists
+                if not self._client.has_collection(self.final_namespace):
+                    logger.warning(
+                        f"[{self.workspace}] Collection {self.final_namespace} does not exist, skipping index creation"
+                    )
+                    return
+                
+                # Check if index exists
+                indexes = self._client.list_indexes(self.final_namespace)
+                if not indexes:
+                    logger.info(
+                        f"[{self.workspace}] Indexes not found in index_done_callback for {self.final_namespace}, creating them now"
+                    )
+                    self._create_indexes_after_collection()
+                else:
+                    logger.debug(
+                        f"[{self.workspace}] Indexes already exist for collection {self.final_namespace}: {indexes}"
+                    )
+                
+                # Load the collection
+                if not self._collection_loaded:
+                    if self._release_idle_collections_enabled():
+                        logger.info(
+                            f"[{self.workspace}] Skipping post-index load for "
+                            f"{self.final_namespace} because "
+                            "MILVUS_RELEASE_IDLE_COLLECTIONS=True"
+                        )
+                        return
+                    logger.info(
+                        f"[{self.workspace}] Loading collection {self.final_namespace} in index_done_callback"
+                    )
+                    self._client.load_collection(self.final_namespace)
+                    self._collection_loaded = True
+                    self._register_collection_loaded()
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Failed to build index / load collection in index_done_callback: {e}"
+                )
+                
+        await asyncio.to_thread(_build_and_load)
 
     async def delete_entity(self, entity_name: str) -> None:
         """Delete an entity from the vector database
@@ -2148,46 +2521,44 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             entity_name: The name of the entity whose relations should be deleted
         """
         try:
-            # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
-
             # Search for relations where entity is either source or target
             expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
 
             # Find all relations involving this entity
-            results = self._milvus_call(
-                "query",
-                lambda client: client.query(
-                    collection_name=self.final_namespace,
-                    filter=expr,
-                    output_fields=["id"],
-                ),
-            )
-
-            if not results or len(results) == 0:
-                logger.debug(
-                    f"[{self.workspace}] No relations found for entity {entity_name}"
-                )
-                return
-
-            # Extract IDs of relations to delete
-            relation_ids = [item["id"] for item in results]
-            logger.debug(
-                f"[{self.workspace}] Found {len(relation_ids)} relations for entity {entity_name}"
-            )
-
-            # Delete the relations
-            if relation_ids:
-                delete_result = self._milvus_call(
-                    "delete",
-                    lambda client: client.delete(
-                        collection_name=self.final_namespace, pks=relation_ids
+            with self._loaded_collection_context():
+                results = self._milvus_call(
+                    "query",
+                    lambda client: client.query(
+                        collection_name=self.final_namespace,
+                        filter=expr,
+                        output_fields=["id"],
                     ),
                 )
 
+                if not results or len(results) == 0:
+                    logger.debug(
+                        f"[{self.workspace}] No relations found for entity {entity_name}"
+                    )
+                    return
+
+                # Extract IDs of relations to delete
+                relation_ids = [item["id"] for item in results]
                 logger.debug(
-                    f"[{self.workspace}] Deleted {delete_result.get('delete_count', 0)} relations for {entity_name}"
+                    f"[{self.workspace}] Found {len(relation_ids)} relations for entity {entity_name}"
                 )
+
+                # Delete the relations
+                if relation_ids:
+                    delete_result = self._milvus_call(
+                        "delete",
+                        lambda client: client.delete(
+                            collection_name=self.final_namespace, pks=relation_ids
+                        ),
+                    )
+
+                    logger.debug(
+                        f"[{self.workspace}] Deleted {delete_result.get('delete_count', 0)} relations for {entity_name}"
+                    )
 
         except Exception as e:
             logger.error(
@@ -2204,23 +2575,21 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return
 
         try:
-            # Ensure collection is loaded before deleting
-            self._ensure_collection_loaded()
-
             batch_size = 1000
             total_deleted = 0
 
             # Delete vectors by IDs in batches
-            for i in range(0, len(ids), batch_size):
-                batch_ids = ids[i:i + batch_size]
-                result = self._milvus_call(
-                    "delete",
-                    lambda client, b=batch_ids: client.delete(
-                        collection_name=self.final_namespace, pks=b
-                    ),
-                )
-                if result:
-                    total_deleted += result.get("delete_count", 0)
+            with self._loaded_collection_context():
+                for i in range(0, len(ids), batch_size):
+                    batch_ids = ids[i:i + batch_size]
+                    result = self._milvus_call(
+                        "delete",
+                        lambda client, b=batch_ids: client.delete(
+                            collection_name=self.final_namespace, pks=b
+                        ),
+                    )
+                    if result:
+                        total_deleted += result.get("delete_count", 0)
 
             if total_deleted > 0:
                 logger.debug(
@@ -2246,21 +2615,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             The vector data if found, or None if not found
         """
         try:
-            # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
-
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
             # Query Milvus for a specific ID
-            result = self._milvus_call(
-                "query",
-                lambda client: client.query(
-                    collection_name=self.final_namespace,
-                    filter=f'id == "{id}"',
-                    output_fields=output_fields,
-                ),
-            )
+            with self._loaded_collection_context():
+                result = self._milvus_call(
+                    "query",
+                    lambda client: client.query(
+                        collection_name=self.final_namespace,
+                        filter=f'id == "{id}"',
+                        output_fields=output_fields,
+                    ),
+                )
 
             if not result or len(result) == 0:
                 return None
@@ -2285,9 +2652,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return []
 
         try:
-            # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
-
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
@@ -2295,28 +2659,29 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             result_map: dict[str, dict[str, Any]] = {}
 
             # Process in batches to avoid Milvus expression length limits
-            for i in range(0, len(ids), batch_size):
-                batch_ids = ids[i:i + batch_size]
-                id_list = '", "'.join(batch_ids)
-                filter_expr = f'id in ["{id_list}"]'
+            with self._loaded_collection_context():
+                for i in range(0, len(ids), batch_size):
+                    batch_ids = ids[i:i + batch_size]
+                    id_list = '", "'.join(batch_ids)
+                    filter_expr = f'id in ["{id_list}"]'
 
-                # Query Milvus with the filter
-                result = self._milvus_call(
-                    "query",
-                    lambda client, f=filter_expr: client.query(
-                        collection_name=self.final_namespace,
-                        filter=f,
-                        output_fields=output_fields,
-                    ),
-                )
+                    # Query Milvus with the filter
+                    result = self._milvus_call(
+                        "query",
+                        lambda client, f=filter_expr: client.query(
+                            collection_name=self.final_namespace,
+                            filter=f,
+                            output_fields=output_fields,
+                        ),
+                    )
 
-                if result:
-                    for row in result:
-                        if not row:
-                            continue
-                        row_id = row.get("id")
-                        if row_id is not None:
-                            result_map[str(row_id)] = row
+                    if result:
+                        for row in result:
+                            if not row:
+                                continue
+                            row_id = row.get("id")
+                            if row_id is not None:
+                                result_map[str(row_id)] = row
 
             ordered_results: list[dict[str, Any] | None] = []
             for requested_id in ids:
@@ -2343,36 +2708,34 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return {}
 
         try:
-            # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
-
             vectors_dict = {}
             batch_size = 1000
 
             # Process in batches to avoid Milvus expression length limits
-            for i in range(0, len(ids), batch_size):
-                batch_ids = ids[i:i + batch_size]
-                id_list = '", "'.join(batch_ids)
-                filter_expr = f'id in ["{id_list}"]'
+            with self._loaded_collection_context():
+                for i in range(0, len(ids), batch_size):
+                    batch_ids = ids[i:i + batch_size]
+                    id_list = '", "'.join(batch_ids)
+                    filter_expr = f'id in ["{id_list}"]'
 
-                # Query Milvus with the filter, requesting only vector field
-                result = self._milvus_call(
-                    "query",
-                    lambda client, f=filter_expr: client.query(
-                        collection_name=self.final_namespace,
-                        filter=f,
-                        output_fields=["vector"],
-                    ),
-                )
+                    # Query Milvus with the filter, requesting only vector field
+                    result = self._milvus_call(
+                        "query",
+                        lambda client, f=filter_expr: client.query(
+                            collection_name=self.final_namespace,
+                            filter=f,
+                            output_fields=["vector"],
+                        ),
+                    )
 
-                if result:
-                    for item in result:
-                        if item and "vector" in item and "id" in item:
-                            # Convert numpy array to list if needed
-                            vector_data = item["vector"]
-                            if isinstance(vector_data, np.ndarray):
-                                vector_data = vector_data.tolist()
-                            vectors_dict[str(item["id"])] = vector_data
+                    if result:
+                        for item in result:
+                            if item and "vector" in item and "id" in item:
+                                # Convert numpy array to list if needed
+                                vector_data = item["vector"]
+                                if isinstance(vector_data, np.ndarray):
+                                    vector_data = vector_data.tolist()
+                                vectors_dict[str(item["id"])] = vector_data
 
             return vectors_dict
         except Exception as e:
@@ -2401,7 +2764,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     "drop_collection",
                     lambda client: client.drop_collection(self.final_namespace),
                 )
-            self._collection_loaded = False
+            self._mark_collection_dropped()
 
             # Recreate the collection
             self._create_collection_if_not_exist()

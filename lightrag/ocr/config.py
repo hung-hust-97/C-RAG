@@ -148,10 +148,10 @@ class OCRConfig:
                 )
 
         if self.engine == "auto" and not (
-            self.mineru_api_url or self.deepseek_api_url
+            self.mineru_api_url
         ):
             logger.warning(
-                "Auto OCR configured without MinerU or DeepSeek endpoint. "
+                "Auto OCR configured without MinerU endpoint. "
                 "Only local Docling can be selected if installed."
             )
         

@@ -11,6 +11,7 @@
     "knowledgeGraph": "Knowledge Graph",
     "retrieval": "Retrieval",
     "api": "API",
+    "monitor": "Monitor",
     "projectRepository": "Project Repository",
     "logout": "Logout",
     "frontendNeedsRebuild": "Frontend needs rebuild",
@@ -475,5 +476,40 @@
     "prevPage": "Previous Page",
     "nextPage": "Next Page",
     "lastPage": "Last Page"
+  },
+  "monitorPanel": {
+    "title": "Pipeline Stage Monitor",
+    "description": "Monitor and reprocess document processing steps.",
+    "stage": "Stage",
+    "status": "Status",
+    "attempts": "Attempts",
+    "started": "Started",
+    "duration": "Duration",
+    "document": "Document",
+    "actions": "Actions",
+    "reprocess": "Reprocess",
+    "viewError": "View Error",
+    "errorDetail": "Error Detail",
+    "noStageRuns": "No stage runs matching current filters.",
+    "reprocessSelected": "Reprocess Selected",
+    "reprocessAllFailed": "Reprocess All Failed",
+    "allStages": "All Stages",
+    "allStatuses": "All Statuses",
+    "searchPlaceholder": "Search document name or ID...",
+    "stageCountsTitle": "Stage Progress Summary",
+    "stageCard": {
+      "total": "Total runs",
+      "running": "Running",
+      "paused": "Paused",
+      "done": "Done",
+      "failed": "Failed"
+    },
+    "paused": "Paused",
+    "approving": "Approving stage...",
+    "approveSuccess": "Stage approved and resumed successfully",
+    "approve": "Approve / Resume",
+    "reprocessSuccess": "Reprocess initiated successfully",
+    "reprocessFailed": "Failed to initiate reprocess",
+    "close": "Close"
   }
 }

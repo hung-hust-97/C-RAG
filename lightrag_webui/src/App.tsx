@@ -15,6 +15,7 @@ import GraphViewer from '@/features/GraphViewer'
 import DocumentManager from '@/features/DocumentManager'
 import RetrievalTesting from '@/features/RetrievalTesting'
 import ApiSite from '@/features/ApiSite'
+import Monitor from '@/features/Monitor'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
 
@@ -215,6 +216,9 @@ function App() {
                 </TabsContent>
                 <TabsContent value="api" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <ApiSite />
+                </TabsContent>
+                <TabsContent value="monitor" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
+                  <Monitor />
                 </TabsContent>
               </div>
             </Tabs>

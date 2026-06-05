@@ -147,6 +147,12 @@ class LLMConfigCache:
 def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_timeout: int):
     from lightrag.llm.load_balancer import LLMLoadBalancer
 
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+
     # Initialize the load balancer with hosts, API keys, models, and max_async
     lb = LLMLoadBalancer(
         hosts=args.llm_binding_host,
@@ -154,12 +160,35 @@ def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_tim
         models=args.llm_model,
         max_async=args.max_async
     )
+    extract_lb = None
+    extract_hosts = os.getenv("ENTITY_EXTRACTION_LLM_BINDING_HOST", "").strip()
+    extract_binding = os.getenv("ENTITY_EXTRACTION_LLM_BINDING", "openai").strip().lower()
+    if extract_hosts:
+        if extract_binding not in {"openai", "openai-ollama"}:
+            logger.warning(
+                "ENTITY_EXTRACTION_LLM_BINDING=%s is not supported by OpenAI factory; "
+                "falling back to LLM_BINDING_HOST",
+                extract_binding,
+            )
+        else:
+            extract_lb = LLMLoadBalancer(
+                hosts=extract_hosts,
+                api_keys=os.getenv("ENTITY_EXTRACTION_LLM_BINDING_API_KEY")
+                or args.llm_binding_api_key,
+                models=os.getenv("ENTITY_EXTRACTION_LLM_MODEL") or args.llm_model,
+                max_async=_env_int("ENTITY_EXTRACTION_LLM_MAX_ASYNC", args.max_async),
+            )
+            logger.info(
+                "OpenAI entity extraction load balancer enabled with %s nodes",
+                len(extract_lb.nodes),
+            )
+    max_node_count = max(len(lb.nodes), len(extract_lb.nodes) if extract_lb else 0)
     node_internal_retry_attempts = max(
         1,
         int(
             os.getenv(
                 "LLM_LOAD_BALANCER_NODE_INTERNAL_RETRY_ATTEMPTS",
-                "1" if len(lb.nodes) > 1 else "3",
+                "1" if max_node_count > 1 else "3",
             )
         ),
     )
@@ -197,7 +226,8 @@ def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_tim
                 api_key=node.api_key, **kwargs
             )
 
-        return await lb.execute_with_fallback(_call_node, scope=request_cache_type)
+        active_lb = extract_lb if request_cache_type == "extract" and extract_lb else lb
+        return await active_lb.execute_with_fallback(_call_node, scope=request_cache_type)
     return optimized_openai_alike_model_complete
 
 def create_optimized_azure_openai_llm_func(config_cache: LLMConfigCache, args, llm_timeout: int):

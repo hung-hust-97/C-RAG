@@ -125,8 +125,28 @@ class StageRunner:
 
         claim = await self.context.coordinator.claim(event)
         if claim.status == ClaimStatus.ALREADY_COMPLETED:
-            logger.info("[Pipeline] Stage already completed %s", context_line)
-            return StageRunOutcome(event, "already_completed", [])
+            try:
+                next_events = await self._recover_next_events_for_completed_stage(event)
+                if next_events:
+                    await self._emit_events(event, next_events)
+                    logger.info(
+                        "[Pipeline] Stage already completed; replayed downstream events %s",
+                        context_line,
+                    )
+                    return StageRunOutcome(
+                        event,
+                        "already_completed",
+                        next_events,
+                        "replayed downstream events for completed stage",
+                    )
+                logger.info("[Pipeline] Stage already completed %s", context_line)
+                return StageRunOutcome(event, "already_completed", [])
+            except Exception as exc:
+                logger.exception(
+                    "[Pipeline] Failed to replay downstream events for completed stage %s",
+                    context_line,
+                )
+                return await self._handle_failure(event, exc)
         if not claim.acquired:
             logger.info("[Pipeline] Stage skipped (%s) %s", claim.status.value, context_line)
             return StageRunOutcome(event, claim.status.value, [])
@@ -187,7 +207,21 @@ class StageRunner:
     async def _emit_events(
         self, current_event: PipelineStageEvent, next_events: list[PipelineStageEvent]
     ) -> None:
+        paused_stages_env = os.getenv("PIPELINE_PAUSED_STAGES", "")
+        paused_stages = {s.strip().lower() for s in paused_stages_env.split(",") if s.strip()}
+        # Stages that are always auto-approved (never paused)
+        always_approved = {"chunking"}
+
         for next_event in next_events:
+            if next_event.stage_name.value in paused_stages and next_event.stage_name.value not in always_approved:
+                logger.info(
+                    "[Pipeline] Stage %s is in PIPELINE_PAUSED_STAGES. Pausing event %s",
+                    next_event.stage_name.value,
+                    next_event.log_context(),
+                )
+                await self.context.coordinator.register_paused(next_event)
+                continue
+
             if current_event.fast_path:
                 logger.info("[Pipeline] Fast-path handoff %s", next_event.log_context())
                 await self.run(next_event)
@@ -199,6 +233,158 @@ class StageRunner:
                 )
                 continue
             await self.event_publisher(next_event)
+
+    async def _recover_next_events_for_completed_stage(
+        self, event: PipelineStageEvent
+    ) -> list[PipelineStageEvent]:
+        if event.stage_name == StageName.KG_MERGE:
+            return await self._recover_kg_merge_next_events(event)
+
+        if event.stage_name != StageName.CHUNKING:
+            return []
+
+        try:
+            stage_outputs = await self.context.coordinator.get_stage_outputs(
+                event.run_id, event.stage_name
+            )
+            chunks_artifact = next(
+                (artifact for artifact in stage_outputs if artifact.kind == "chunks"),
+                None,
+            )
+            if chunks_artifact is None:
+                logger.warning(
+                    "[Pipeline] Cannot replay chunking downstream events; chunks artifact missing %s",
+                    event.log_context(),
+                )
+                return []
+
+            from .stages.common import rows_to_chunks
+
+            rows = await self.context.artifact_store.read_jsonl(chunks_artifact.uri)
+            chunks = rows_to_chunks(rows)
+            chunk_ids = list(chunks.keys())
+            if not chunk_ids:
+                logger.warning(
+                    "[Pipeline] Cannot replay chunking downstream events; chunks artifact is empty %s",
+                    event.log_context(),
+                )
+                return []
+
+            shard_size = int(os.getenv("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", "32"))
+            if event.debug_sync or self.context.debug_sync:
+                shard_size = len(chunk_ids)
+            shard_size = max(1, shard_size)
+            shard_count = (len(chunk_ids) + shard_size - 1) // shard_size
+
+            next_events = [
+                event.next_event(
+                    StageName.CHUNK_EMBEDDING,
+                    artifact_uri=chunks_artifact.uri,
+                    counts={"chunks": len(chunks)},
+                    metadata={"chunks_artifact_uri": chunks_artifact.uri},
+                )
+            ]
+            for shard_index in range(shard_count):
+                start = shard_index * shard_size
+                end = start + shard_size
+                shard_chunk_ids = chunk_ids[start:end]
+                next_events.append(
+                    event.next_event(
+                        StageName.ENTITY_EXTRACTION,
+                        artifact_uri=chunks_artifact.uri,
+                        shard_index=shard_index,
+                        shard_count=shard_count,
+                        counts={"chunks": len(shard_chunk_ids)},
+                        metadata={
+                            "chunks_artifact_uri": chunks_artifact.uri,
+                            "chunk_ids": shard_chunk_ids,
+                            "legal_single_shard": False,
+                        },
+                    )
+                )
+
+            logger.warning(
+                "[Pipeline] Replaying chunking downstream events for completed stage %s chunks=%s extraction_shards=%s",
+                event.log_context(),
+                len(chunks),
+                shard_count,
+            )
+            return next_events
+        except Exception:
+            logger.exception(
+                "[Pipeline] Failed to replay downstream events for completed stage %s",
+                event.log_context(),
+            )
+            raise
+
+    async def _recover_kg_merge_next_events(
+        self, event: PipelineStageEvent
+    ) -> list[PipelineStageEvent]:
+        try:
+            stage_outputs = await self.context.coordinator.get_stage_outputs(
+                event.run_id, event.stage_name
+            )
+            payload_artifacts = [
+                artifact
+                for artifact in stage_outputs
+                if artifact.kind == "kg_vector_payload"
+            ]
+            if not payload_artifacts:
+                logger.warning(
+                    "[Pipeline] Cannot replay kg_merge downstream events; vector payload artifact missing %s",
+                    event.log_context(),
+                )
+                return []
+
+            payload_artifacts.sort(
+                key=lambda artifact: int(artifact.metadata.get("shard_index", 0))
+            )
+            shard_count = max(
+                len(payload_artifacts),
+                max(
+                    int(artifact.metadata.get("shard_count", 1))
+                    for artifact in payload_artifacts
+                ),
+            )
+            next_events = []
+            for fallback_index, artifact in enumerate(payload_artifacts):
+                shard_index = int(
+                    artifact.metadata.get("shard_index", fallback_index)
+                )
+                next_events.append(
+                    event.next_event(
+                        StageName.KG_EMBEDDING,
+                        artifact_uri=artifact.uri,
+                        shard_index=shard_index,
+                        shard_count=shard_count,
+                        counts={
+                            "entities": int(artifact.metadata.get("entities", 0)),
+                            "relations": int(artifact.metadata.get("relations", 0)),
+                            "vector_rows": int(
+                                artifact.metadata.get(
+                                    "vector_rows", artifact.row_count
+                                )
+                            ),
+                        },
+                        metadata={
+                            "kg_vector_payload_artifact_uri": artifact.uri,
+                            "replayed_from_completed_stage": event.stage_name.value,
+                        },
+                    )
+                )
+
+            logger.warning(
+                "[Pipeline] Replaying kg_merge downstream events for completed stage %s kg_embedding_shards=%s",
+                event.log_context(),
+                len(next_events),
+            )
+            return next_events
+        except Exception:
+            logger.exception(
+                "[Pipeline] Failed to replay downstream events for completed kg_merge stage %s",
+                event.log_context(),
+            )
+            raise
 
     async def _handle_failure(
         self, event: PipelineStageEvent, exc: BaseException

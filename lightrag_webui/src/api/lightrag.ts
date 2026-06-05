@@ -530,11 +530,15 @@ export const scanNewDocuments = async (): Promise<ScanResponse> => {
   return response.data
 }
 
-export const reprocessFailedDocuments = async (): Promise<ReprocessFailedResponse> => {
+export const reprocessFailedDocuments = async (docIds?: string[]): Promise<ReprocessFailedResponse> => {
   const workspaceId = getSelectedWorkspaceId()
-  const response = await axiosInstance.post('/documents/reprocess_failed', null, {
-    params: { workspace_id: workspaceId }
-  })
+  const response = await axiosInstance.post(
+    '/documents/reprocess_failed',
+    docIds ? { doc_ids: docIds } : null,
+    {
+      params: { workspace_id: workspaceId }
+    }
+  )
   return response.data
 }
 
@@ -1124,5 +1128,123 @@ export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> =
 
 export const getWorkspaces = async (): Promise<WorkspacesResponse> => {
   const response = await axiosInstance.get('/workspaces')
+  return response.data
+}
+
+export type PipelineStageRunResponse = {
+  run_id: string
+  stage: string
+  shard_index: number
+  shard_count: number
+  workspace_id: string
+  doc_id: string
+  document_name: string | null
+  status: 'running' | 'paused' | 'done' | 'failed'
+  attempt: number
+  error_json: any | null
+  started_at: string | null
+  completed_at: string | null
+  updated_at: string
+}
+
+export type PipelineStageRunsRequest = {
+  workspace_id?: string
+  stage?: string | null
+  status?: string[] | null
+  search?: string | null
+  page: number
+  page_size: number
+}
+
+export type PaginatedPipelineStageRunsResponse = {
+  runs: PipelineStageRunResponse[]
+  total: number
+  page: number
+  page_size: number
+  status_matrix: Record<string, Record<string, number>>
+}
+
+export const getPipelineStageRuns = async (
+  request: PipelineStageRunsRequest
+): Promise<PaginatedPipelineStageRunsResponse> => {
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/stage_runs', {
+    ...request,
+    workspace_id: request.workspace_id ?? workspaceId
+  })
+  return response.data
+}
+
+export const getAllWorkspacesPipelineStageRuns = async (
+  request: PipelineStageRunsRequest
+): Promise<PaginatedPipelineStageRunsResponse> => {
+  const response = await axiosInstance.post('/documents/stage_runs/all', {
+    ...request
+  })
+  return response.data
+}
+
+export const approveStage = async (
+  runId: string,
+  stage: string,
+  shardIndex: number,
+  workspaceId?: string
+): Promise<any> => {
+  const resolvedWorkspaceId = workspaceId || getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/approve_stage', {
+    run_id: runId,
+    stage: stage,
+    shard_index: shardIndex,
+    workspace_id: resolvedWorkspaceId
+  })
+  return response.data
+}
+
+export const bulkApproveStage = async (stage: string, workspaceId?: string): Promise<any> => {
+  const resolvedWorkspaceId = workspaceId || getSelectedWorkspaceId()
+  const response = await axiosInstance.post('/documents/bulk_approve_stage', {
+    stage,
+    workspace_id: resolvedWorkspaceId
+  })
+  return response.data
+}
+
+export type StageSpeedEntry = {
+  stage: string
+  docs_completed_1m: number
+  docs_completed_5m: number
+  avg_duration_seconds: number | null
+}
+
+export const getStageSpeed = async (): Promise<StageSpeedEntry[]> => {
+  const workspaceId = getSelectedWorkspaceId()
+  const response = await axiosInstance.get('/documents/stage_speed', {
+    params: { workspace_id: workspaceId }
+  })
+  return response.data
+}
+
+export type PipelineConfig = {
+  entity_extraction_model: string
+  entity_extraction_host: string
+  entity_extraction_api_key?: string
+  paused_stages: string
+}
+
+export type PipelineConfigUpdate = {
+  entity_extraction_model?: string
+  entity_extraction_host?: string
+  entity_extraction_api_key?: string
+  paused_stages?: string
+  restart_workers?: boolean
+}
+
+export const getPipelineConfig = async (): Promise<PipelineConfig> => {
+  const response = await axiosInstance.get('/documents/pipeline_config')
+  return response.data
+}
+
+export const updatePipelineConfig = async (config: PipelineConfigUpdate): Promise<any> => {
+  const response = await axiosInstance.post('/documents/pipeline_config', config)
   return response.data
 }

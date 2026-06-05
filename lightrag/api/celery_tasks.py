@@ -100,7 +100,7 @@ def task_extract_and_enqueue(self, workspace_id: str, file_path_str: str, track_
     """
     Celery Task 1 – OCR & Markdown Extraction.
 
-    Picks up a file from disk, runs DeepSeek/Docling to produce Markdown text,
+    Picks up a file from disk, runs MinerU/Docling to produce Markdown text,
     and writes a PENDING doc_status record. Then automatically triggers
     task_chunk_and_graph to do the heavy graph work.
     """
@@ -203,19 +203,19 @@ def task_execute_query(self, workspace_id: str, query_text: str, query_params: d
 # ---------------------------------------------------------------------------
 
 @celery_app.task(name="lightrag.api.lightrag_server.apipeline_process_enqueue_documents_task", bind=True, max_retries=1, default_retry_delay=30)
-def apipeline_process_enqueue_documents_task(self, workspace_id: str, reprocess_failed: bool = False):
+def apipeline_process_enqueue_documents_task(self, workspace_id: str, reprocess_failed: bool = False, doc_ids: list[str] | None = None):
     """
     Celery task to process/enqueue documents for a specific workspace.
     """
     from lightrag.kg.shared_storage import initialize_share_data
     initialize_share_data()
     
-    logger.info(f"[Celery/Pipeline] Starting for workspace={workspace_id} (reprocess_failed={reprocess_failed})")
+    logger.info(f"[Celery/Pipeline] Starting for workspace={workspace_id} (reprocess_failed={reprocess_failed}, doc_ids={doc_ids})")
 
     async def _run():
         rag = await _get_rag(workspace_id)
-        # Use our modified apipeline_process_enqueue_documents that supports reprocess_failed
-        await rag.apipeline_process_enqueue_documents(reprocess_failed=reprocess_failed)
+        # Use our modified apipeline_process_enqueue_documents that supports reprocess_failed and doc_ids
+        await rag.apipeline_process_enqueue_documents(reprocess_failed=reprocess_failed, doc_ids=doc_ids)
 
     try:
         _run_async(_run())

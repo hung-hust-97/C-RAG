@@ -946,6 +946,19 @@ class DocStatusStorage(BaseKVStorage, ABC):
             tuple[bool, str | None]: (is_duplicate, existing_doc_id)
         """
 
+    @abstractmethod
+    async def get_processing_throughput(self) -> dict[str, float]:
+        """Get document processing throughput metrics (e.g. docs per minute, hour, 24h)
+
+        Returns:
+            Dictionary containing throughput metrics like:
+            {
+                "docs_per_minute": float,
+                "docs_per_hour": float,
+                "total_24h": int
+            }
+        """
+
 class StoragesStatus(str, Enum):
     """Storages status"""
 

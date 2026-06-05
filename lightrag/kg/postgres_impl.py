@@ -2304,6 +2304,67 @@ class PGDocStatusStorage(DocStatusStorage):
             # Return empty dict on error
             return {}
 
+    async def get_processing_throughput(self) -> dict[str, float]:
+        """Get recent processed-document throughput for the current workspace."""
+        try:
+            sql = """
+                WITH completed_docs AS (
+                    SELECT update_time AS completed_at
+                    FROM "tbl_document"
+                    WHERE workspace_id=$1 AND status='PROCESSED'
+                    UNION ALL
+                    SELECT updated_at AS completed_at
+                    FROM "tbl_legal_document"
+                    WHERE workspace_id=$1
+                      AND COALESCE(process_status, 'EXTRACTED')='PROCESSED'
+                )
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE completed_at >= NOW() - INTERVAL '1 minute'
+                    )::float AS docs_per_minute,
+                    COUNT(*) FILTER (
+                        WHERE completed_at >= NOW() - INTERVAL '1 hour'
+                    )::float AS docs_per_hour,
+                    COUNT(*) FILTER (
+                        WHERE completed_at >= NOW() - INTERVAL '24 hours'
+                    )::float AS total_24h
+                FROM completed_docs
+            """
+            result = await asyncio.wait_for(
+                self.db.query(sql, [to_uuid(self.workspace)]),
+                timeout=10.0,
+            )
+            if not result:
+                return {
+                    "docs_per_minute": 0.0,
+                    "docs_per_hour": 0.0,
+                    "total_24h": 0.0,
+                }
+
+            return {
+                "docs_per_minute": float(result.get("docs_per_minute") or 0.0),
+                "docs_per_hour": float(result.get("docs_per_hour") or 0.0),
+                "total_24h": float(result.get("total_24h") or 0.0),
+            }
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[{self.workspace}] Timeout getting processing throughput after 10s"
+            )
+            return {
+                "docs_per_minute": 0.0,
+                "docs_per_hour": 0.0,
+                "total_24h": 0.0,
+            }
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error getting processing throughput: {e}"
+            )
+            return {
+                "docs_per_minute": 0.0,
+                "docs_per_hour": 0.0,
+                "total_24h": 0.0,
+            }
+
     async def index_done_callback(self) -> None:
         # PG handles persistence automatically
         pass

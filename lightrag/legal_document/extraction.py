@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
@@ -88,6 +89,51 @@ def _truncate_text_by_tokens(tokenizer: Tokenizer, text: str, max_tokens: int) -
     return tokenizer.decode(encoded[:max_tokens]).strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_optional(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_reserved_output_tokens() -> int:
+    for env_name in (
+        "OPENAI_LLM_MAX_COMPLETION_TOKENS_EXTRACT",
+        "OPENAI_LLM_MAX_TOKENS_EXTRACT",
+        "OPENAI_LLM_DEFAULT_MAX_COMPLETION_TOKENS_EXTRACT",
+        "OPENAI_LLM_DEFAULT_MAX_TOKENS_EXTRACT",
+    ):
+        value = _env_int_optional(env_name)
+        if value is not None and value > 0:
+            return value
+    return 2048
+
+
+def _legal_cross_chunk_input_token_limit(
+    global_config: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    configured_input_limit = int(global_config.get("max_extract_input_tokens", 15500))
+    context_limit = max(1, _env_int("LLM_EXTRACT_MODEL_CONTEXT_TOKENS", 16384))
+    safety_margin = max(0, _env_int("LLM_EXTRACT_CONTEXT_SAFETY_MARGIN", 512))
+    min_output_tokens = max(1, _env_int("ENTITY_EXTRACTION_MIN_OUTPUT_TOKENS", 512))
+    reserved_output_tokens = max(min_output_tokens, _extract_reserved_output_tokens())
+    input_limit = min(
+        configured_input_limit,
+        context_limit - safety_margin - reserved_output_tokens,
+    )
+    return input_limit, context_limit, reserved_output_tokens, safety_margin
+
+
 def _legal_article_group_key(chunk: dict[str, Any]) -> tuple[str, str] | None:
     context = chunk.get("context", {}) if isinstance(chunk, dict) else {}
     article = (context.get("article") or "").strip()
@@ -143,7 +189,12 @@ async def extract_legal_cross_chunk_relations(
     language = global_config.get("addon_params", {}).get(
         "language", DEFAULT_SUMMARY_LANGUAGE
     )
-    max_input_tokens = int(global_config.get("max_extract_input_tokens", 20480))
+    (
+        max_input_tokens,
+        context_limit,
+        reserved_output_tokens,
+        context_safety_margin,
+    ) = _legal_cross_chunk_input_token_limit(global_config)
     all_edges: list[dict] = []
 
     for (chapter, article), group_chunk_ids in article_groups.items():
@@ -172,24 +223,52 @@ async def extract_legal_cross_chunk_relations(
 
         group_source_id = GRAPH_FIELD_SEP.join(group_chunk_ids)
         context_label = " > ".join(part for part in [chapter, article] if part)
-        chunk_sections = []
-        for chunk_id in group_chunk_ids:
-            chunk = chunks[chunk_id]
-            chunk_content = _truncate_text_by_tokens(
-                tokenizer, chunk.get("content", ""), 500
-            )
-            chunk_entity_names = ", ".join(sorted(entities_by_chunk[chunk_id].keys()))
-            chunk_sections.append(
-                f"Chunk ID: {chunk_id}\nEntities in this chunk: {chunk_entity_names}\nContent:\n{chunk_content}"
-            )
-
         system_prompt = f"""You are a Legal Knowledge Graph Specialist.
 Infer only cross-chunk legal relationships that are directly supported by the supplied chunks.
 You must not create new entities. Relation endpoints must be chosen from the existing entity list.
 Use directed legal relationships and keep keywords in English.
 Write descriptions in {language}.
 """
-        user_prompt = f"""Legal section: {context_label}
+        if max_input_tokens < 1:
+            logger.warning(
+                "Skipping legal cross-chunk relation pass for %s: no input "
+                "budget left after reserving output tokens "
+                "(context_limit=%s, reserved_output=%s, safety_margin=%s)",
+                context_label,
+                context_limit,
+                reserved_output_tokens,
+                context_safety_margin,
+            )
+            continue
+
+        content_token_budget = max(
+            1, _env_int("LEGAL_CROSS_CHUNK_CONTENT_TOKENS", 500)
+        )
+        min_content_token_budget = max(
+            1,
+            min(
+                content_token_budget,
+                _env_int("LEGAL_CROSS_CHUNK_MIN_CONTENT_TOKENS", 80),
+            ),
+        )
+
+        def _build_cross_chunk_user_prompt(chunk_content_tokens: int) -> tuple[str, int]:
+            chunk_sections = []
+            for chunk_id in group_chunk_ids:
+                chunk = chunks[chunk_id]
+                chunk_content = _truncate_text_by_tokens(
+                    tokenizer, chunk.get("content", ""), chunk_content_tokens
+                )
+                chunk_entity_names = ", ".join(
+                    sorted(entities_by_chunk[chunk_id].keys())
+                )
+                chunk_sections.append(
+                    f"Chunk ID: {chunk_id}\n"
+                    f"Entities in this chunk: {chunk_entity_names}\n"
+                    f"Content:\n{chunk_content}"
+                )
+
+            prompt = f"""Legal section: {context_label}
 
 Existing entities:
 {json.dumps(entity_names, ensure_ascii=False)}
@@ -201,12 +280,53 @@ Return only relationships connecting existing entities, preferably when the evid
 Each relation must include source_ids containing the chunk IDs that support it.
 Use keywords such as APPLIES_TO, PENALIZED_BY, REGULATED_BY, HAS_OBLIGATION, HAS_RIGHT, IS_CONDITION_FOR, REPLACES, MODIFIES.
 """
-        prompt_tokens = len(tokenizer.encode(system_prompt + user_prompt))
+            prompt_tokens = len(tokenizer.encode(system_prompt + prompt))
+            return prompt, prompt_tokens
+
+        user_prompt, prompt_tokens = _build_cross_chunk_user_prompt(
+            content_token_budget
+        )
+        while (
+            prompt_tokens > max_input_tokens
+            and content_token_budget > min_content_token_budget
+        ):
+            next_budget = int(
+                content_token_budget * max_input_tokens / max(prompt_tokens, 1) * 0.9
+            )
+            if next_budget >= content_token_budget:
+                next_budget = content_token_budget - 25
+            content_token_budget = max(min_content_token_budget, next_budget)
+            user_prompt, prompt_tokens = _build_cross_chunk_user_prompt(
+                content_token_budget
+            )
+
         if prompt_tokens > max_input_tokens:
             logger.warning(
-                f"Skipping legal cross-chunk relation pass for {context_label}: input tokens {prompt_tokens} > {max_input_tokens}"
+                "Skipping legal cross-chunk relation pass for %s: input tokens "
+                "%s > %s after shrinking chunk content to %s tokens "
+                "(context_limit=%s, reserved_output=%s, safety_margin=%s)",
+                context_label,
+                prompt_tokens,
+                max_input_tokens,
+                content_token_budget,
+                context_limit,
+                reserved_output_tokens,
+                context_safety_margin,
             )
             continue
+        if content_token_budget < _env_int("LEGAL_CROSS_CHUNK_CONTENT_TOKENS", 500):
+            logger.warning(
+                "Reduced legal cross-chunk relation context for %s to %s tokens "
+                "per chunk (input_tokens=%s, input_limit=%s, context_limit=%s, "
+                "reserved_output=%s, safety_margin=%s)",
+                context_label,
+                content_token_budget,
+                prompt_tokens,
+                max_input_tokens,
+                context_limit,
+                reserved_output_tokens,
+                context_safety_margin,
+            )
 
         cache_keys_collector: list[str] = []
         doc_ids = sorted(

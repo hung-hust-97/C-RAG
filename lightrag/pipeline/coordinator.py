@@ -11,6 +11,8 @@ from lightrag.utils import logger
 
 from .models import ArtifactRef, PipelineError, PipelineStageEvent, StageName, utc_now_iso
 
+MAX_STAGE_RETRY_ATTEMPTS_DEFAULT = 3
+
 
 class ClaimStatus(str, Enum):
     ACQUIRED = "acquired"
@@ -73,6 +75,9 @@ class PipelineCoordinator:
     async def finalize(self) -> None:
         pass
 
+    async def register_paused(self, event: PipelineStageEvent) -> None:
+        raise NotImplementedError
+
 
 class InMemoryPipelineCoordinator(PipelineCoordinator):
     def __init__(self) -> None:
@@ -81,6 +86,7 @@ class InMemoryPipelineCoordinator(PipelineCoordinator):
 
     async def claim(self, event: PipelineStageEvent) -> ClaimResult:
         key = _stage_key(event.run_id, event.stage_name, event.shard_index)
+        max_attempts = int(os.getenv("PIPELINE_MAX_STAGE_RETRY_ATTEMPTS", str(MAX_STAGE_RETRY_ATTEMPTS_DEFAULT)))
         async with self._lock:
             record = self._records.get(key)
             if record:
@@ -89,8 +95,21 @@ class InMemoryPipelineCoordinator(PipelineCoordinator):
                     return ClaimResult(ClaimStatus.ALREADY_COMPLETED)
                 if status == "running":
                     return ClaimResult(ClaimStatus.ALREADY_RUNNING)
-                if status == "failed" and event.attempt <= record.get("attempt", 0):
-                    return ClaimResult(ClaimStatus.FAILED_ATTEMPT_RECORDED)
+                if status == "failed":
+                    recorded_attempt = record.get("attempt", 0)
+                    if recorded_attempt >= max_attempts:
+                        return ClaimResult(
+                            ClaimStatus.FAILED_ATTEMPT_RECORDED,
+                            f"max retries ({max_attempts}) exhausted at attempt={recorded_attempt}",
+                        )
+                    logger.info(
+                        "[Pipeline] Auto-retrying failed stage run_id=%s stage=%s attempt=%s/%s",
+                        event.run_id,
+                        StageName(event.stage_name).value if isinstance(event.stage_name, str) else event.stage_name.value,
+                        recorded_attempt + 1,
+                        max_attempts,
+                    )
+                    # Fall through to update record with incremented attempt
 
             self._records[key] = {
                 "status": "running",
@@ -108,6 +127,25 @@ class InMemoryPipelineCoordinator(PipelineCoordinator):
                 "error": None,
             }
             return ClaimResult(ClaimStatus.ACQUIRED)
+
+    async def register_paused(self, event: PipelineStageEvent) -> None:
+        key = _stage_key(event.run_id, event.stage_name, event.shard_index)
+        async with self._lock:
+            self._records[key] = {
+                "status": "paused",
+                "run_id": event.run_id,
+                "stage": event.stage_name.value,
+                "shard_index": event.shard_index,
+                "shard_count": event.shard_count,
+                "attempt": event.attempt,
+                "workspace_id": event.workspace_id,
+                "doc_id": event.doc_id,
+                "event": event.model_dump(mode="json"),
+                "artifacts": [],
+                "started_at": utc_now_iso(),
+                "completed_at": None,
+                "error": None,
+            }
 
     async def complete(
         self, event: PipelineStageEvent, artifacts: list[ArtifactRef]
@@ -274,6 +312,16 @@ class PostgresPipelineCoordinator(PipelineCoordinator):
             )
             """
             await db.execute(sql)
+            # Performance index for COUNT/GROUP BY queries used by
+            # are_stages_complete(), get_stage_outputs(), and gap analysis.
+            idx_sql = f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.table_name}_status
+            ON {self.table_name} (run_id, stage, status);
+            """
+            try:
+                await db.execute(idx_sql)
+            except Exception:
+                logger.warning("[Pipeline] Failed to create performance index (may already exist)")
             self._initialized = True
 
     async def claim(self, event: PipelineStageEvent) -> ClaimResult:
@@ -312,8 +360,26 @@ class PostgresPipelineCoordinator(PipelineCoordinator):
                             age_seconds,
                             self.running_stale_seconds,
                         )
-                    if status == "failed" and event.attempt <= int(row["attempt"]):
-                        return ClaimResult(ClaimStatus.FAILED_ATTEMPT_RECORDED)
+                    if status == "failed":
+                        recorded_attempt = int(row["attempt"])
+                        max_attempts = int(os.getenv(
+                            "PIPELINE_MAX_STAGE_RETRY_ATTEMPTS",
+                            str(MAX_STAGE_RETRY_ATTEMPTS_DEFAULT),
+                        ))
+                        if recorded_attempt >= max_attempts:
+                            return ClaimResult(
+                                ClaimStatus.FAILED_ATTEMPT_RECORDED,
+                                f"max retries ({max_attempts}) exhausted at attempt={recorded_attempt}",
+                            )
+                        logger.info(
+                            "[Pipeline] Auto-retrying failed stage run_id=%s stage=%s shard=%s attempt=%s/%s",
+                            event.run_id,
+                            event.stage_name.value,
+                            event.shard_index,
+                            recorded_attempt + 1,
+                            max_attempts,
+                        )
+                        # Fall through to UPDATE below
                     await conn.execute(
                         f"""
                         UPDATE {self.table_name}
@@ -349,6 +415,31 @@ class PostgresPipelineCoordinator(PipelineCoordinator):
                     json.dumps(event.model_dump(mode="json"), ensure_ascii=False),
                 )
                 return ClaimResult(ClaimStatus.ACQUIRED)
+
+    async def register_paused(self, event: PipelineStageEvent) -> None:
+        await self._ensure_schema()
+        db = await self._db()
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                INSERT INTO {self.table_name}
+                    (run_id, stage, shard_index, shard_count, workspace_id, doc_id,
+                     status, attempt, event_json, artifacts_json, started_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, 'paused', $7, $8::jsonb,
+                        '[]'::jsonb, NOW(), NOW())
+                ON CONFLICT (run_id, stage, shard_index)
+                DO UPDATE SET status='paused', attempt=EXCLUDED.attempt,
+                    event_json=EXCLUDED.event_json, updated_at=NOW()
+                """,
+                event.run_id,
+                event.stage_name.value,
+                event.shard_index,
+                event.shard_count,
+                event.workspace_id,
+                event.doc_id,
+                event.attempt,
+                json.dumps(event.model_dump(mode="json"), ensure_ascii=False),
+            )
 
     async def complete(
         self, event: PipelineStageEvent, artifacts: list[ArtifactRef]

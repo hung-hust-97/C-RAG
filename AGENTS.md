@@ -289,11 +289,11 @@ UPLOADING → EXTRACTING → EXTRACTED → CHUNKING → PROCESSED
 
 **Extraction Strategy & Fallback Logic:**
 - **PDF & Images (.pdf, .jpg, .png, etc.)**:
-  - **Priority**: Direct DeepSeek OCR (Full document). Skip Docling and Hybrid mode for optimal speed on CPU.
-  - **Failure Handling**: If DeepSeek OCR fails or returns no content, the status is set to `FAILED` immediately. No fallback to local Tesseract/pypdf to avoid low-quality results and heavy CPU usage.
+  - **Priority**: MinerU OCR (Full document).
+  - **Failure Handling**: If MinerU OCR fails or returns no content, the status is set to `FAILED` immediately. DeepSeek OCR is deprecated. No fallback to local Tesseract/pypdf to avoid low-quality results and heavy CPU usage.
 - **Office Formats (.docx, .pptx, .xlsx)**:
   - **Primary**: Docling (Local structural extraction).
-  - **Fallback**: If Docling fails or returns no content, fallback to DeepSeek OCR.
+  - **Fallback**: If Docling fails or returns no content, fallback to MinerU OCR.
   - **Failure Handling**: If both Docling and OCR fail, the status is set to `FAILED`.
 - **General Rules**:
   - Extraction runs on **CPU** by default (GPU not required for current worker deployment).

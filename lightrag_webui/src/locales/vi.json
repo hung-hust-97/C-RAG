@@ -11,6 +11,7 @@
     "knowledgeGraph": "Đồ thị tri thức",
     "retrieval": "Truy xuất",
     "api": "API",
+    "monitor": "Giám sát",
     "projectRepository": "Kho dự án",
     "logout": "Đăng xuất",
     "frontendNeedsRebuild": "Giao diện cần được xây dựng lại",
@@ -475,5 +476,40 @@
     "prevPage": "Trang Trước",
     "nextPage": "Trang Tiếp",
     "lastPage": "Trang Cuối"
+  },
+  "monitorPanel": {
+    "title": "Giám Sát Tiến Trình",
+    "description": "Theo dõi và xử lý lại các bước xử lý tài liệu.",
+    "stage": "Giai đoạn",
+    "status": "Trạng thái",
+    "attempts": "Số lần thử",
+    "started": "Bắt đầu",
+    "duration": "Thời gian chạy",
+    "document": "Tài liệu",
+    "actions": "Hành động",
+    "reprocess": "Xử lý lại",
+    "viewError": "Xem lỗi",
+    "errorDetail": "Chi tiết lỗi",
+    "noStageRuns": "Không có tiến trình chạy nào khớp với bộ lọc.",
+    "reprocessSelected": "Xử lý lại mục đã chọn",
+    "reprocessAllFailed": "Xử lý lại tất cả lỗi",
+    "allStages": "Tất cả giai đoạn",
+    "allStatuses": "Tất cả trạng thái",
+    "searchPlaceholder": "Tìm kiếm tên tài liệu hoặc ID...",
+    "stageCountsTitle": "Bảng tóm tắt tiến trình",
+    "stageCard": {
+      "total": "Tổng số chạy",
+      "running": "Đang chạy",
+      "paused": "Tạm dừng",
+      "done": "Hoàn thành",
+      "failed": "Thất bại"
+    },
+    "paused": "Tạm dừng",
+    "approving": "Đang duyệt giai đoạn...",
+    "approveSuccess": "Giai đoạn đã được duyệt và tiếp tục thành công",
+    "approve": "Duyệt / Chạy tiếp",
+    "reprocessSuccess": "Yêu cầu xử lý lại đã được gửi thành công",
+    "reprocessFailed": "Gửi yêu cầu xử lý lại thất bại",
+    "close": "Đóng"
   }
 }

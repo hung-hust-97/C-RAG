@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from dataclasses import dataclass
 from typing import Any, final
 import configparser
@@ -179,6 +180,18 @@ class Neo4JStorage(BaseGraphStorage):
                     config.get("neo4j", "liveness_check_timeout", fallback=30.0),
                 ),
             )
+            INIT_MAX_RETRIES = int(
+                os.environ.get(
+                    "NEO4J_INIT_MAX_RETRIES",
+                    config.get("neo4j", "init_max_retries", fallback=12),
+                )
+            )
+            INIT_RETRY_DELAY_SECONDS = float(
+                os.environ.get(
+                    "NEO4J_INIT_RETRY_DELAY_SECONDS",
+                    config.get("neo4j", "init_retry_delay_seconds", fallback=5.0),
+                )
+            )
             KEEP_ALIVE = os.environ.get(
                 "NEO4J_KEEP_ALIVE",
                 config.get("neo4j", "keep_alive", fallback="true"),
@@ -206,20 +219,29 @@ class Neo4JStorage(BaseGraphStorage):
                 connected = False
 
                 try:
-                    async with self._driver.session(database=database) as session:
+                    for connect_attempt in range(1, INIT_MAX_RETRIES + 1):
                         try:
-                            result = await session.run("MATCH (n) RETURN n LIMIT 0")
-                            await result.consume()  # Ensure result is consumed
-                            logger.info(
-                                f"[{self.workspace}] Connected to {database} at {URI}"
-                            )
-                            connected = True
+                            async with self._driver.session(database=database) as session:
+                                result = await session.run("MATCH (n) RETURN n LIMIT 0")
+                                await result.consume()  # Ensure result is consumed
+                                logger.info(
+                                    f"[{self.workspace}] Connected to {database} at {URI}"
+                                )
+                                connected = True
+                                break
                         except neo4jExceptions.ServiceUnavailable as e:
-                            logger.error(
+                            if connect_attempt >= INIT_MAX_RETRIES:
+                                logger.error(
+                                    f"[{self.workspace}] "
+                                    + f"Database {database} at {URI} is not available after {connect_attempt} attempts"
+                                )
+                                raise e
+                            logger.warning(
                                 f"[{self.workspace}] "
-                                + f"Database {database} at {URI} is not available"
+                                + f"Database {database} at {URI} is not available "
+                                + f"(attempt {connect_attempt}/{INIT_MAX_RETRIES}); retrying in {INIT_RETRY_DELAY_SECONDS}s"
                             )
-                            raise e
+                            await asyncio.sleep(INIT_RETRY_DELAY_SECONDS)
                 except neo4jExceptions.AuthError as e:
                     logger.error(
                         f"[{self.workspace}] Authentication failed for {database} at {URI}"

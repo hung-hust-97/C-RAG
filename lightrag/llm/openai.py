@@ -1,6 +1,7 @@
 from ..utils import verbose_debug, VERBOSE_DEBUG
 import os
 import logging
+import re
 
 from collections.abc import AsyncIterator
 
@@ -78,6 +79,10 @@ class InvalidResponseError(Exception):
 
 # Module-level cache for tiktoken encodings
 _TIKTOKEN_ENCODING_CACHE: dict[str, Any] = {}
+_CONTEXT_LIMIT_RETRY_BUFFER = 1000
+_CONTEXT_LIMIT_LOW_HEADROOM = 50
+_CONTEXT_LIMIT_MIN_OUTPUT_TOKENS = 100
+_OPENAI_BAD_REQUEST_MAX_ATTEMPTS = 5
 
 
 def _content_to_text(content: Any) -> str:
@@ -160,6 +165,146 @@ def _get_tiktoken_encoding_for_model(model: str) -> Any:
             )
             _TIKTOKEN_ENCODING_CACHE[model] = tiktoken.get_encoding("cl100k_base")
     return _TIKTOKEN_ENCODING_CACHE[model]
+
+
+def _extract_context_limit_details(
+    error_text: str,
+) -> tuple[int, int | None, int | None] | None:
+    """Extract context window, input tokens, and requested output tokens from API errors."""
+    max_ctx_match = re.search(
+        r"maximum context length is\s*(\d+)", error_text, re.IGNORECASE
+    )
+    if not max_ctx_match:
+        return None
+
+    max_ctx = int(max_ctx_match.group(1))
+    input_tokens = None
+    requested_output_tokens = None
+
+    input_patterns = (
+        r"parameter\s*=\s*input_tokens\s*,\s*value\s*=\s*(\d+)",
+        r"['\"]?input[_\s-]?tokens['\"]?\s*[:=]\s*(\d+)",
+        r"prompt contains at least\s*(\d+)\s*input tokens",
+        r"prompt contains\s*(?:at least\s*)?(\d+)\s*tokens",
+    )
+    for pattern in input_patterns:
+        match = re.search(pattern, error_text, re.IGNORECASE)
+        if match:
+            input_tokens = int(match.group(1))
+            break
+
+    output_match = re.search(
+        r"requested\s*(\d+)\s*output tokens", error_text, re.IGNORECASE
+    )
+    if output_match:
+        requested_output_tokens = int(output_match.group(1))
+
+    return max_ctx, input_tokens, requested_output_tokens
+
+
+def _estimate_chat_input_tokens(model: str, messages: list[dict[str, Any]]) -> int:
+    """Estimate chat prompt tokens when the backend error does not report them."""
+    try:
+        encoding = _get_tiktoken_encoding_for_model(model)
+        return (
+            sum(
+                len(encoding.encode(_content_to_text(msg.get("content"))))
+                for msg in messages
+            )
+            + len(messages) * 4
+            + 2
+        )
+    except Exception:
+        return (
+            sum(len(_content_to_text(msg.get("content"))) for msg in messages) // 4
+        )
+
+
+def _current_output_token_request(
+    kwargs: dict[str, Any], requested_output_tokens: int | None
+) -> int | None:
+    values: list[int] = []
+    for key in ("max_completion_tokens", "max_tokens"):
+        value = kwargs.get(key)
+        if value is None:
+            continue
+        try:
+            values.append(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    if requested_output_tokens is not None:
+        values.append(requested_output_tokens)
+
+    return max(values) if values else None
+
+
+def _cap_context_limit_output_tokens(
+    error_text: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    kwargs: dict[str, Any],
+    context_retry_count: int = 1,
+) -> tuple[bool, int | None, int | None, int | None]:
+    """Mutate OpenAI token kwargs to fit the reported context window."""
+    details = _extract_context_limit_details(error_text)
+    if not details:
+        return False, None, None, None
+
+    max_ctx, reported_input_tokens, requested_output_tokens = details
+    estimated_input_tokens = _estimate_chat_input_tokens(model, messages)
+    input_tokens = max(
+        token_count
+        for token_count in (reported_input_tokens, estimated_input_tokens)
+        if token_count is not None
+    )
+
+    safe_output_tokens = max_ctx - input_tokens - _CONTEXT_LIMIT_RETRY_BUFFER
+    if safe_output_tokens < _CONTEXT_LIMIT_MIN_OUTPUT_TOKENS:
+        safe_output_tokens = max_ctx - input_tokens - _CONTEXT_LIMIT_LOW_HEADROOM
+
+    current_output_tokens = _current_output_token_request(
+        kwargs, requested_output_tokens
+    )
+    if current_output_tokens is not None:
+        safe_output_tokens = min(safe_output_tokens, current_output_tokens - 1)
+        if (
+            context_retry_count > 1
+            and reported_input_tokens is not None
+            and requested_output_tokens is not None
+        ):
+            reported_total = reported_input_tokens + requested_output_tokens
+            if max_ctx <= reported_total <= max_ctx + 1:
+                safe_output_tokens = min(
+                    safe_output_tokens,
+                    max(
+                        current_output_tokens // 2,
+                        _CONTEXT_LIMIT_MIN_OUTPUT_TOKENS,
+                    ),
+                )
+
+    if safe_output_tokens <= 0:
+        return False, max_ctx, input_tokens, None
+
+    token_keys = [
+        key
+        for key in ("max_completion_tokens", "max_tokens")
+        if kwargs.get(key) is not None
+    ]
+    if not token_keys:
+        token_keys = ["max_tokens"]
+
+    for key in token_keys:
+        kwargs[key] = safe_output_tokens
+
+    return True, max_ctx, input_tokens, safe_output_tokens
+
+
+def _is_retryable_openai_bad_request_text(error_text: str) -> bool:
+    return (
+        "Conversation roles must alternate user/assistant" in error_text
+        or _extract_context_limit_details(error_text) is not None
+    )
 
 
 def create_openai_async_client(
@@ -394,36 +539,74 @@ async def openai_complete_if_cache(
     api_model = azure_deployment if use_azure and azure_deployment else model
 
     try:
-        # Don't use async with context manager, use client directly
-        if "response_format" in kwargs:
-            response = await openai_async_client.chat.completions.parse(
-                model=api_model, messages=messages, **kwargs
-            )
-        else:
-            response = await openai_async_client.chat.completions.create(
-                model=api_model, messages=messages, **kwargs
-            )
-    except BadRequestError as e:
-        error_text = str(e)
-        if "Conversation roles must alternate user/assistant" in error_text:
-            logger.warning(
-                "OpenAI-compatible backend requires alternating roles; retrying with normalized messages"
-            )
-            normalized_messages = _normalize_messages_for_alternating_roles(messages)
-            if "response_format" in kwargs:
-                response = await openai_async_client.chat.completions.parse(
-                    model=api_model, messages=normalized_messages, **kwargs
+        # Prepare retry loop
+        attempt = 0
+        max_attempts = _OPENAI_BAD_REQUEST_MAX_ATTEMPTS
+        context_limit_retry_count = 0
+        response = None
+        while attempt < max_attempts:
+            try:
+                # Don't use async with context manager, use client directly
+                if "response_format" in kwargs:
+                    response = await openai_async_client.chat.completions.parse(
+                        model=api_model, messages=messages, **kwargs
+                    )
+                else:
+                    response = await openai_async_client.chat.completions.create(
+                        model=api_model, messages=messages, **kwargs
+                    )
+                break
+            except Exception as e:
+                if isinstance(e, (APITimeoutError, APIConnectionError, RateLimitError)):
+                    raise
+
+                attempt += 1
+                error_text = str(e)
+                if not (
+                    isinstance(e, BadRequestError)
+                    or _is_retryable_openai_bad_request_text(error_text)
+                ):
+                    raise
+
+                if "Conversation roles must alternate user/assistant" in error_text:
+                    if attempt >= max_attempts:
+                        logger.error(
+                            f"OpenAI API Call Failed (Alternating roles fallback failed),\nModel: {model},\nParams: {kwargs}, Got: {e}"
+                        )
+                        await openai_async_client.close()
+                        raise
+                    logger.warning(
+                        "OpenAI-compatible backend requires alternating roles; retrying with normalized messages"
+                    )
+                    messages = _normalize_messages_for_alternating_roles(messages)
+                    continue
+
+                if attempt < max_attempts:
+                    (
+                        retry_context_limit,
+                        max_ctx,
+                        input_tokens,
+                        safe_output_tokens,
+                    ) = _cap_context_limit_output_tokens(
+                        error_text,
+                        model,
+                        messages,
+                        kwargs,
+                        context_retry_count=context_limit_retry_count + 1,
+                    )
+                    if retry_context_limit:
+                        context_limit_retry_count += 1
+                        logger.warning(
+                            f"OpenAI API request exceeded context length. Model max: {max_ctx}, Input tokens: {input_tokens}. "
+                            f"Reducing requested output tokens to {safe_output_tokens} and retrying."
+                        )
+                        continue
+
+                logger.error(
+                    f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}"
                 )
-            else:
-                response = await openai_async_client.chat.completions.create(
-                    model=api_model, messages=normalized_messages, **kwargs
-                )
-        else:
-            logger.error(
-                f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}"
-            )
-            await openai_async_client.close()
-            raise
+                await openai_async_client.close()
+                raise
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
         await openai_async_client.close()  # Ensure client is closed

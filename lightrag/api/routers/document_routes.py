@@ -994,7 +994,7 @@ class PipelineStageRunsRequest(BaseModel):
     status: Optional[list[str]] = Field(default=None, description="Filter by status list (e.g. ['running', 'failed'])")
     search: Optional[str] = Field(default=None, description="Search term for document title or ID")
     page: int = Field(default=1, ge=1, description="Page number")
-    page_size: int = Field(default=10, ge=1, le=100, description="Items per page")
+    page_size: int = Field(default=10, ge=1, le=500, description="Items per page")
 
 
 class PipelineStageRunResponse(BaseModel):
@@ -4799,7 +4799,7 @@ def create_document_routes(
             
             # 1. Fetch status matrix (counts grouped by stage and status)
             matrix_sql = """
-                SELECT stage, status, COUNT(*) as cnt
+                SELECT stage, status, COUNT(DISTINCT run_id) as cnt
                 FROM lightrag_pipeline_stage_runs
                 WHERE workspace_id = $1
                 GROUP BY stage, status
@@ -4950,7 +4950,7 @@ def create_document_routes(
             
             # 1. Fetch status matrix (counts grouped by stage and status) across all workspaces
             matrix_sql = """
-                SELECT stage, status, COUNT(*) as cnt
+                SELECT stage, status, COUNT(DISTINCT run_id) as cnt
                 FROM lightrag_pipeline_stage_runs
                 GROUP BY stage, status
             """

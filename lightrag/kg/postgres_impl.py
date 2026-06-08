@@ -2785,15 +2785,11 @@ SQL_TEMPLATES = {
                                """,
     "get_by_id_relation_chunks": """
         SELECT $2::text || '<SEP>' || $3::text AS id, jsonb_agg(cr.chunk_id) AS chunk_ids
-        FROM tbl_chunk_relation cr
-        JOIN tbl_lightrag_relation r ON cr.relation_id = r.id
-        JOIN tbl_lightrag_entity e1 ON r.source_entity_id = e1.id
-        JOIN tbl_lightrag_entity e2 ON r.target_entity_id = e2.id
-        WHERE r.workspace_id = $1 
-          AND (
-            (e1.name = $2 AND e2.name = $3) OR 
-            (e1.name = $3 AND e2.name = $2)
-          )
+        FROM tbl_lightrag_entity e1
+        JOIN tbl_lightrag_entity e2 ON e2.workspace_id = $1 AND ((e1.name = $2 AND e2.name = $3) OR (e1.name = $3 AND e2.name = $2))
+        JOIN tbl_lightrag_relation r ON r.workspace_id = $1 AND r.source_entity_id = e1.id AND r.target_entity_id = e2.id
+        JOIN tbl_chunk_relation cr ON cr.relation_id = r.id
+        WHERE e1.workspace_id = $1
     """,
     "get_by_ids_full_docs": """SELECT document_id AS id, COALESCE(content_summary, '') AS content,
                                  COALESCE(document_name, '') AS file_path

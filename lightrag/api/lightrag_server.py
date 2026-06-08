@@ -71,14 +71,25 @@ except ImportError:
     celery_app = None
     logger.warning("Celery worker module not available, async processing disabled")
 
-async def monkeypatch_apipeline_process_enqueue_documents(self, reprocess_failed=False):
+async def monkeypatch_apipeline_process_enqueue_documents(
+    self,
+    split_by_character=None,
+    split_by_character_only=False,
+    reprocess_failed=False,
+    task_id=None,
+    doc_ids=None,
+):
     """
     Monkeypatch for LightRAG.apipeline_process_enqueue_documents to use Celery.
     """
     if CELERY_AVAILABLE and celery_app is not None:
         celery_app.send_task(
             "lightrag.api.lightrag_server.apipeline_process_enqueue_documents_task",
-            args=[self.workspace, reprocess_failed]
+            kwargs={
+                "workspace_id": self.workspace,
+                "reprocess_failed": reprocess_failed,
+                "doc_ids": doc_ids,
+            },
         )
         return True
     else:

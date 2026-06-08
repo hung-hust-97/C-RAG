@@ -30,6 +30,7 @@ class CitationMetadata:
     citation_id: int  # Sequential ID: 1, 2, 3, ...
     doc_id: str  # Document ID (e.g., "doc-550e8400-e29b-41d4-a716-446655440000")
     chunk_id: Optional[str] = None  # Chunk ID (for chunks)
+    reference_id: Optional[str] = None  # Document reference ID (e.g., "1", "2")
     
     # Document classification
     doc_type: Literal["LEGAL", "GENERAL"] = "GENERAL"  # Document type (uppercase)
@@ -668,6 +669,22 @@ class CitationTracker:
         """
         return self._citations.get(citation_id)
     
+    def get_citation_by_chunk_id(self, doc_id: str, chunk_id: str) -> Optional[CitationMetadata]:
+        """Retrieve citation metadata by doc_id and chunk_id.
+        
+        Args:
+            doc_id: Document identifier
+            chunk_id: Chunk identifier
+            
+        Returns:
+            CitationMetadata if found, None otherwise
+        """
+        dedup_key = (doc_id, chunk_id)
+        if dedup_key in self._chunk_index:
+            cid = self._chunk_index[dedup_key]
+            return self._citations.get(cid)
+        return None
+    
     def get_all_citations(self) -> List[CitationMetadata]:
         """Retrieve all tracked citations in order of citation ID.
         
@@ -1174,8 +1191,19 @@ def validate_citation_ids(
         ids = [int(x) for x in match.group(1).split(',')]
         used_ids.update(ids)
     
-    # Get valid citation IDs from tracker
-    valid_ids = set(citation_tracker.get_all_citation_ids())
+    # Get valid citation IDs from tracker (reference_id for chunks, citation_id for others)
+    valid_ids = set()
+    for cit in citation_tracker.get_all_citations():
+        if cit.source_type == "chunk":
+            if cit.reference_id:
+                try:
+                    valid_ids.add(int(cit.reference_id))
+                except ValueError:
+                    pass
+            else:
+                valid_ids.add(cit.citation_id)
+        else:
+            valid_ids.add(cit.citation_id)
     
     # Find invalid IDs (used but not tracked)
     invalid_ids = used_ids - valid_ids
@@ -1461,6 +1489,120 @@ class CitationRenderer:
                 f"Replacing with [?] markers."
             )
             llm_response = sanitize_invalid_citations(llm_response, invalid_ids)
+        
+        # Step 1.5: Re-index valid citation IDs to start from 1 sequentially
+        pattern = r'\[(\d+(?:\s*,\s*\d+)*)\]'
+        used_ids = []
+        seen = set()
+        for match in re.finditer(pattern, llm_response):
+            ids = [int(x.strip()) for x in match.group(1).split(',')]
+            for old_id in ids:
+                if old_id not in seen:
+                    used_ids.append(old_id)
+                    seen.add(old_id)
+                    
+        def lookup_and_consolidate(old_id):
+            # 1. Check if any chunks have reference_id matching old_id
+            matching_cits = []
+            for c in self.tracker.get_all_citations():
+                if c.source_type == "chunk" and c.reference_id == str(old_id):
+                    matching_cits.append(c)
+            
+            if matching_cits:
+                title = self._get_document_title(matching_cits[0])
+                
+                chunk_refs = []
+                for c in matching_cits:
+                    ref = self._get_chunk_reference(c)
+                    if ref and ref not in chunk_refs:
+                        chunk_refs.append(ref)
+                combined_chunk_ref = ", ".join(chunk_refs)
+                
+                return CitationMetadata(
+                    citation_id=old_id,
+                    doc_id=matching_cits[0].doc_id,
+                    chunk_id=matching_cits[0].chunk_id,
+                    reference_id=str(old_id),
+                    doc_type=matching_cits[0].doc_type,
+                    source_type="chunk",
+                    workspace=matching_cits[0].workspace,
+                    file_path=matching_cits[0].file_path,
+                    hierarchy_path=[combined_chunk_ref] if combined_chunk_ref else [],
+                    relevance_score=max(c.relevance_score for c in matching_cits),
+                    content_preview=matching_cits[0].content_preview,
+                    legal_info=matching_cits[0].legal_info,
+                    formatted_ref=title,
+                    retrieved_at=matching_cits[0].retrieved_at,
+                )
+            else:
+                # 2. Check if it's an entity/relationship by citation_id
+                return self.tracker.get_citation(old_id)
+                    
+        # Sort used_ids based on citation_order
+        if self.citation_order == "relevance":
+            cits = []
+            for old_id in used_ids:
+                cit = lookup_and_consolidate(old_id)
+                if cit:
+                    cits.append(cit)
+            cits.sort(
+                key=lambda c: (
+                    -_legal_status_priority_for_citation(c),
+                    -c.relevance_score,
+                    c.citation_id,
+                )
+            )
+            ordered_used_ids = [c.citation_id for c in cits]
+        else: # appearance
+            ordered_used_ids = used_ids
+            
+        # Create mapping from old_id -> new_id
+        old_to_new = {old_id: i + 1 for i, old_id in enumerate(ordered_used_ids)}
+        
+        # Replace the citation markers in the response text using this mapping
+        if old_to_new:
+            def replace_ids(match):
+                ids = [int(x.strip()) for x in match.group(1).split(',')]
+                new_ids = [str(old_to_new[old_id]) for old_id in ids if old_id in old_to_new]
+                if not new_ids:
+                    return "[?]"
+                return f"[{','.join(new_ids)}]"
+            
+            llm_response = re.sub(pattern, replace_ids, llm_response)
+            
+            # Create a new re-indexed tracker
+            reindexed_tracker = CitationTracker()
+            for old_id in ordered_used_ids:
+                cit = lookup_and_consolidate(old_id)
+                if cit:
+                    cloned_cit = CitationMetadata(
+                        citation_id=old_to_new[old_id],
+                        doc_id=cit.doc_id,
+                        chunk_id=cit.chunk_id,
+                        reference_id=cit.reference_id,
+                        doc_type=cit.doc_type,
+                        source_type=cit.source_type,
+                        entity_name=cit.entity_name,
+                        relation_key=cit.relation_key,
+                        workspace=cit.workspace,
+                        file_path=cit.file_path,
+                        hierarchy_path=cit.hierarchy_path,
+                        relevance_score=cit.relevance_score,
+                        content_preview=cit.content_preview,
+                        legal_info=cit.legal_info,
+                        formatted_ref=cit.formatted_ref,
+                        retrieved_at=cit.retrieved_at,
+                    )
+                    reindexed_tracker._citations[cloned_cit.citation_id] = cloned_cit
+                    if cloned_cit.source_type == "chunk":
+                        reindexed_tracker._chunk_index[(cloned_cit.doc_id, cloned_cit.chunk_id)] = cloned_cit.citation_id
+                    elif cloned_cit.source_type == "entity":
+                        reindexed_tracker._entity_index[(cloned_cit.entity_name, cloned_cit.workspace)] = cloned_cit.citation_id
+                    elif cloned_cit.source_type == "relation":
+                        reindexed_tracker._relation_index[(cloned_cit.relation_key, cloned_cit.workspace)] = cloned_cit.citation_id
+            
+            # Swap with reindexed tracker
+            self.tracker = reindexed_tracker
         
         # Step 2: Aggregate consecutive citation markers
         llm_response = self._aggregate_citation_markers(llm_response)

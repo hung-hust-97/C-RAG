@@ -254,7 +254,7 @@ class PostgresPipelineCoordinator(PipelineCoordinator):
         self._initialized = False
         self._init_lock = asyncio.Lock()
         self.running_stale_seconds = int(
-            os.getenv("PIPELINE_STAGE_RUNNING_STALE_SECONDS", "120")
+            os.getenv("PIPELINE_STAGE_RUNNING_STALE_SECONDS", "10800")
         )
         self._db_instance = None
         self._db_lock = asyncio.Lock()

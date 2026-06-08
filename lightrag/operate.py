@@ -2013,6 +2013,10 @@ async def _merge_nodes_then_upsert(
     return node_data, full_source_ids, data_for_vdb
 
 
+def _empty_edge_merge_result():
+    return None, None, None, [], {}, [], []
+
+
 async def _merge_edges_then_upsert(
     src_id: str,
     tgt_id: str,
@@ -2038,7 +2042,8 @@ async def _merge_edges_then_upsert(
     edge_vdb_delete_ids = []
     added_entities = []
     if src_id == tgt_id:
-        return None
+        logger.warning(f"Skipping self-loop relation `{src_id}`~`{tgt_id}`")
+        return _empty_edge_merge_result()
 
     already_weights = []
     already_source_ids = []
@@ -2147,7 +2152,18 @@ async def _merge_edges_then_upsert(
                 f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks  {already_source_ids}/{len(full_source_ids)}"
             )
             existing_edge_data = dict(already_edge)
-            return existing_edge_data
+            existing_edge_data.setdefault("src_id", src_id)
+            existing_edge_data.setdefault("tgt_id", tgt_id)
+            existing_edge_data.setdefault("directed", is_directed)
+            return (
+                existing_edge_data,
+                full_source_ids,
+                None,
+                [],
+                {},
+                [],
+                [],
+            )
         else:
             logger.error(
                 f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
@@ -3039,15 +3055,7 @@ async def merge_nodes_and_edges(
                                 storage_key
                             )
 
-                            (
-                                edge_data,
-                                full_source_ids,
-                                edge_vdb_data,
-                                node_updates,
-                                node_vdb_updates,
-                                edge_vdb_delete_ids,
-                                added_entities,
-                            ) = await _merge_edges_then_upsert(
+                            merge_res = await _merge_edges_then_upsert(
                                 src_id=edge_key[0],
                                 tgt_id=edge_key[1],
                                 edges_data=edges,
@@ -3066,6 +3074,26 @@ async def merge_nodes_and_edges(
                                 existing_nodes_cache=_entity_cache,
                                 existing_entity_chunks_cache=_entity_chunks_cache,
                             )
+                            if merge_res is None:
+                                merge_res = _empty_edge_merge_result()
+
+                            if not (
+                                isinstance(merge_res, tuple) and len(merge_res) == 7
+                            ):
+                                logger.error(
+                                    f"Invalid merge result for relation `{edge_key[0]}`~`{edge_key[1]}`: {type(merge_res).__name__}"
+                                )
+                                merge_res = _empty_edge_merge_result()
+
+                            (
+                                edge_data,
+                                full_source_ids,
+                                edge_vdb_data,
+                                node_updates,
+                                node_vdb_updates,
+                                edge_vdb_delete_ids,
+                                added_entities,
+                            ) = merge_res
                             return (
                                 edge_key,
                                 storage_key,
@@ -5626,6 +5654,7 @@ async def _build_context_str(
     chunk_tracking: dict = None,
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
+    citation_tracker: "CitationTracker" = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Build the final LLM context string with token processing.
@@ -5725,6 +5754,15 @@ async def _build_context_str(
     reference_list, truncated_chunks = generate_reference_list_from_chunks(
         truncated_chunks
     )
+
+    # Synchronize reference_id to CitationTracker
+    if citation_tracker:
+        for chunk in truncated_chunks:
+            chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
+            doc_id = chunk_id.split(":", 1)[0] if ":" in chunk_id else ""
+            cit = citation_tracker.get_citation_by_chunk_id(doc_id, chunk_id)
+            if cit:
+                cit.reference_id = chunk["reference_id"]
 
     # Rebuild chunks_context with truncated chunks
     # The actual tokens may be slightly less than available_chunk_tokens due to deduplication logic
@@ -6207,6 +6245,7 @@ async def _build_query_context(
         chunk_tracking=search_result["chunk_tracking"],
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
+        citation_tracker=citation_tracker,
     )
 
     # Convert keywords strings to lists and add complete metadata to raw_data
@@ -6253,7 +6292,7 @@ async def _build_query_context(
             .replace("# Document Chunks", "")
             .strip()
         )
-        if len(content_only) < 100:
+        if len(content_only) < 10:
             logger.warning(
                 f"[_build_query_context] Context too short ({len(content_only)} chars), likely irrelevant. Returning None to prevent hallucination."
             )
@@ -7275,6 +7314,15 @@ async def naive_query(
     reference_list, processed_chunks_with_ref_ids = generate_reference_list_from_chunks(
         processed_chunks
     )
+
+    # Synchronize reference_id to CitationTracker
+    if citation_tracker:
+        for chunk in processed_chunks_with_ref_ids:
+            chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
+            doc_id = chunk_id.split(":", 1)[0] if ":" in chunk_id else ""
+            cit = citation_tracker.get_citation_by_chunk_id(doc_id, chunk_id)
+            if cit:
+                cit.reference_id = chunk["reference_id"]
 
     logger.info(f"Final context: {len(processed_chunks_with_ref_ids)} chunks")
 

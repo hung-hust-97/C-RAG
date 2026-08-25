@@ -1,6 +1,7 @@
 import json
 import copy
 import asyncio
+import os
 from aiokafka import AIOKafkaProducer
 from lightrag.lightrag import LightRAG
 from lightrag.utils import logger
@@ -10,6 +11,67 @@ from kafka_worker.models import KmsEvent
 _config_cache = None
 _rag_instances: dict[str, LightRAG] = {}
 _rag_init_locks: dict[str, asyncio.Lock] = {}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_transient_rag_init_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "server unavailable",
+            "service unavailable",
+            "channel",
+            "grpc",
+            "milvus",
+            "neo4j",
+            "failed to initialize",
+            "temporarily unavailable",
+        )
+    )
+
+
+async def _initialize_rag_with_retry(rag: LightRAG, profile_name: str | None) -> None:
+    attempts = max(1, _env_int("LIGHTRAG_RAG_INIT_RETRY_ATTEMPTS", 4))
+    delay = max(1, _env_int("LIGHTRAG_RAG_INIT_RETRY_DELAY_SECONDS", 3))
+    max_delay = max(delay, _env_int("LIGHTRAG_RAG_INIT_RETRY_MAX_DELAY_SECONDS", 30))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            await rag.initialize_storages(profile=profile_name)
+            return
+        except Exception as exc:
+            if attempt >= attempts or not _is_transient_rag_init_error(exc):
+                raise
+            sleep_seconds = min(max_delay, delay * (2 ** (attempt - 1)))
+            logger.warning(
+                "[Kafka] Transient LightRAG init error profile=%s attempt=%s/%s sleep_seconds=%s error=%s",
+                profile_name,
+                attempt,
+                attempts,
+                sleep_seconds,
+                exc,
+            )
+            try:
+                await rag.finalize_storages()
+            except Exception as close_exc:
+                logger.debug(
+                    "[Kafka] Ignored error while cleaning failed LightRAG init: %s",
+                    close_exc,
+                )
+            await asyncio.sleep(sleep_seconds)
 
 
 def validate_config() -> None:
@@ -59,7 +121,7 @@ async def get_initialized_rag_instance(
         rag = _rag_instances.get(cache_key)
         if rag is None:
             rag = _get_rag_instance(workspace_id)
-            await rag.initialize_storages(profile=profile_name)
+            await _initialize_rag_with_retry(rag, profile_name)
             _rag_instances[cache_key] = rag
             logger.info(
                 f"[Kafka] Initialized cached LightRAG for workspace {workspace_id} (profile: {profile_name})"

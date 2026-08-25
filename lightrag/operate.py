@@ -1819,12 +1819,10 @@ async def _merge_nodes_then_upsert(
                 f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
             )
             existing_node_data = dict(already_node)
-            return existing_node_data
+            return existing_node_data, existing_full_source_ids, None
         else:
-            logger.error(f"Internal Error: already_node missing for `{entity_name}`")
-            raise ValueError(
-                f"Internal Error: already_node missing for `{entity_name}`"
-            )
+            logger.warning(f"Inconsistent state: KV storage has chunks for `{entity_name}` but graph is missing already_node. Skipping.")
+            return None, None, None
 
     # 6.1 Finalize source_id
     source_id = GRAPH_FIELD_SEP.join(source_ids)
@@ -2165,12 +2163,10 @@ async def _merge_edges_then_upsert(
                 [],
             )
         else:
-            logger.error(
-                f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
+            logger.warning(
+                f"Inconsistent state: KV storage has chunks for `{src_id}`~`{tgt_id}` but graph is missing already_edge. Skipping."
             )
-            raise ValueError(
-                f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
-            )
+            return _empty_edge_merge_result()
 
     # 6.1 Finalize source_id
     source_id = GRAPH_FIELD_SEP.join(source_ids)
@@ -2773,7 +2769,7 @@ async def merge_nodes_and_edges(
     namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
 
     processed_entities = []
-    BATCH_SIZE = 1000
+    BATCH_SIZE = int(os.environ.get("KG_MERGE_BATCH_SIZE", 50))
 
     for i in range(0, len(entity_names), BATCH_SIZE):
         batch_entity_names = entity_names[i : i + BATCH_SIZE]

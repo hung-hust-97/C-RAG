@@ -13,7 +13,9 @@ from lightrag.utils import compute_mdhash_id
 
 
 def chunks_to_rows(chunks: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"chunk_id": chunk_id, "chunk": chunk} for chunk_id, chunk in chunks.items()]
+    return [
+        {"chunk_id": chunk_id, "chunk": chunk} for chunk_id, chunk in chunks.items()
+    ]
 
 
 def rows_to_chunks(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -73,7 +75,9 @@ def _serialize_edges(edges: Any) -> Any:
 
 
 def _deserialize_edges(edges: Any) -> Any:
-    if isinstance(edges, list) and all(isinstance(item, dict) and "items" in item for item in edges):
+    if isinstance(edges, list) and all(
+        isinstance(item, dict) and "items" in item for item in edges
+    ):
         return {
             (item.get("src", ""), item.get("tgt", "")): item.get("items", [])
             for item in edges
@@ -122,22 +126,31 @@ def build_relation_vector_payload(
         "weight": edge_data.get("weight", 1.0),
         "file_path": edge_data.get("file_path", "unknown_source"),
     }
-    return compute_mdhash_id(src_id + tgt_id, prefix="rel-", workspace=workspace), payload
+    return compute_mdhash_id(
+        src_id + tgt_id, prefix="rel-", workspace=workspace
+    ), payload
 
 
 async def read_file_from_storage(
-    workspace_id: str,
-    doc_type: str,
-    document_id: str,
-    document_name: str
+    workspace_id: str, doc_type: str, document_id: str, document_name: str
 ) -> bytes:
     """Đọc file gốc từ MinIO/S3."""
     endpoint_url = os.environ.get("S3_ENDPOINT_URL")
     access_key = os.environ.get("S3_ACCESS_KEY") or os.environ.get("S3_ACCESS_KEY_ID")
-    secret_key = os.environ.get("S3_SECRET_KEY") or os.environ.get("S3_SECRET_ACCESS_KEY")
-    bucket = os.environ.get("S3_BUCKET_NAME", "kms-docs-s3")
+    secret_key = os.environ.get("S3_SECRET_KEY") or os.environ.get(
+        "S3_SECRET_ACCESS_KEY"
+    )
+    bucket = os.environ.get("S3_BUCKET", "lightrag-markdown")
 
-    object_key = f"{workspace_id}/{doc_type}/{document_id}/{document_name}"
+    if (
+        doc_type == "legal"
+        and document_name.startswith("law_")
+        and document_name.endswith(".pdf")
+    ):
+        bucket = "legal-docs-pdf"
+        object_key = document_name
+    else:
+        object_key = f"full_docs/{workspace_id}/{document_id}/{document_name}"
 
     if not all([endpoint_url, access_key, secret_key]):
         raise ValueError("Missing S3 credentials in environment variables")
@@ -154,13 +167,116 @@ async def read_file_from_storage(
             response = await s3.get_object(Bucket=bucket, Key=object_key)
             async with response["Body"] as stream:
                 data = await stream.read()
-            logger.info(f"[MinIO] Successfully read {len(data)} bytes from s3://{bucket}/{object_key}")
+            logger.info(
+                f"[MinIO] Successfully read {len(data)} bytes from s3://{bucket}/{object_key}"
+            )
             return data
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "Unknown")
             error_msg = f"File not found in MinIO: s3://{bucket}/{object_key}. Code: {error_code}"
             logger.error(error_msg)
             raise FileNotFoundError(error_msg) from e
+
+
+def _s3_credentials() -> tuple[str | None, str | None, str | None]:
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+    access_key = os.environ.get("S3_ACCESS_KEY") or os.environ.get("S3_ACCESS_KEY_ID")
+    secret_key = os.environ.get("S3_SECRET_KEY") or os.environ.get(
+        "S3_SECRET_ACCESS_KEY"
+    )
+    return endpoint_url, access_key, secret_key
+
+
+async def read_legal_pdf_from_storage(doc_id: str) -> bytes:
+    """Read a legal source PDF from the fixed MinIO location."""
+    endpoint_url, access_key, secret_key = _s3_credentials()
+    bucket = os.environ.get("LEGAL_DOCS_PDF_BUCKET", "legal-docs-pdf")
+    object_key = f"law_{doc_id}.pdf"
+
+    if not all([endpoint_url, access_key, secret_key]):
+        raise ValueError("Missing S3 credentials in environment variables")
+
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    ) as s3:
+        try:
+            logger.info(f"[MinIO] Downloading legal PDF s3://{bucket}/{object_key}")
+            response = await s3.get_object(Bucket=bucket, Key=object_key)
+            async with response["Body"] as stream:
+                data = await stream.read()
+            logger.info(
+                f"[MinIO] Successfully read {len(data)} bytes from s3://{bucket}/{object_key}"
+            )
+            return data
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_msg = (
+                f"Legal PDF not found in MinIO: s3://{bucket}/{object_key}. "
+                f"Code: {error_code}"
+            )
+            logger.error(error_msg)
+            raise FileNotFoundError(error_msg) from e
+
+
+async def write_text_to_storage(
+    object_key: str,
+    content: str,
+    *,
+    bucket: str | None = None,
+    content_type: str = "text/plain; charset=utf-8",
+) -> str:
+    """Write UTF-8 text to MinIO/S3 and return the object key."""
+    endpoint_url, access_key, secret_key = _s3_credentials()
+    target_bucket = bucket or os.environ.get("S3_BUCKET", "lightrag-markdown")
+
+    if not all([endpoint_url, access_key, secret_key]):
+        raise ValueError("Missing S3 credentials in environment variables")
+
+    payload = content.encode("utf-8")
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    ) as s3:
+        await s3.put_object(
+            Bucket=target_bucket,
+            Key=object_key,
+            Body=payload,
+            ContentType=content_type,
+        )
+    logger.info(
+        f"[MinIO] Uploaded {len(payload)} bytes to s3://{target_bucket}/{object_key}"
+    )
+    return object_key
+
+
+async def update_legal_document_metadata(
+    legal_document_id: int,
+    workspace_id: str,
+    content_path: str,
+) -> None:
+    """Update extracted HTML metadata for tbl_legal_document."""
+    ws_uuid = to_uuid(workspace_id)
+    db = await ClientManager.get_client()
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE "tbl_legal_document"
+            SET "content_path" = $1,
+                "updated_at" = NOW()
+            WHERE "id" = $2 AND "workspace_id" = $3
+            """,
+            content_path,
+            legal_document_id,
+            ws_uuid,
+        )
+
 
 async def update_document_metadata(
     document_id: str,
@@ -194,6 +310,7 @@ async def update_document_metadata(
             ws_uuid,
         )
 
+
 async def check_duplicate_by_content_hash(
     content_hash: str, workspace_id: str
 ) -> str | None:
@@ -214,6 +331,7 @@ async def check_duplicate_by_content_hash(
         if row:
             return str(row["document_id"])
     return None
+
 
 async def mark_document_as_duplicated(document_id: str, workspace_id: str) -> None:
     """Đánh dấu file DUPLICATED."""

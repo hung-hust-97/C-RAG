@@ -14,11 +14,51 @@ from .artifacts import PipelineArtifactStore
 from .coordinator import ClaimStatus, PipelineCoordinator
 from .models import PipelineError, PipelineStageEvent, StageName, StageResult
 
-StageHandler = Callable[[PipelineStageEvent, "StageExecutionContext"], Awaitable[StageResult]]
+StageHandler = Callable[
+    [PipelineStageEvent, "StageExecutionContext"], Awaitable[StageResult]
+]
 EventPublisher = Callable[[PipelineStageEvent], Awaitable[None]]
 RagFactory = Callable[[str, object | None], Awaitable[Any]]
 
 TERMINAL_SUCCESS_STATUSES = {"PROCESSED", "COMPLETED", "DUPLICATED"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning(
+            "[Pipeline] Invalid %s=%r, using default=%s",
+            name,
+            os.getenv(name),
+            default,
+        )
+        return default
+
+
+def _stage_env_name(prefix: str, stage: StageName | str) -> str:
+    return f"{prefix}_{StageName(stage).value.upper()}"
+
+
+def _stage_env_int(prefix: str, stage: StageName | str, default: int) -> int:
+    stage_env_name = _stage_env_name(prefix, stage)
+    raw_value = os.getenv(stage_env_name)
+    env_name = stage_env_name
+    if raw_value is None:
+        raw_value = os.getenv(prefix)
+        env_name = prefix
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[Pipeline] Invalid %s=%r, using default=%s",
+            env_name,
+            raw_value,
+            default,
+        )
+        return default
 
 
 def _status_get(status_doc: Any, field: str, default: Any = None) -> Any:
@@ -90,6 +130,8 @@ class StageExecutionContext:
     coordinator: PipelineCoordinator
     rag_factory: RagFactory
     debug_sync: bool = False
+    partition_allocator: Any = None
+    producer: Any = None
 
     async def get_rag(self, workspace_id: str, profile: object | None = None) -> Any:
         return await self.rag_factory(workspace_id, profile)
@@ -148,12 +190,16 @@ class StageRunner:
                 )
                 return await self._handle_failure(event, exc)
         if not claim.acquired:
-            logger.info("[Pipeline] Stage skipped (%s) %s", claim.status.value, context_line)
+            logger.info(
+                "[Pipeline] Stage skipped (%s) %s", claim.status.value, context_line
+            )
             return StageRunOutcome(event, claim.status.value, [])
 
         if await self._document_already_terminal(event):
             await self.context.coordinator.complete(event, [])
-            logger.info("[Pipeline] Stage skipped for terminal document %s", context_line)
+            logger.info(
+                "[Pipeline] Stage skipped for terminal document %s", context_line
+            )
             return StageRunOutcome(
                 event,
                 "already_completed",
@@ -163,9 +209,12 @@ class StageRunner:
 
         handler = self.handlers.get(event.stage_name)
         if handler is None:
-            error = RuntimeError(f"No handler registered for stage {event.stage_name.value}")
+            error = RuntimeError(
+                f"No handler registered for stage {event.stage_name.value}"
+            )
             return await self._handle_failure(event, error)
 
+        heartbeat_task = self._start_stage_heartbeat(event)
         try:
             result = await handler(event, self.context)
             artifacts = list(result.output_artifacts)
@@ -182,10 +231,14 @@ class StageRunner:
                 join_event = result.join_next_event.model_copy(deep=True)
                 join_metadata = dict(join_event.metadata)
                 join_metadata["input_artifact_uris"] = [
-                    artifact.uri for artifact in stage_outputs if artifact.kind != "manifest"
+                    artifact.uri
+                    for artifact in stage_outputs
+                    if artifact.kind != "manifest"
                 ]
                 join_metadata["input_manifest_uris"] = [
-                    artifact.uri for artifact in stage_outputs if artifact.kind == "manifest"
+                    artifact.uri
+                    for artifact in stage_outputs
+                    if artifact.kind == "manifest"
                 ]
                 join_event.metadata = join_metadata
                 next_events.append(join_event)
@@ -203,25 +256,57 @@ class StageRunner:
 
         except Exception as exc:
             return await self._handle_failure(event, exc)
+        finally:
+            await self._stop_stage_heartbeat(heartbeat_task)
+
+    def _start_stage_heartbeat(
+        self, event: PipelineStageEvent
+    ) -> asyncio.Task[None] | None:
+        interval_seconds = _stage_env_int(
+            "PIPELINE_STAGE_HEARTBEAT_SECONDS",
+            event.stage_name,
+            60,
+        )
+        if interval_seconds <= 0:
+            return None
+        return asyncio.create_task(
+            self._stage_heartbeat_loop(event, interval_seconds),
+            name=(
+                "pipeline-heartbeat-"
+                f"{event.stage_name.value}-{event.run_id}-{event.shard_index}"
+            ),
+        )
+
+    async def _stop_stage_heartbeat(
+        self, heartbeat_task: asyncio.Task[None] | None
+    ) -> None:
+        if heartbeat_task is None:
+            return
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
+    async def _stage_heartbeat_loop(
+        self, event: PipelineStageEvent, interval_seconds: int
+    ) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.context.coordinator.heartbeat(event)
+            except Exception:
+                logger.warning(
+                    "[Pipeline] Stage heartbeat failed %s",
+                    event.log_context(),
+                    exc_info=True,
+                )
 
     async def _emit_events(
         self, current_event: PipelineStageEvent, next_events: list[PipelineStageEvent]
     ) -> None:
-        paused_stages_env = os.getenv("PIPELINE_PAUSED_STAGES", "")
-        paused_stages = {s.strip().lower() for s in paused_stages_env.split(",") if s.strip()}
-        # Stages that are always auto-approved (never paused)
-        always_approved = {"chunking"}
-
+        # Pause logic disabled per user request
         for next_event in next_events:
-            if next_event.stage_name.value in paused_stages and next_event.stage_name.value not in always_approved:
-                logger.info(
-                    "[Pipeline] Stage %s is in PIPELINE_PAUSED_STAGES. Pausing event %s",
-                    next_event.stage_name.value,
-                    next_event.log_context(),
-                )
-                await self.context.coordinator.register_paused(next_event)
-                continue
-
             if current_event.fast_path:
                 logger.info("[Pipeline] Fast-path handoff %s", next_event.log_context())
                 await self.run(next_event)
@@ -244,6 +329,18 @@ class StageRunner:
             return []
 
         try:
+            downstream_started = await self.context.coordinator.has_any_stage_records(
+                event.run_id,
+                [StageName.CHUNK_EMBEDDING, StageName.ENTITY_EXTRACTION],
+            )
+            if downstream_started:
+                logger.info(
+                    "[Pipeline] Stage already completed; downstream records exist, "
+                    "skipping chunking replay %s",
+                    event.log_context(),
+                )
+                return []
+
             stage_outputs = await self.context.coordinator.get_stage_outputs(
                 event.run_id, event.stage_name
             )
@@ -270,20 +367,42 @@ class StageRunner:
                 )
                 return []
 
-            shard_size = int(os.getenv("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", "32"))
+            chunk_embedding_shard_size = _env_int(
+                "PIPELINE_CHUNK_EMBEDDING_SHARD_SIZE", 512
+            )
+            if event.debug_sync or self.context.debug_sync:
+                chunk_embedding_shard_size = len(chunk_ids)
+            chunk_embedding_shard_size = max(1, chunk_embedding_shard_size)
+            chunk_embedding_shard_count = (
+                len(chunk_ids) + chunk_embedding_shard_size - 1
+            ) // chunk_embedding_shard_size
+
+            next_events = []
+            for shard_index in range(chunk_embedding_shard_count):
+                start = shard_index * chunk_embedding_shard_size
+                end = start + chunk_embedding_shard_size
+                shard_chunk_ids = chunk_ids[start:end]
+                next_events.append(
+                    event.next_event(
+                        StageName.CHUNK_EMBEDDING,
+                        artifact_uri=chunks_artifact.uri,
+                        shard_index=shard_index,
+                        shard_count=chunk_embedding_shard_count,
+                        counts={"chunks": len(shard_chunk_ids)},
+                        metadata={
+                            "chunks_artifact_uri": chunks_artifact.uri,
+                            "chunk_ids": shard_chunk_ids,
+                            "chunk_embedding_shard_size": chunk_embedding_shard_size,
+                        },
+                    )
+                )
+
+            shard_size = _env_int("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", 32)
             if event.debug_sync or self.context.debug_sync:
                 shard_size = len(chunk_ids)
             shard_size = max(1, shard_size)
             shard_count = (len(chunk_ids) + shard_size - 1) // shard_size
 
-            next_events = [
-                event.next_event(
-                    StageName.CHUNK_EMBEDDING,
-                    artifact_uri=chunks_artifact.uri,
-                    counts={"chunks": len(chunks)},
-                    metadata={"chunks_artifact_uri": chunks_artifact.uri},
-                )
-            ]
             for shard_index in range(shard_count):
                 start = shard_index * shard_size
                 end = start + shard_size
@@ -304,9 +423,10 @@ class StageRunner:
                 )
 
             logger.warning(
-                "[Pipeline] Replaying chunking downstream events for completed stage %s chunks=%s extraction_shards=%s",
+                "[Pipeline] Replaying chunking downstream events for completed stage %s chunks=%s chunk_embedding_shards=%s extraction_shards=%s",
                 event.log_context(),
                 len(chunks),
+                chunk_embedding_shard_count,
                 shard_count,
             )
             return next_events
@@ -348,9 +468,7 @@ class StageRunner:
             )
             next_events = []
             for fallback_index, artifact in enumerate(payload_artifacts):
-                shard_index = int(
-                    artifact.metadata.get("shard_index", fallback_index)
-                )
+                shard_index = int(artifact.metadata.get("shard_index", fallback_index))
                 next_events.append(
                     event.next_event(
                         StageName.KG_EMBEDDING,
@@ -361,9 +479,7 @@ class StageRunner:
                             "entities": int(artifact.metadata.get("entities", 0)),
                             "relations": int(artifact.metadata.get("relations", 0)),
                             "vector_rows": int(
-                                artifact.metadata.get(
-                                    "vector_rows", artifact.row_count
-                                )
+                                artifact.metadata.get("vector_rows", artifact.row_count)
                             ),
                         },
                         metadata={
@@ -397,17 +513,25 @@ class StageRunner:
             traceback=traceback.format_exc(),
         )
         await self.context.coordinator.fail(event, pipeline_error)
-        await self._mark_document_failed(event, pipeline_error)
 
-        failure_event = event.model_copy(deep=True)
-        failure_event.status = "failed"
-        failure_event.metadata = {
-            **failure_event.metadata,
-            "error": pipeline_error.model_dump(mode="json"),
-        }
-
-        if self.failure_publisher is not None:
-            await self.failure_publisher(failure_event)
+        if event.stage_name != StageName.FINALIZE:
+            finalize_event = event.next_event(
+                StageName.FINALIZE,
+                metadata={
+                    "error": pipeline_error.model_dump(mode="json"),
+                },
+            )
+            if self.event_publisher is not None:
+                await self.event_publisher(finalize_event)
+        else:
+            failure_event = event.model_copy(deep=True)
+            failure_event.status = "failed"
+            failure_event.metadata = {
+                **failure_event.metadata,
+                "error": pipeline_error.model_dump(mode="json"),
+            }
+            if self.failure_publisher is not None:
+                await self.failure_publisher(failure_event)
 
         if self.raise_stage_errors:
             raise exc

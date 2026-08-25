@@ -41,8 +41,23 @@ STUCK_THRESHOLD_SECONDS = int(
         os.getenv("PIPELINE_STAGE_RUNNING_STALE_SECONDS", "10800"),
     )
 )
+CHUNK_EMBEDDING_STUCK_THRESHOLD_SECONDS = int(
+    os.getenv(
+        "PIPELINE_SWEEPER_STUCK_THRESHOLD_SECONDS_CHUNK_EMBEDDING",
+        os.getenv(
+            "PIPELINE_STAGE_RUNNING_STALE_SECONDS_CHUNK_EMBEDDING",
+            str(STUCK_THRESHOLD_SECONDS),
+        ),
+    )
+)
 # Max stale rows requeued in a single sweep cycle
 STALE_BATCH_SIZE = int(os.getenv("PIPELINE_SWEEPER_STALE_BATCH_SIZE", "100"))
+STALE_REQUEUE_COOLDOWN_SECONDS = int(
+    os.getenv("PIPELINE_SWEEPER_STALE_REQUEUE_COOLDOWN_SECONDS", "300")
+)
+FAILED_CHUNK_EMBEDDING_RETRY_BATCH_SIZE = int(
+    os.getenv("PIPELINE_FAILED_CHUNK_EMBEDDING_RETRY_BATCH_SIZE", str(STALE_BATCH_SIZE))
+)
 # Automatically approve paused events for the next stage once prerequisite
 # stages no longer have running/paused work in the same workspace.
 AUTO_APPROVE_NEXT_STAGE = os.getenv(
@@ -50,6 +65,12 @@ AUTO_APPROVE_NEXT_STAGE = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 AUTO_APPROVE_BATCH_SIZE = int(
     os.getenv("PIPELINE_SWEEPER_AUTO_APPROVE_BATCH_SIZE", "500")
+)
+AUTO_APPROVE_STAGE_BATCH_SIZE = int(
+    os.getenv(
+        "PIPELINE_SWEEPER_AUTO_APPROVE_STAGE_BATCH_SIZE",
+        str(AUTO_APPROVE_BATCH_SIZE),
+    )
 )
 AUTO_APPROVE_REPUBLISH_COOLDOWN_SECONDS = int(
     os.getenv("PIPELINE_SWEEPER_AUTO_APPROVE_REPUBLISH_COOLDOWN_SECONDS", "900")
@@ -65,6 +86,23 @@ STAGE_AUTO_APPROVE_DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
     StageName.KG_EMBEDDING: (StageName.KG_MERGE,),
     StageName.FINALIZE: (StageName.CHUNK_EMBEDDING, StageName.KG_EMBEDDING),
 }
+
+
+def _stage_auto_approve_batch_size(stage: StageName) -> int:
+    stage_key = stage.value.upper()
+    for env_name in (
+        f"PIPELINE_SWEEPER_AUTO_APPROVE_{stage_key}_BATCH_SIZE",
+        f"PIPELINE_SWEEPER_AUTO_APPROVE_STAGE_BATCH_SIZE_{stage_key}",
+    ):
+        value = os.getenv(env_name)
+        if value is None or not value.strip():
+            continue
+        try:
+            return max(0, int(value))
+        except ValueError:
+            logger.warning("Invalid %s=%r; using global stage batch size", env_name, value)
+            break
+    return max(1, AUTO_APPROVE_STAGE_BATCH_SIZE)
 
 
 async def _get_db():
@@ -190,6 +228,77 @@ async def _mark_auto_approved_rows(
     )
 
 
+async def _mark_failed_chunk_embedding_requeued_rows(
+    rows: list[dict[str, Any]],
+    table_name: str = "lightrag_pipeline_stage_runs",
+) -> None:
+    if not rows:
+        return
+
+    db = await _get_db()
+    await db.execute(
+        f"""
+        WITH requeued_keys AS (
+            SELECT *
+            FROM UNNEST($1::text[], $2::text[], $3::int[])
+                 AS t(run_id, stage, shard_index)
+        )
+        UPDATE {table_name} sr
+        SET updated_at = NOW(),
+            error_json = COALESCE(sr.error_json, '{{}}'::jsonb) || jsonb_build_object(
+                'failed_requeued_by', 'pipeline_sweeper',
+                'failed_requeued_at', NOW()::text,
+                'failed_requeued_at_epoch', EXTRACT(EPOCH FROM NOW())
+            )
+        FROM requeued_keys rk
+        WHERE sr.run_id = rk.run_id
+          AND sr.stage = rk.stage
+          AND sr.shard_index = rk.shard_index
+          AND sr.status = 'failed'
+        """,
+        [
+            [str(row["run_id"]) for row in rows],
+            [str(row["stage"]) for row in rows],
+            [int(row["shard_index"]) for row in rows],
+        ],
+    )
+
+
+async def _mark_stale_running_requeued_rows(
+    rows: list[dict[str, Any]],
+    table_name: str = "lightrag_pipeline_stage_runs",
+) -> None:
+    if not rows:
+        return
+
+    db = await _get_db()
+    await db.execute(
+        f"""
+        WITH requeued_keys AS (
+            SELECT *
+            FROM UNNEST($1::text[], $2::text[], $3::int[])
+                 AS t(run_id, stage, shard_index)
+        )
+        UPDATE {table_name} sr
+        SET error_json = COALESCE(sr.error_json, '{{}}'::jsonb) || jsonb_build_object(
+                'stale_requeued_by', 'pipeline_sweeper',
+                'stale_requeued_at', NOW()::text,
+                'stale_requeued_at_epoch', EXTRACT(EPOCH FROM NOW())
+            )
+        FROM requeued_keys rk
+        WHERE sr.run_id = rk.run_id
+          AND sr.stage = rk.stage
+          AND sr.shard_index = rk.shard_index
+          AND sr.status = 'running'
+        """,
+        [
+            [str(row["run_id"]) for row in rows],
+            [str(row["stage"]) for row in rows],
+            [int(row["shard_index"]) for row in rows],
+        ],
+    )
+
+
 async def auto_approve_next_stages(
     table_name: str = "lightrag_pipeline_stage_runs",
 ) -> int:
@@ -203,9 +312,13 @@ async def auto_approve_next_stages(
     stage_counts: dict[str, int] = {}
 
     for target_stage, dependency_stages in STAGE_AUTO_APPROVE_DEPENDENCIES.items():
-        remaining_capacity = AUTO_APPROVE_BATCH_SIZE - len(events)
-        if remaining_capacity <= 0:
+        total_remaining_capacity = AUTO_APPROVE_BATCH_SIZE - len(events)
+        if total_remaining_capacity <= 0:
             break
+        stage_capacity = _stage_auto_approve_batch_size(target_stage)
+        if stage_capacity <= 0:
+            continue
+        remaining_capacity = min(total_remaining_capacity, stage_capacity)
 
         rows = await db.query(
             f"""
@@ -237,10 +350,10 @@ async def auto_approve_next_stages(
                           THEN (sr.error_json->>'auto_approved_at_epoch')::double precision
                           ELSE 0
                       END
-                  ) <= EXTRACT(EPOCH FROM NOW()) - $3
+                  ) <= EXTRACT(EPOCH FROM NOW()) - $3::double precision
               )
             ORDER BY sr.workspace_id, sr.run_id, sr.shard_index
-            LIMIT $4
+            LIMIT $4::int
             """,
             [
                 target_stage.value,
@@ -288,11 +401,31 @@ async def sweep_stale_running(table_name: str = "lightrag_pipeline_stage_runs") 
                EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) AS age_seconds
         FROM {table_name}
         WHERE status = 'running'
-          AND EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) > $1
+          AND EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) >
+              CASE
+                  WHEN stage = 'chunk_embedding' THEN $4::double precision
+                  ELSE $1::double precision
+              END
+          AND (
+              error_json IS NULL
+              OR error_json->>'stale_requeued_at_epoch' IS NULL
+              OR (
+                  CASE
+                      WHEN (error_json->>'stale_requeued_at_epoch') ~ '^[0-9]+(\\.[0-9]+)?$'
+                      THEN (error_json->>'stale_requeued_at_epoch')::double precision
+                      ELSE 0
+                  END
+              ) <= EXTRACT(EPOCH FROM NOW()) - $2::double precision
+          )
         ORDER BY COALESCE(updated_at, started_at, NOW()) ASC
-        LIMIT $2
+        LIMIT $3::int
         """,
-        [STUCK_THRESHOLD_SECONDS, STALE_BATCH_SIZE],
+        [
+            STUCK_THRESHOLD_SECONDS,
+            STALE_REQUEUE_COOLDOWN_SECONDS,
+            STALE_BATCH_SIZE,
+            CHUNK_EMBEDDING_STUCK_THRESHOLD_SECONDS,
+        ],
         multirows=True,
     )
 
@@ -300,9 +433,11 @@ async def sweep_stale_running(table_name: str = "lightrag_pipeline_stage_runs") 
         return 0
 
     events: list[PipelineStageEvent] = []
+    event_rows: list[dict[str, Any]] = []
     for row in rows:
         try:
             events.append(_event_from_stale_row(row))
+            event_rows.append(row)
         except Exception as exc:
             logger.error(
                 "Sweeper: cannot requeue stale running record run_id=%s stage=%s shard=%s: %s",
@@ -314,53 +449,167 @@ async def sweep_stale_running(table_name: str = "lightrag_pipeline_stage_runs") 
 
     published = await _publish_stage_events(events)
     if published > 0:
+        await _mark_stale_running_requeued_rows(event_rows[:published], table_name)
         logger.warning(
-            "Sweeper: requeued %s stale running records at the same stage (found=%s threshold=%ss)",
+            "Sweeper: requeued %s stale running records at the same stage (found=%s threshold=%ss chunk_embedding_threshold=%ss cooldown=%ss)",
             published,
             len(rows),
             STUCK_THRESHOLD_SECONDS,
+            CHUNK_EMBEDDING_STUCK_THRESHOLD_SECONDS,
+            STALE_REQUEUE_COOLDOWN_SECONDS,
+        )
+    return published
+
+
+async def _mark_failed_requeued_rows(
+    rows: list[dict[str, Any]],
+    table_name: str = "lightrag_pipeline_stage_runs",
+) -> None:
+    if not rows:
+        return
+
+    db = await _get_db()
+    await db.execute(
+        f"""
+        WITH requeued_keys AS (
+            SELECT *
+            FROM UNNEST($1::text[], $2::text[], $3::int[])
+                 AS t(run_id, stage, shard_index)
+        )
+        UPDATE {table_name} sr
+        SET updated_at = NOW(),
+            error_json = COALESCE(sr.error_json, '{{}}'::jsonb) || jsonb_build_object(
+                'failed_requeued_by', 'pipeline_sweeper',
+                'failed_requeued_at', NOW()::text,
+                'failed_requeued_at_epoch', EXTRACT(EPOCH FROM NOW())
+            )
+        FROM requeued_keys rk
+        WHERE sr.run_id = rk.run_id
+          AND sr.stage = rk.stage
+          AND sr.shard_index = rk.shard_index
+          AND sr.status = 'failed'
+        """,
+        [
+            [str(row["run_id"]) for row in rows],
+            [str(row["stage"]) for row in rows],
+            [int(row["shard_index"]) for row in rows],
+        ],
+    )
+
+
+async def sweep_failed_stage_records(
+    table_name: str = "lightrag_pipeline_stage_runs",
+) -> int:
+    """Requeue failed stage records across all stages that still have retry budget."""
+    max_attempts = int(os.getenv("PIPELINE_MAX_STAGE_RETRY_ATTEMPTS", "5"))
+    retry_cooldown_seconds = int(
+        os.getenv("PIPELINE_FAILED_RETRY_COOLDOWN_SECONDS", "300")
+    )
+    batch_size = int(os.getenv("PIPELINE_SWEEPER_FAILED_RETRY_BATCH_SIZE", "500"))
+
+    db = await _get_db()
+    rows = await db.query(
+        f"""
+        SELECT run_id, stage, shard_index, shard_count, workspace_id, doc_id,
+               attempt, event_json,
+               EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) AS age_seconds
+        FROM {table_name}
+        WHERE status = 'failed'
+          AND attempt < $1::int
+          AND EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) > $2::double precision
+        ORDER BY COALESCE(updated_at, started_at, NOW()) ASC
+        LIMIT $3::int
+        """,
+        [max_attempts, retry_cooldown_seconds, batch_size],
+        multirows=True,
+    )
+
+    if not rows:
+        return 0
+
+    events: list[PipelineStageEvent] = []
+    event_rows: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            events.append(_event_from_stale_row(row))
+            event_rows.append(row)
+        except Exception as exc:
+            logger.error(
+                "Sweeper: cannot requeue failed record run_id=%s stage=%s shard=%s: %s",
+                row.get("run_id"),
+                row.get("stage"),
+                row.get("shard_index"),
+                exc,
+            )
+
+    published = await _publish_stage_events(events)
+    if published > 0:
+        await _mark_failed_requeued_rows(event_rows[:published], table_name)
+        logger.warning(
+            "Sweeper: requeued %s failed stage records (found=%s max_attempts=%s cooldown=%ss batch_size=%s)",
+            published,
+            len(rows),
+            max_attempts,
+            retry_cooldown_seconds,
+            batch_size,
         )
     return published
 
 
 async def sweep_orphaned_documents(table_name: str = "lightrag_pipeline_stage_runs") -> int:
-    """Find documents that have all extraction shards done/failed but no kg_merge record.
+    """Find documents that have all extraction shards done/failed but no completed kg_merge record.
     
     This handles the case where entity_extraction shards all completed but the
-    join event for kg_merge was never published (e.g., due to worker crash or
-    Kafka delivery failure).
+    join event for kg_merge was never published or processed (e.g., due to worker crash,
+    Kafka delivery failure, or pending records stuck in DB).
     """
     db = await _get_db()
+    stuck_pending_seconds = int(
+        os.getenv("PIPELINE_SWEEPER_PENDING_STUCK_THRESHOLD_SECONDS", "300")
+    )
+    batch_size = int(os.getenv("PIPELINE_SWEEPER_ORPHANED_BATCH_SIZE", "1000"))
     
     # Find run_ids where:
     # 1. entity_extraction shards exist
-    # 2. All entity_extraction shards are in terminal state (done or failed)
-    # 3. No kg_merge record exists
-    # 4. The entity_extraction records are old enough (beyond threshold)
+    # 2. All entity_extraction shards are completed successfully (done)
+    # 3. No running/done kg_merge record exists, and no recent pending record exists
     rows = await db.query(
         f"""
         WITH ee_summary AS (
             SELECT run_id,
+                   MAX(workspace_id) as workspace_id,
+                   MAX(doc_id) as doc_id,
                    MAX(shard_count) as shard_count,
+                   MAX(event_json->>'doc_type') as doc_type,
+                   MAX(event_json->'metadata'->>'doc_type') as meta_doc_type,
+                   MAX(event_json->'metadata'->>'legal_document_id') as legal_doc_id,
+                   MAX(event_json->'metadata'->>'document_name') as document_name,
+                   MAX(event_json->'metadata'->>'file_path') as file_path,
                    COUNT(*) as total_shards,
-                   COUNT(*) FILTER (WHERE status IN ('done', 'failed')) as terminal_shards,
+                   COUNT(*) FILTER (WHERE status = 'done') as done_shards,
                    MIN(updated_at) as oldest_update
             FROM {table_name}
             WHERE stage = 'entity_extraction'
             GROUP BY run_id
         )
-        SELECT ee.run_id, ee.shard_count, ee.total_shards, ee.terminal_shards
+        SELECT ee.run_id, ee.shard_count, ee.total_shards, ee.done_shards, ee.workspace_id, ee.doc_id,
+               ee.doc_type, ee.meta_doc_type, ee.legal_doc_id, ee.document_name, ee.file_path
         FROM ee_summary ee
         WHERE ee.total_shards >= ee.shard_count
-          AND ee.terminal_shards = ee.total_shards
+          AND ee.done_shards = ee.total_shards
           AND NOT EXISTS (
               SELECT 1 FROM {table_name} km
-              WHERE km.run_id = ee.run_id AND km.stage = 'kg_merge'
+              WHERE km.run_id = ee.run_id
+                AND km.stage = 'kg_merge'
+                AND (
+                    km.status IN ('running', 'done')
+                    OR (km.status = 'pending' AND EXTRACT(EPOCH FROM (NOW() - COALESCE(km.updated_at, km.started_at, NOW()))) < $2::double precision)
+                )
           )
-          AND EXTRACT(EPOCH FROM (NOW() - ee.oldest_update)) > $1
-        LIMIT 100
+          AND EXTRACT(EPOCH FROM (NOW() - ee.oldest_update)) > $1::double precision
+        LIMIT $3::int
         """,
-        [STUCK_THRESHOLD_SECONDS],
+        [STUCK_THRESHOLD_SECONDS, stuck_pending_seconds, batch_size],
         multirows=True,
     )
     
@@ -369,38 +618,263 @@ async def sweep_orphaned_documents(table_name: str = "lightrag_pipeline_stage_ru
     
     count = len(rows)
     logger.warning(
-        "Sweeper: found %s documents with completed entity_extraction but missing kg_merge", count
+        "Sweeper: found %s documents with completed entity_extraction needing kg_merge recovery", count
     )
     
-    # For these orphaned documents, we cannot easily re-publish Kafka events from here.
-    # Instead, mark the document as FAILED in the pipeline coordinator so the
-    # auto-retry mechanism can pick them up on next reprocess.
+    run_ids = [row["run_id"] for row in rows]
+    artifacts_by_run: dict[str, list[str]] = {}
+    
+    art_rows = await db.query(
+        f"""
+        SELECT run_id, artifacts_json
+        FROM {table_name}
+        WHERE stage = 'entity_extraction'
+          AND status = 'done'
+          AND run_id = ANY($1::text[])
+        """,
+        [run_ids],
+        multirows=True,
+    )
+    import json
+    for art_row in art_rows or []:
+        rid = art_row.get("run_id")
+        art_list = art_row.get("artifacts_json") or []
+        if isinstance(art_list, str):
+            try:
+                art_list = json.loads(art_list)
+            except Exception:
+                art_list = []
+        if rid not in artifacts_by_run:
+            artifacts_by_run[rid] = []
+        for item in art_list:
+            if isinstance(item, dict) and item.get("kind") == "extraction" and item.get("uri"):
+                artifacts_by_run[rid].append(item["uri"])
+
+    events = []
+    event_rows = []
     for row in rows:
         run_id = row["run_id"]
-        logger.info("Sweeper: marking orphaned document run_id=%s as needing reprocess", run_id)
-        # Insert a failed kg_merge record so it can be auto-retried
+        workspace_id = row["workspace_id"]
+        doc_id = row["doc_id"]
+        input_uris = artifacts_by_run.get(run_id, [])
+        
+        raw_doc_type = str(row.get("doc_type") or "").lower()
+        meta_doc_type = str(row.get("meta_doc_type") or "").lower()
+        legal_doc_id = row.get("legal_doc_id")
+        is_legal = (
+            raw_doc_type == "legal"
+            or meta_doc_type == "legal"
+            or legal_doc_id is not None
+        )
+        canonical_doc_type = "legal" if is_legal else "general"
+
+        meta = {
+            "input_artifact_uris": input_uris,
+            "doc_type": canonical_doc_type,
+        }
+        if legal_doc_id is not None:
+            meta["legal_document_id"] = legal_doc_id
+        if row.get("document_name"):
+            meta["document_name"] = row.get("document_name")
+        if row.get("file_path"):
+            meta["file_path"] = row.get("file_path")
+
+        event = PipelineStageEvent(
+            run_id=run_id,
+            stage=StageName.KG_MERGE,
+            shard_index=0,
+            shard_count=1,
+            workspace_id=workspace_id,
+            doc_id=doc_id,
+            doc_type=canonical_doc_type,
+            attempt=1,
+            metadata=meta,
+        )
+        events.append(event)
+        event_rows.append((run_id, workspace_id, doc_id, event.model_dump_json()))
+        
+    for run_id, workspace_id, doc_id, event_json_str in event_rows:
         try:
             await db.execute(
                 f"""
                 INSERT INTO {table_name}
                     (run_id, stage, shard_index, shard_count, workspace_id, doc_id,
                      status, attempt, started_at, updated_at,
-                     error_json, artifacts_json)
-                SELECT
-                    $1, 'kg_merge', 0, 1,
-                    MIN(workspace_id), MIN(doc_id),
-                    'failed', 0, NOW(), NOW(),
-                    '{{"message": "Sweeper: created missing kg_merge record"}}'::jsonb,
-                    '[]'::jsonb
-                FROM {table_name}
-                WHERE run_id = $1 AND stage = 'entity_extraction'
-                ON CONFLICT (run_id, stage, shard_index) DO NOTHING
+                     error_json, artifacts_json, event_json)
+                VALUES
+                    ($1, 'kg_merge', 0, 1,
+                     $2, $3,
+                     'pending', 1, NOW(), NOW(),
+                     '{{}}'::jsonb,
+                     '[]'::jsonb,
+                     $4::jsonb)
+                ON CONFLICT (run_id, stage, shard_index) DO UPDATE
+                    SET status = 'pending',
+                        updated_at = NOW(),
+                        attempt = EXCLUDED.attempt,
+                        event_json = EXCLUDED.event_json
                 """,
-                [run_id],
+                [run_id, workspace_id, doc_id, event_json_str],
             )
         except Exception as exc:
-            logger.error("Sweeper: failed to create kg_merge record for %s: %s", run_id, exc)
+            logger.error("Sweeper: failed to insert/update pending kg_merge record for %s: %s", run_id, exc)
+
+    if events:
+        try:
+            published = await _publish_stage_events(events)
+            logger.info("Sweeper: successfully published %s missing kg_merge events", published)
+        except Exception as exc:
+            logger.error("Sweeper: failed to publish kg_merge events: %s", exc)
     
+    return count
+
+
+async def sweep_orphaned_kg_embedding_documents(
+    table_name: str = "lightrag_pipeline_stage_runs",
+) -> int:
+    """Find documents that completed kg_merge but have no active/pending kg_embedding record.
+    
+    This handles the case where kg_merge finished successfully but the downstream
+    kg_embedding event was lost or dropped.
+    """
+    db = await _get_db()
+    stuck_pending_seconds = int(
+        os.getenv("PIPELINE_SWEEPER_PENDING_STUCK_THRESHOLD_SECONDS", "300")
+    )
+    batch_size = int(os.getenv("PIPELINE_SWEEPER_ORPHANED_BATCH_SIZE", "1000"))
+
+    # Find run_ids where:
+    # 1. kg_merge is done and has non-empty artifacts_json
+    # 2. No active (running/done) kg_embedding record exists, and no recent pending record exists
+    rows = await db.query(
+        f"""
+        SELECT km.run_id, km.workspace_id, km.doc_id, km.artifacts_json,
+               km.event_json->>'doc_type' as doc_type,
+               km.event_json->'metadata'->>'doc_type' as meta_doc_type,
+               km.event_json->'metadata'->>'legal_document_id' as legal_doc_id,
+               km.event_json->'metadata'->>'document_name' as document_name,
+               km.event_json->'metadata'->>'file_path' as file_path
+        FROM {table_name} km
+        WHERE km.stage = 'kg_merge'
+          AND km.status = 'done'
+          AND jsonb_array_length(km.artifacts_json) > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM {table_name} ke
+              WHERE ke.run_id = km.run_id
+                AND ke.stage = 'kg_embedding'
+                AND (
+                    ke.status IN ('running', 'done')
+                    OR (ke.status = 'pending' AND EXTRACT(EPOCH FROM (NOW() - COALESCE(ke.updated_at, ke.started_at, NOW()))) < $2::double precision)
+                )
+          )
+          AND EXTRACT(EPOCH FROM (NOW() - km.updated_at)) > $1::double precision
+        ORDER BY km.updated_at ASC
+        LIMIT $3::int
+        """,
+        [STUCK_THRESHOLD_SECONDS, stuck_pending_seconds, batch_size],
+        multirows=True,
+    )
+
+    if not rows:
+        return 0
+
+    count = len(rows)
+    logger.warning(
+        "Sweeper: found %s documents with completed kg_merge needing kg_embedding recovery", count
+    )
+
+    events = []
+    event_rows = []
+    import json
+    for row in rows:
+        run_id = row["run_id"]
+        workspace_id = row["workspace_id"]
+        doc_id = row["doc_id"]
+        art_list = row.get("artifacts_json") or []
+        if isinstance(art_list, str):
+            try:
+                art_list = json.loads(art_list)
+            except Exception:
+                art_list = []
+
+        payload_uri = None
+        for item in art_list:
+            if isinstance(item, dict) and item.get("kind") == "kg_vector_payload" and item.get("uri"):
+                payload_uri = item["uri"]
+                break
+
+        if not payload_uri:
+            continue
+
+        raw_doc_type = str(row.get("doc_type") or "").lower()
+        meta_doc_type = str(row.get("meta_doc_type") or "").lower()
+        legal_doc_id = row.get("legal_doc_id")
+        is_legal = (
+            raw_doc_type == "legal"
+            or meta_doc_type == "legal"
+            or legal_doc_id is not None
+        )
+        canonical_doc_type = "legal" if is_legal else "general"
+
+        meta = {
+            "kg_vector_payload_artifact_uri": payload_uri,
+            "doc_type": canonical_doc_type,
+        }
+        if legal_doc_id is not None:
+            meta["legal_document_id"] = legal_doc_id
+        if row.get("document_name"):
+            meta["document_name"] = row.get("document_name")
+        if row.get("file_path"):
+            meta["file_path"] = row.get("file_path")
+
+        event = PipelineStageEvent(
+            run_id=run_id,
+            stage=StageName.KG_EMBEDDING,
+            shard_index=0,
+            shard_count=1,
+            workspace_id=workspace_id,
+            doc_id=doc_id,
+            doc_type=canonical_doc_type,
+            attempt=1,
+            artifact_uri=payload_uri,
+            metadata=meta,
+        )
+        events.append(event)
+        event_rows.append((run_id, workspace_id, doc_id, event.model_dump_json()))
+
+    for run_id, workspace_id, doc_id, event_json_str in event_rows:
+        try:
+            await db.execute(
+                f"""
+                INSERT INTO {table_name}
+                    (run_id, stage, shard_index, shard_count, workspace_id, doc_id,
+                     status, attempt, started_at, updated_at,
+                     error_json, artifacts_json, event_json)
+                VALUES
+                    ($1, 'kg_embedding', 0, 1,
+                     $2, $3,
+                     'pending', 1, NOW(), NOW(),
+                     '{{}}'::jsonb,
+                     '[]'::jsonb,
+                     $4::jsonb)
+                ON CONFLICT (run_id, stage, shard_index) DO UPDATE
+                    SET status = 'pending',
+                        updated_at = NOW(),
+                        attempt = EXCLUDED.attempt,
+                        event_json = EXCLUDED.event_json
+                """,
+                [run_id, workspace_id, doc_id, event_json_str],
+            )
+        except Exception as exc:
+            logger.error("Sweeper: failed to insert/update pending kg_embedding record for %s: %s", run_id, exc)
+
+    if events:
+        try:
+            published = await _publish_stage_events(events)
+            logger.info("Sweeper: successfully published %s missing kg_embedding events", published)
+        except Exception as exc:
+            logger.error("Sweeper: failed to publish kg_embedding events: %s", exc)
+
     return count
 
 
@@ -446,18 +920,26 @@ async def report_pipeline_gaps(table_name: str = "lightrag_pipeline_stage_runs")
 
 async def run_sweep() -> None:
     """Run all sweep operations once."""
-    logger.info("Sweeper: starting sweep cycle (threshold=%ss)", STUCK_THRESHOLD_SECONDS)
+    logger.info(
+        "Sweeper: starting sweep cycle (threshold=%ss chunk_embedding_threshold=%ss)",
+        STUCK_THRESHOLD_SECONDS,
+        CHUNK_EMBEDDING_STUCK_THRESHOLD_SECONDS,
+    )
     
     try:
         await report_pipeline_gaps()
         stale_count = await sweep_stale_running()
-        orphan_count = await sweep_orphaned_documents()
+        failed_stage_count = await sweep_failed_stage_records()
+        orphan_kg_merge_count = await sweep_orphaned_documents()
+        orphan_kg_embedding_count = await sweep_orphaned_kg_embedding_documents()
         auto_approved_count = await auto_approve_next_stages()
         
         logger.info(
-            "Sweeper: cycle complete. Requeued %s stale running, found %s orphaned docs, auto-approved %s paused next-stage records.",
+            "Sweeper: cycle complete. Requeued %s stale running, requeued %s failed records, found %s orphaned kg_merge, found %s orphaned kg_embedding, auto-approved %s paused next-stage records.",
             stale_count,
-            orphan_count,
+            failed_stage_count,
+            orphan_kg_merge_count,
+            orphan_kg_embedding_count,
             auto_approved_count,
         )
     except Exception:

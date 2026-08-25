@@ -1,0 +1,24 @@
+entity_types_guidance: |
+  Chỉ trích xuất các entity pháp lý quan trọng.
+  Không trích xuất từ chung chung, cụm từ quá ngắn hoặc entity không có giá trị truy xuất.
+
+  LegalDocument: Văn bản quy phạm pháp luật, ví dụ Luật, Nghị định, Thông tư, Quyết định.
+  LegalArticle: Điều, khoản, điểm, mục, chương.
+  LegalAuthority: Cơ quan ban hành hoặc cơ quan có thẩm quyền.
+  LegalSubject: Đối tượng chịu điều chỉnh, ví dụ cá nhân, tổ chức, doanh nghiệp.
+  Obligation: Nghĩa vụ phải thực hiện.
+  Permission: Quyền hoặc hành vi được phép.
+  Prohibition: Hành vi bị cấm.
+  Condition: Điều kiện áp dụng.
+  Procedure: Trình tự, thủ tục, hồ sơ.
+  Sanction: Chế tài, xử phạt, mức phạt.
+  Definition: Khái niệm được định nghĩa trong văn bản.
+  EffectiveDate: Ngày hiệu lực.
+  LegalDomain: Lĩnh vực pháp luật.
+
+entity_extraction_examples:
+  - |
+    entity{tuple_delimiter}Luật Doanh nghiệp 2020{tuple_delimiter}LegalDocument{tuple_delimiter}Văn bản luật điều chỉnh việc thành lập, tổ chức quản lý và hoạt động của doanh nghiệp.
+    entity{tuple_delimiter}doanh nghiệp{tuple_delimiter}LegalSubject{tuple_delimiter}Đối tượng chịu sự điều chỉnh của quy định.
+    relation{tuple_delimiter}Luật Doanh nghiệp 2020{tuple_delimiter}doanh nghiệp{tuple_delimiter}REGULATES{tuple_delimiter}Luật Doanh nghiệp 2020 điều chỉnh hoạt động của doanh nghiệp.
+    {completion_delimiter}

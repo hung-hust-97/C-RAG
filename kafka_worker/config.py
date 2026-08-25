@@ -3,7 +3,7 @@ import socket
 
 # Thông tin kết nối Kafka broker
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID")
+KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID") or "lightrag"
 
 # Tên các Topic
 KMS_EXTRACTING_TOPIC = os.getenv("KMS_EXTRACTING_TOPIC", "kms.doc.extracting")
@@ -40,8 +40,8 @@ PIPELINE_FAILED_TOPIC = os.getenv(
     "PIPELINE_FAILED_TOPIC", "lightrag.pipeline.failed"
 )
 
-PIPELINE_CONSUMER_GROUP_PREFIX = os.getenv(
-    "PIPELINE_CONSUMER_GROUP_PREFIX", f"{KAFKA_GROUP_ID}_pipeline"
+PIPELINE_CONSUMER_GROUP_PREFIX = (
+    os.getenv("PIPELINE_CONSUMER_GROUP_PREFIX") or f"{KAFKA_GROUP_ID}_pipeline"
 )
 PIPELINE_WORKER_ID = os.getenv(
     "PIPELINE_WORKER_ID", f"{socket.gethostname()}:{os.getpid()}"

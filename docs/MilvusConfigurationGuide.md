@@ -54,7 +54,7 @@ Expected result:
 All 11 MilvusIndexConfig parameters can be configured via `vector_db_storage_cls_kwargs`:
 
 ### Base Configuration
-- `index_type`: Index type (AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, etc.)
+- `index_type`: Index type (HNSW_PQ, HNSW, HNSW_SQ, IVF_FLAT, AUTOINDEX, etc.)
 - `metric_type`: Distance metric (COSINE, L2, IP)
 
 ### HNSW Parameters

@@ -1210,7 +1210,7 @@ Milvus is a high-performance, scalable vector database for production-level vect
 
 ### Supported Index Types
 
-- `AUTOINDEX` (default): Milvus automatically selects the best index
+- `HNSW_PQ` (default): HNSW with Product Quantization for memory efficiency
 - `HNSW`: Hierarchical Navigable Small World graph for high recall
 - `HNSW_SQ`: HNSW with scalar quantization for memory savings (requires Milvus 2.6.8+)
 - `HNSW_PQ`, `HNSW_PRQ`: HNSW with product / product-residual quantization
@@ -1240,7 +1240,7 @@ MILVUS_DB_NAME=lightrag
 LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage
 
 # Index configuration (all optional — sensible defaults apply)
-MILVUS_INDEX_TYPE=HNSW              # Default: AUTOINDEX
+MILVUS_INDEX_TYPE=GPU_IVF_PQ        # Default: GPU_IVF_PQ
 MILVUS_METRIC_TYPE=COSINE           # Default: COSINE
 MILVUS_HNSW_M=16                    # Default: 16, range [2-2048]
 MILVUS_HNSW_EF_CONSTRUCTION=360     # Default: 360
@@ -1337,7 +1337,7 @@ db_name = lightrag
 - Other index types work with Milvus 2.0+
 
 **Backward Compatibility:**
-- If no index configuration is provided, LightRAG uses AUTOINDEX (Milvus default behavior)
+- If no index configuration is provided, LightRAG uses HNSW_PQ
 - Existing collections are not affected; index configuration only applies to newly created collections
 
 For complete configuration options, see `env.example` and `docs/MilvusConfigurationGuide.md`.

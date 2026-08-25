@@ -1,0 +1,215 @@
+services:
+  etcd1: &etcd-common
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: crag-etcd1
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
+    stop_grace_period: 30s
+    environment: &etcd-env
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: crag-milvus-etcd
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "8589934592"
+      ETCD_SNAPSHOT_COUNT: "50000"
+      ETCD_NAME: etcd1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+    volumes:
+      - ../data/volumes/etcd1:/etcd
+    mem_limit: 8g
+    mem_reservation: 1g
+    cpus: 2
+    healthcheck:
+      test: [ "CMD", "etcdctl", "endpoint", "health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [ milvus_net ]
+
+  etcd2:
+    <<: *etcd-common
+    container_name: crag-etcd2
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+    volumes:
+      - ../data/volumes/etcd2:/etcd
+
+  etcd3:
+    <<: *etcd-common
+    container_name: crag-etcd3
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd3
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+    volumes:
+      - ../data/volumes/etcd3:/etcd
+
+  milvus-mixcoord-1: &mixcoord-common
+    image: milvusdb/milvus:v2.6.21
+    container_name: crag-remote-mixcoord-1
+    restart: "on-failure:5"
+    logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
+    command: [ "milvus", "run", "mixcoord" ]
+    environment: &milvus-env
+      ETCD_ENDPOINTS: etcd1:2379,etcd2:2379,etcd3:2379
+      MINIO_ADDRESS: 10.2.6.25:19000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_NAME: milvus-vectors
+    volumes:
+      - ../data/volumes/milvus-mc1:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+    depends_on: [ etcd1, etcd2, etcd3 ]
+    mem_limit: 8g
+    cpus: 4
+    networks: [ milvus_net ]
+
+  milvus-mixcoord-2:
+    <<: *mixcoord-common
+    container_name: crag-remote-mixcoord-2
+    volumes:
+      - ../data/volumes/milvus-mc2:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+
+  milvus-proxy:
+    image: milvusdb/milvus:v2.6.21
+    container_name: crag-remote-proxy
+    restart: "on-failure:5"
+    logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
+    stop_grace_period: 60s
+    command: [ "milvus", "run", "proxy" ]
+    security_opt: [ "seccomp:unconfined" ]
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    environment: *milvus-env
+    volumes:
+      - ../data/volumes/milvus-proxy:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+    ports:
+      - "19531:19530"
+      - "19091:9091"
+    depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fsS http://127.0.0.1:9091/healthz >/dev/null" ]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    mem_limit: 8g
+    cpus: 4
+    networks: [ milvus_net ]
+
+  milvus-querynode-1: &querynode-common
+    image: milvusdb/milvus:v2.6.21
+    container_name: crag-remote-querynode-1
+    restart: "on-failure:5"
+    logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
+    command: [ "milvus", "run", "querynode" ]
+    environment: *milvus-env
+    volumes:
+      - ../data/volumes/milvus-qn1:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+    depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
+    deploy:
+      resources:
+        limits: { memory: 190G }
+    networks: [ milvus_net ]
+
+  milvus-querynode-2:
+    <<: *querynode-common
+    container_name: crag-remote-querynode-2
+    volumes:
+      - ../data/volumes/milvus-qn2:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+
+  milvus-querynode-3:
+    <<: *querynode-common
+    container_name: crag-remote-querynode-3
+    volumes:
+      - ../data/volumes/milvus-qn3:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+
+  milvus-datanode-1: &datanode-common
+    image: milvusdb/milvus:v2.6.21
+    container_name: crag-remote-datanode-1
+    restart: "on-failure:5"
+    logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
+    command: [ "milvus", "run", "datanode" ]
+    environment: *milvus-env
+    volumes:
+      - ../data/volumes/milvus-dn1:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+    depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
+    mem_limit: 16g
+    cpus: 4
+    networks: [ milvus_net ]
+
+  milvus-datanode-2:
+    <<: *datanode-common
+    container_name: crag-remote-datanode-2
+    volumes:
+      - ../data/volumes/milvus-dn2:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+  milvus-indexnode-1: &indexnode-common
+    image: milvusdb/milvus:v2.6.21
+    container_name: crag-remote-indexnode-1
+    restart: "on-failure:5"
+    logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
+    command: [ "milvus", "run", "indexnode" ]
+    environment: *milvus-env
+    volumes:
+      - ../data/volumes/milvus-in1:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+    depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
+    mem_limit: 32g
+    cpus: 8
+    networks: [ milvus_net ]
+
+  milvus-indexnode-2:
+    <<: *indexnode-common
+    container_name: crag-remote-indexnode-2
+    volumes:
+      - ../data/volumes/milvus-in2:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+
+  milvus-streamingnode:
+    image: milvusdb/milvus:v2.6.21
+    container_name: crag-remote-streamingnode
+    restart: "on-failure:5"
+    logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
+    command: [ "milvus", "run", "streamingnode" ]
+    environment: *milvus-env
+    volumes:
+      - ../data/volumes/milvus-sn:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml
+    depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
+    mem_limit: 16g
+    networks: [ milvus_net ]
+
+  attu:
+    container_name: crag-attu
+    image: zilliz/attu:v2.6.5
+    environment:
+      MILVUS_URL: milvus-proxy:19530
+    ports:
+      - "8001:3000"
+    depends_on:
+      - milvus-proxy
+    networks:
+      - milvus_net
+
+networks:
+  milvus_net:
+    driver: bridge

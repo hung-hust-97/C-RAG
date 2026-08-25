@@ -10,8 +10,6 @@ LEGAL_DOCUMENT_STATUS_LABELS = {
     "CHUA_CO_HIEU_LUC": "Chưa có hiệu lực",
     "UNDETERMINED": "Chưa xác định",
     "VALID": "Còn hiệu lực",
-    "VALID_UNTIL": "Còn hiệu lực đến",
-    "EFFECTIVE_FROM": "Có hiệu lực từ",
     "EXPIRED": "Hết hiệu lực",
     "EXPIRED_TOTALLY": "Hết hiệu lực toàn bộ",
     "NO_LONGER_SUITABLE": "Không còn phù hợp",
@@ -22,8 +20,6 @@ LEGAL_DOCUMENT_STATUS_LABELS = {
 
 LEGAL_DOCUMENT_STATUS_PRIORITY = {
     "VALID": 100,
-    "VALID_UNTIL": 95,
-    "EFFECTIVE_FROM": 90,
     "KNOWN": 60,
     "UNDETERMINED": 45,
     "UNKNOWN": 40,
@@ -49,9 +45,16 @@ def normalize_legal_document_status(status: Any) -> dict[str, Any]:
         code = _LABEL_TO_CODE.get(raw_status.casefold(), "")
 
     if not code and raw_status.casefold().startswith("còn hiệu lực đến"):
-        code = "VALID_UNTIL"
+        code = "VALID"
     elif not code and raw_status.casefold().startswith("có hiệu lực từ"):
-        code = "EFFECTIVE_FROM"
+        code = "CHUA_CO_HIEU_LUC"
+    elif not code and raw_status.casefold().startswith("ngừng hiệu lực"):
+        code = "CEASED_EFFECT"
+    elif not code and raw_status.casefold().startswith("hết hiệu lực toàn bộ"):
+        code = "EXPIRED_TOTALLY"
+        
+    if not code:
+        code = "UNKNOWN"
 
     label = LEGAL_DOCUMENT_STATUS_LABELS.get(code, raw_status)
     priority = LEGAL_DOCUMENT_STATUS_PRIORITY.get(code, 0)

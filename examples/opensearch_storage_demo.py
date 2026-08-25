@@ -175,7 +175,7 @@ async def test_doc_status_storage():
 
         # With status filter
         filtered, ftotal = await s.get_docs_paginated(
-            status_filter=DocStatus.PENDING, page=1, page_size=50
+            status_filter=DocStatus.EXTRACTED, page=1, page_size=50
         )
         check(ftotal == 10, f"filtered total: {ftotal}")
 

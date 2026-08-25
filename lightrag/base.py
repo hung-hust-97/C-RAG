@@ -800,12 +800,7 @@ class DocStatus(str, Enum):
     PROCESSED = "PROCESSED"           # Hoàn thành tất cả
     FAILED = "FAILED"                 # Lỗi ở bất kỳ stage nào
     DUPLICATED = "DUPLICATED"         # Tài liệu trùng lặp về nội dung
-    
-    # Legacy statuses for backward compatibility (deprecated, will be removed)
-    PENDING = "PENDING"               # Legacy: mapped to EXTRACTED
-    PROCESSING = "PROCESSING"         # Legacy: mapped to CHUNKING
-    PREPROCESSED = "PREPROCESSED"     # Legacy: deprecated
-    CHUNKED = "CHUNKED"               # Legacy: deprecated
+
 
 
 @dataclass
@@ -849,15 +844,20 @@ class DocProcessingStatus:
         1. Migrate legacy statuses to new statuses
         2. Handle multimodal_processed field for backward compatibility
         """
-        # Migrate legacy statuses to new statuses
+        # Migrate legacy string statuses to new statuses
+        # since we cannot modify the legacy doc status in the database.
         legacy_migration = {
-            DocStatus.PENDING: DocStatus.EXTRACTED,
-            DocStatus.PROCESSING: DocStatus.CHUNKING,
-            DocStatus.PREPROCESSED: DocStatus.CHUNKED,
+            "PENDING": DocStatus.EXTRACTED,
+            "PROCESSING": DocStatus.CHUNKING,
+            "PREPROCESSED": DocStatus.PROCESSED,
+            "CHUNKED": DocStatus.PROCESSED,
         }
         
-        if self.status in legacy_migration:
-            self.status = legacy_migration[self.status]
+        status_val = self.status.value if hasattr(self.status, "value") else self.status
+        if status_val in legacy_migration:
+            self.status = legacy_migration[status_val]
+        elif isinstance(self.status, str):
+            self.status = DocStatus(self.status)
         
         # Apply multimodal_processed logic (backward compatibility)
         if self.multimodal_processed is not None:
@@ -865,7 +865,7 @@ class DocProcessingStatus:
                 self.multimodal_processed is False
                 and self.status == DocStatus.PROCESSED
             ):
-                self.status = DocStatus.CHUNKED
+                self.status = DocStatus.PROCESSED
 
 
 @dataclass

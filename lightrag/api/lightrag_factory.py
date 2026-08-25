@@ -182,7 +182,32 @@ def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_tim
                 "OpenAI entity extraction load balancer enabled with %s nodes",
                 len(extract_lb.nodes),
             )
+            
+    summary_lb = None
+    summary_hosts = os.getenv("SUMMARY_LLM_BINDING_HOST", "").strip()
+    summary_binding = os.getenv("SUMMARY_LLM_BINDING", "openai").strip().lower()
+    if summary_hosts:
+        if summary_binding not in {"openai", "openai-ollama"}:
+            logger.warning(
+                "SUMMARY_LLM_BINDING=%s is not supported by OpenAI factory; "
+                "falling back to LLM_BINDING_HOST",
+                summary_binding,
+            )
+        else:
+            summary_lb = LLMLoadBalancer(
+                hosts=summary_hosts,
+                api_keys=os.getenv("SUMMARY_LLM_BINDING_API_KEY") or args.llm_binding_api_key,
+                models=os.getenv("SUMMARY_LLM_MODEL") or args.llm_model,
+                max_async=_env_int("SUMMARY_LLM_MAX_ASYNC", args.max_async),
+            )
+            logger.info(
+                "OpenAI summary (kg_merge) load balancer enabled with %s nodes",
+                len(summary_lb.nodes),
+            )
+            
     max_node_count = max(len(lb.nodes), len(extract_lb.nodes) if extract_lb else 0)
+    if summary_lb:
+        max_node_count = max(max_node_count, len(summary_lb.nodes))
     node_internal_retry_attempts = max(
         1,
         int(
@@ -226,7 +251,12 @@ def create_optimized_openai_llm_func(config_cache: LLMConfigCache, args, llm_tim
                 api_key=node.api_key, **kwargs
             )
 
-        active_lb = extract_lb if request_cache_type == "extract" and extract_lb else lb
+        active_lb = lb
+        if request_cache_type == "extract" and extract_lb:
+            active_lb = extract_lb
+        elif request_cache_type == "summary" and summary_lb:
+            active_lb = summary_lb
+            
         return await active_lb.execute_with_fallback(_call_node, scope=request_cache_type)
     return optimized_openai_alike_model_complete
 

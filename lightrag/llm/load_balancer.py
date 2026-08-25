@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+_global_redis_clients = {}
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,10 +68,13 @@ return 0
         self._client = None
 
     async def _redis(self):
+        global _global_redis_clients
         if self._client is None:
             from redis.asyncio import Redis
 
-            self._client = Redis.from_url(self.redis_url, decode_responses=True)
+            if self.redis_url not in _global_redis_clients:
+                _global_redis_clients[self.redis_url] = Redis.from_url(self.redis_url, decode_responses=True)
+            self._client = _global_redis_clients[self.redis_url]
         return self._client
 
     async def acquire(self) -> str | None:
@@ -190,10 +195,13 @@ class RedisDistributedNodeHealth:
         self._client = None
 
     async def _redis(self):
+        global _global_redis_clients
         if self._client is None:
             from redis.asyncio import Redis
 
-            self._client = Redis.from_url(self.redis_url, decode_responses=True)
+            if self.redis_url not in _global_redis_clients:
+                _global_redis_clients[self.redis_url] = Redis.from_url(self.redis_url, decode_responses=True)
+            self._client = _global_redis_clients[self.redis_url]
         return self._client
 
     async def is_unhealthy(self) -> bool:
@@ -272,6 +280,7 @@ class LLMNode:
     host: str
     api_key: Optional[str]
     model: str
+    max_capacity: int
     semaphore: asyncio.Semaphore
     distributed_semaphore: RedisDistributedSemaphore | None = None
     scoped_distributed_semaphores: dict[str, RedisDistributedSemaphore] | None = None
@@ -452,6 +461,7 @@ class LLMLoadBalancer:
                     host=host,
                     api_key=key,
                     model=model,
+                    max_capacity=node_limit,
                     semaphore=asyncio.Semaphore(node_limit),
                     distributed_semaphore=distributed_semaphore,
                     scoped_distributed_semaphores=scoped_distributed_semaphores,
@@ -639,18 +649,21 @@ class LLMLoadBalancer:
                     "All LLM nodes are unhealthy; refusing to route requests to known bad nodes"
                 )
 
+        # Sort healthy nodes by proportional available local slots (descending order)
+        # This acts as a Weighted Least Loaded balancer and naturally prioritizes nodes with higher capacity,
+        # ensuring that if there is not enough load to saturate all nodes, they are utilized proportionally.
+        healthy_nodes.sort(key=lambda n: getattr(n.semaphore, "_value", 0) / max(1, n.max_capacity), reverse=True)
+
         attempts = len(healthy_nodes)
         last_exception = None
 
-        # Reserve the starting node before any await point so concurrent callers do
-        # not all read the same index and stampede one vLLM endpoint.
-        start_index = self._last_index % len(healthy_nodes)
-        self._last_index = (self._last_index + 1) % len(healthy_nodes)
-
-        # 3. Try available nodes in round-robin order
+        # 3. Try available nodes in order of available capacity
         for attempt in range(attempts):
-            idx = (start_index + attempt) % len(healthy_nodes)
-            node = healthy_nodes[idx]
+            node = healthy_nodes[attempt]
+
+            # If the node is already fully saturated and we still have other nodes to try, skip it.
+            if attempt < attempts - 1 and node.semaphore.locked():
+                continue
 
             logger.debug(
                 f"[LoadBalancer] Routing request to node {node.host} "
@@ -659,9 +672,12 @@ class LLMLoadBalancer:
             )
 
             try:
-                async with self._scoped_slot_context(node, scope):
-                    # Acquire local and optional distributed semaphores to enforce per-node concurrency.
-                    async with node.semaphore:
+                # Acquire local semaphore FIRST. This is fully synchronous and atomic,
+                # preventing the race condition where multiple requests pass the .locked() check
+                # and then yield in Redis calls before acquiring the local semaphore.
+                async with node.semaphore:
+                    async with self._scoped_slot_context(node, scope):
+
                         slot_context = (
                             node.distributed_semaphore.slot()
                             if node.distributed_semaphore is not None

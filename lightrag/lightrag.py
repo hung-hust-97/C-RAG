@@ -2954,7 +2954,17 @@ class LightRAG:
         doc_type: str = "general",
     ) -> list:
         try:
-            is_legal = doc_type == "legal"
+            chunk_values = [
+                chunk_item for chunk_item in chunk.values() if isinstance(chunk_item, dict)
+            ]
+            is_legal = doc_type == "legal" or (
+                bool(chunk_values)
+                and all(
+                    chunk_item.get("doc_type") == "legal"
+                    or chunk_item.get("legal_document_id") is not None
+                    for chunk_item in chunk_values
+                )
+            )
 
             if is_legal:
                 logger.info("Using extract_legal_entities for legal document")
@@ -3890,10 +3900,6 @@ class LightRAG:
                 elif doc_status == DocStatus.CHUNKING:
                     warning_msg = (
                         f"Deleting {doc_id} {file_path}(previous status: CHUNKING)"
-                    )
-                elif doc_status == DocStatus.CHUNKED:
-                    warning_msg = (
-                        f"Deleting {doc_id} {file_path}(previous status: CHUNKED)"
                     )
                 elif doc_status == DocStatus.FAILED:
                     warning_msg = (

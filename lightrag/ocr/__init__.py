@@ -18,6 +18,7 @@ import time
 import os
 import tempfile
 import logging
+import asyncio
 from typing import Optional
 
 from lightrag.ocr.config import OCRConfig, OCRResult
@@ -294,13 +295,15 @@ async def _extract_with_docling(
 
     try:
         converter = DocumentConverter(allowed_formats=[InputFormat.PDF])
-        conversion_result = converter.convert(tmp_path)
-        markdown_content = conversion_result.document.export_to_markdown()
-        page_count = (
-            conversion_result.document.num_pages
-            if hasattr(conversion_result.document, "num_pages")
-            else 0
-        )
+        
+        def convert_and_export():
+            res = converter.convert(tmp_path)
+            md = res.document.export_to_markdown()
+            pages = res.document.num_pages if hasattr(res.document, "num_pages") else 0
+            return md, pages
+
+        markdown_content, page_count = await asyncio.to_thread(convert_and_export)
+
 
         processing_time = time.time() - start_time
 

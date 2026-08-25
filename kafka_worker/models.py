@@ -10,7 +10,7 @@ class KmsEvent(BaseModel):
     document_id: str | None = Field(alias="documentId", default=None)
     legal_document_id: int | None = Field(alias="legalDocumentId", default=None)
     workspace_id: str = Field(alias="workspaceId")
-    workspace_name: str = Field(alias="workspaceName")
+    workspace_name: str | None = Field(alias="workspaceName", default=None)
     document_name: str = Field(alias="documentName")
     status: DocStatus = Field(alias="status")
     message: str | None = Field(alias="message", default="")

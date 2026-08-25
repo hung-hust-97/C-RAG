@@ -740,20 +740,7 @@ class DocsStatusesResponse(BaseModel):
                             "file_path": "extracted_doc.pdf",
                         }
                     ],
-                    "PREPROCESSED": [
-                        {
-                            "id": "doc-660e8400-e29b-41d4-a716-446655440001",
-                            "content_summary": "Document pending final indexing",
-                            "content_length": 7200,
-                            "status": "preprocessed",
-                            "created_at": "2025-03-31T09:30:00",
-                            "updated_at": "2025-03-31T09:35:00",
-                            "chunks_count": 10,
-                            "error": None,
-                            "metadata": None,
-                            "file_path": "preprocessed_doc.pdf",
-                        }
-                    ],
+
                     "PROCESSED": [
                         {
                             "id": "doc-770e8400-e29b-41d4-a716-446655440002",
@@ -937,9 +924,7 @@ class PaginatedDocsResponse(BaseModel):
                 },
                 "status_counts": {
                     "EXTRACTED": 10,
-                    "CHUNKING": 5,
-                    "CHUNKED": 5,
-                    "PROCESSED": 130,
+                    "PROCESSED": 135,
                     "FAILED": 5,
                 },
             }
@@ -966,10 +951,7 @@ class StatusCountsResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "status_counts": {
-                    "EXTRACTED": 10,
-                    "CHUNKING": 5,
-                    "CHUNKED": 5,
-                    "PROCESSED": 130,
+                    "PROCESSED": 135,
                     "FAILED": 5,
                 }
             }
@@ -3943,13 +3925,8 @@ def create_document_routes(
                 DocStatus.EXTRACTING,
                 DocStatus.EXTRACTED,
                 DocStatus.CHUNKING,
-                DocStatus.CHUNKED,
                 DocStatus.PROCESSED,
                 DocStatus.FAILED,
-                # Include legacy statuses for backward compatibility
-                DocStatus.PENDING,
-                DocStatus.PROCESSING,
-                DocStatus.PREPROCESSED,
             )
 
             tasks = [current_rag.get_docs_by_status(status) for status in statuses]
@@ -4702,8 +4679,9 @@ def create_document_routes(
                         status_counts = await current_rag.doc_status.get_all_status_counts()
                         documents_count = (
                             status_counts.get(DocStatus.FAILED.value, 0) +
-                            status_counts.get(DocStatus.PENDING.value, 0) +
-                            status_counts.get(DocStatus.PROCESSING.value, 0) +
+                            status_counts.get("PENDING", 0) +
+                            status_counts.get("PROCESSING", 0) +
+                            status_counts.get(DocStatus.CHUNKING.value, 0) +
                             status_counts.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
                         )
                         if documents_count > 0:
@@ -4716,8 +4694,9 @@ def create_document_routes(
                         for ws_id, ws_stats in workspaces_stats.items():
                             ws_failed_count = (
                                 ws_stats.get(DocStatus.FAILED.value, 0) +
-                                ws_stats.get(DocStatus.PENDING.value, 0) +
-                                ws_stats.get(DocStatus.PROCESSING.value, 0) +
+                                ws_stats.get("PENDING", 0) +
+                                ws_stats.get("PROCESSING", 0) +
+                                ws_stats.get(DocStatus.CHUNKING.value, 0) +
                                 ws_stats.get(DocStatus.EXTRACTING.value, 0)  # Include stuck EXTRACTING docs
                             )
                             if ws_failed_count > 0:

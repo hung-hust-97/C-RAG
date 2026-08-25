@@ -24,11 +24,9 @@ async def reembed_workspace_vectors(
 
     # Collect chunk ids from processed documents.
     processed_docs = await rag.doc_status.get_docs_by_status(DocStatus.PROCESSED)
-    chunked_docs = await rag.doc_status.get_docs_by_status(DocStatus.CHUNKED)
 
     doc_status_map: dict[str, Any] = {}
     doc_status_map.update(processed_docs or {})
-    doc_status_map.update(chunked_docs or {})
 
     chunk_ids: list[str] = []
     seen_chunk_ids: set[str] = set()

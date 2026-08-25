@@ -174,7 +174,7 @@ class PostgreSQLDB:
             row = await self.query(check_sql, [to_uuid(normalized_workspace_id)])
             if row and isinstance(row, dict) and row.get("name"):
                 existing_name = row["name"]
-                if workspace_name is None or workspace_name == existing_name:
+                if not workspace_name or workspace_name == existing_name:
                     # Update local cache and return early to preserve the nice name in the database
                     self._registered_workspaces[normalized_workspace_id] = existing_name
                     return
@@ -435,22 +435,21 @@ class PostgreSQLDB:
                     await self.initdb()
 
     async def _reset_pool(self) -> None:
-        async with self._get_reconnect_lock():
-            if self.pool is not None:
-                try:
-                    await asyncio.wait_for(
-                        self.pool.close(), timeout=self.pool_close_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "PostgreSQL, Timed out closing connection pool after %.2fs",
-                        self.pool_close_timeout,
-                    )
-                except Exception as close_error:  # pragma: no cover - defensive logging
-                    logger.warning(
-                        f"PostgreSQL, Failed to close existing connection pool cleanly: {close_error!r}"
-                    )
-            self.pool = None
+        if self.pool is not None:
+            try:
+                await asyncio.wait_for(
+                    self.pool.close(), timeout=self.pool_close_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "PostgreSQL, Timed out closing connection pool after %.2fs",
+                    self.pool_close_timeout,
+                )
+            except Exception as close_error:  # pragma: no cover - defensive logging
+                logger.warning(
+                    f"PostgreSQL, Failed to close existing connection pool cleanly: {close_error!r}"
+                )
+        self.pool = None
 
     async def _before_sleep(self, retry_state: RetryCallState) -> None:
         """Hook invoked by tenacity before sleeping between retries."""
@@ -2514,18 +2513,17 @@ class PGDocStatusStorage(DocStatusStorage):
         if not data:
             return
 
-        # Updated SQL for tbl_document with snake_case and workspace_id
-        sql = """insert into "tbl_document"("workspace_id","document_id","content_summary","content_length",status,"document_name","content_hash","error_msg","create_time","update_time")
-                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                  on conflict("document_id","workspace_id") do update set
-                  "content_summary" = EXCLUDED."content_summary",
-                  "content_length" = EXCLUDED."content_length",
-                  status = EXCLUDED.status,
-                  "document_name" = EXCLUDED."document_name",
-                  "content_hash" = EXCLUDED."content_hash",
-                  "error_msg" = EXCLUDED."error_msg",
-                  "create_time" = EXCLUDED."create_time",
-                  "update_time" = EXCLUDED."update_time" """
+        # Changed to UPDATE since C-RAG only updates existing rows created by KMS
+        sql = """UPDATE "tbl_document" SET
+                 "content_summary" = COALESCE($3, "content_summary"),
+                 "content_length" = COALESCE($4, "content_length"),
+                 status = $5,
+                 "document_name" = COALESCE($6, "document_name"),
+                 "content_hash" = COALESCE($7, "content_hash"),
+                 "error_msg" = $8,
+                 "create_time" = COALESCE($9, "create_time"),
+                 "update_time" = $10
+                 WHERE "workspace_id" = $1 AND "document_id" = $2"""
 
         # Merge partial updates with existing records to avoid KeyError
         existing_rows = await self.get_by_ids(list(data.keys()))
@@ -2605,17 +2603,17 @@ class PGDocStatusStorage(DocStatusStorage):
                 )
                 return None
 
-        sql = """insert into "tbl_document"("workspace_id","document_id","content_summary","content_length",status,"document_name","content_hash","error_msg","create_time","update_time")
-                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                  on conflict("document_id","workspace_id") do update set
-                  "content_summary" = EXCLUDED."content_summary",
-                  "content_length" = EXCLUDED."content_length",
-                  status = EXCLUDED.status,
-                  "document_name" = EXCLUDED."document_name",
-                  "content_hash" = EXCLUDED."content_hash",
-                  "error_msg" = EXCLUDED."error_msg",
-                  "create_time" = EXCLUDED."create_time",
-                  "update_time" = EXCLUDED."update_time" """
+        # Changed to UPDATE since C-RAG only updates existing rows created by KMS
+        sql = """UPDATE "tbl_document" SET
+                 "content_summary" = COALESCE($3, "content_summary"),
+                 "content_length" = COALESCE($4, "content_length"),
+                 status = $5,
+                 "document_name" = COALESCE($6, "document_name"),
+                 "content_hash" = COALESCE($7, "content_hash"),
+                 "error_msg" = $8,
+                 "create_time" = COALESCE($9, "create_time"),
+                 "update_time" = $10
+                 WHERE "workspace_id" = $1 AND "document_id" = $2"""
 
         async def _atomic_operation(connection: asyncpg.Connection) -> None:
             """Execute all upserts within a single transaction"""
@@ -2628,14 +2626,11 @@ class PGDocStatusStorage(DocStatusStorage):
                         sql,
                         self.workspace,
                         k,
-                        v["content_summary"],
-                        v["content_length"],
-                        v["chunks_count"] if "chunks_count" in v else -1,
-                        v["status"],
-                        v["file_path"],
-                        json.dumps(v.get("chunks_list", [])),
+                        v.get("content_summary", ""),
+                        v.get("content_length", 0),
+                        v.get("status", "UNKNOWN"),
+                        v.get("file_path", ""),
                         v.get("content_hash"),
-                        json.dumps(v.get("metadata", {})),
                         v.get("error_msg"),
                         created_at,
                         updated_at,
@@ -2829,11 +2824,10 @@ SQL_TEMPLATES = {
                             content = EXCLUDED.content,
                             update_time = EXCLUDED.update_time
                          """,
-    "upsert_doc_full": """INSERT INTO tbl_document (document_id, content_summary, document_name, workspace_id)
-                          VALUES ($1, $2, $3, $4)
-                          ON CONFLICT (document_id, workspace_id) DO UPDATE SET
-                          content_summary = EXCLUDED.content_summary,
-                          document_name = EXCLUDED.document_name
+    "upsert_doc_full": """UPDATE tbl_document SET
+                          content_summary = $2,
+                          document_name = $3
+                          WHERE document_id = $1 AND workspace_id = $4
                        """,
     "upsert_llm_response_cache": """INSERT INTO tbl_lightrag_llm_cache (workspace_id, id, original_prompt, return_value, chunk_id, cache_type, query_param, create_time, update_time)
                                     VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)

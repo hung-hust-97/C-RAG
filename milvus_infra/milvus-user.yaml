@@ -1,0 +1,105 @@
+rootCoord:
+  enableActiveStandby: true
+
+dataCoord:
+  enableActiveStandby: true
+  compaction:
+    enableAutoCompaction: true
+    mix:
+      triggerInterval: 60
+    levelzero:
+      triggerInterval: 10
+      forceTrigger:
+        minSize: 8388608
+        maxSize: 67108864
+        deltalogMinNum: 10
+        deltalogMaxNum: 1000
+  segment:
+    maxSize: 1024
+    sealProportion: 0.25
+
+dataNode:
+  slot:
+    slotCap: 16
+
+indexNode:
+  scheduler:
+    buildParallel: 12
+
+queryCoord:
+  enableActiveStandby: true
+  loadTimeoutSeconds: 600
+  segmentTaskTimeout: 600000
+  channelTaskTimeout: 300000
+  overloadedMemoryThresholdPercentage: 90
+
+indexCoord:
+  enableActiveStandby: true
+
+# Related configuration of mixCoord
+mixCoord:
+  enableActiveStandby: true
+
+queryNode:
+  mmap:
+    mmapEnabled: false
+    vectorField: false
+    vectorIndex: false
+    scalarField: false
+    scalarIndex: false
+    growingMmapEnabled: false
+    mmapDirPath: /var/lib/milvus/mmap
+  cache:
+    warmup: async
+  lazyload:
+    enabled: false
+  scheduler:
+    maxReadConcurrentRatio: 1.5
+
+quotaAndLimits:
+  enabled: true
+  limits:
+    maxCollectionNum: 256
+    maxCollectionNumPerDB: 256
+  limitWriting:
+    forceDeny: false
+    memProtection:
+      enabled: true
+      dataNodeMemoryLowWaterLevel: 0.75
+      dataNodeMemoryHighWaterLevel: 0.90
+      queryNodeMemoryLowWaterLevel: 0.75
+      queryNodeMemoryHighWaterLevel: 0.90
+    growingSegmentsSizeProtection:
+      enabled: true
+      lowWaterLevel: 0.1
+      highWaterLevel: 0.2
+      minRateRatio: 0.5
+    diskProtection:
+      enabled: true
+      diskQuota: -1
+      diskQuotaPerCollection: -1
+  limitReading:
+    forceDeny: false
+    queueProtection:
+      enabled: true
+      nqInQueueThreshold: 5000
+      queueLatencyThreshold: 5
+    resultProtection:
+      enabled: true
+
+proxy:
+  maxUserNum: 1024
+  maxRoleNum: 128
+  ginLogging: false   
+
+grpc:
+    serverMaxRecvSize: 268435456 
+    serverMaxSendSize: 268435456
+
+log:
+  level: info
+
+mq:
+  type: kafka
+kafka:
+  brokerList: 10.1.6.75:30210,10.1.6.200:30210,10.1.6.110:30210

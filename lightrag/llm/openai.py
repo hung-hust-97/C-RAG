@@ -307,6 +307,8 @@ def _is_retryable_openai_bad_request_text(error_text: str) -> bool:
     )
 
 
+_OPENAI_CLIENT_RR_INDEX = 0
+
 def create_openai_async_client(
     api_key: str | None = None,
     base_url: str | None = None,
@@ -332,6 +334,7 @@ def create_openai_async_client(
     Returns:
         An AsyncOpenAI or AsyncAzureOpenAI client instance.
     """
+    global _OPENAI_CLIENT_RR_INDEX
     if use_azure:
         from openai import AsyncAzureOpenAI
 
@@ -349,12 +352,12 @@ def create_openai_async_client(
             "api_key": api_key,
         }
 
-        import random
         # Add explicit parameters (override client_configs)
         if base_url is not None:
             urls = [url.strip() for url in base_url.split(",") if url.strip()]
             if urls:
-                merged_configs["azure_endpoint"] = random.choice(urls)
+                merged_configs["azure_endpoint"] = urls[_OPENAI_CLIENT_RR_INDEX % len(urls)]
+                _OPENAI_CLIENT_RR_INDEX += 1
         if azure_deployment is not None:
             merged_configs["azure_deployment"] = azure_deployment
         if api_version is not None:
@@ -382,11 +385,11 @@ def create_openai_async_client(
             "api_key": api_key,
         }
 
-        import random
         if base_url is not None:
             urls = [url.strip() for url in base_url.split(",") if url.strip()]
             if urls:
-                merged_configs["base_url"] = random.choice(urls)
+                merged_configs["base_url"] = urls[_OPENAI_CLIENT_RR_INDEX % len(urls)]
+                _OPENAI_CLIENT_RR_INDEX += 1
         else:
             merged_configs["base_url"] = os.environ.get(
                 "OPENAI_API_BASE", "https://api.openai.com/v1"

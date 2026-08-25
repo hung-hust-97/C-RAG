@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from hashlib import md5
+from pathlib import Path
 from typing import (
     Any,
     Protocol,
@@ -569,6 +570,17 @@ class EmbeddingFunc:
 
         # Call the actual embedding function
         result = await self.func(*args, **kwargs)
+
+        # MRL (Matryoshka Representation Learning) Client-side Truncation
+        # If API returns higher dimension than requested, we truncate and L2 re-normalize
+        if len(result.shape) == 2 and result.shape[1] > self.embedding_dim:
+            logger.debug(
+                f"MRL Truncation: Reducing embedding dimension from {result.shape[1]} to {self.embedding_dim}"
+            )
+            result = result[:, :self.embedding_dim]
+            # L2 normalize
+            norms = np.linalg.norm(result, axis=1, keepdims=True)
+            result = result / np.where(norms == 0, 1e-10, norms)
 
         # Validate embedding dimensions using total element count
         total_elements = result.size  # Total number of elements in the numpy array
@@ -3635,6 +3647,8 @@ def convert_to_user_format(
             "reference_id": chunk.get("reference_id", ""),
             "content": chunk.get("content", ""),
             "file_path": chunk.get("file_path", "unknown_source"),
+            "document_title": chunk.get("document_title")
+            or chunk.get("document_name", ""),
             "chunk_id": chunk.get("chunk_id", ""),
         }
         formatted_chunks.append(chunk_data)
@@ -3665,6 +3679,67 @@ def convert_to_user_format(
     }
 
 
+_REFERENCE_TITLE_KEYS = (
+    "document_title",
+    "document_name",
+    "documentName",
+    "title",
+    "original_filename",
+    "original_file_name",
+    "source_filename",
+)
+
+
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _clean_reference_title(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+
+    title = str(value).strip()
+    if not title or title == "unknown_source":
+        return ""
+
+    return title
+
+
+def _reference_title_from_chunk(chunk: dict) -> str:
+    metadata = _metadata_dict(chunk.get("metadata"))
+    nested_metadata = [
+        metadata,
+        _metadata_dict(metadata.get("context")),
+        _metadata_dict(metadata.get("legal_info")),
+    ]
+
+    for key in _REFERENCE_TITLE_KEYS:
+        title = _clean_reference_title(chunk.get(key))
+        if title:
+            return title
+
+    for nested in nested_metadata:
+        for key in _REFERENCE_TITLE_KEYS:
+            title = _clean_reference_title(nested.get(key))
+            if title:
+                return title
+
+    file_path = _clean_reference_title(chunk.get("file_path") or metadata.get("file_path"))
+    if not file_path:
+        return "Unknown Document"
+
+    return Path(file_path).name
+
+
 def generate_reference_list_from_chunks(
     chunks: list[dict],
 ) -> tuple[list[dict], list[dict]]:
@@ -3677,12 +3752,14 @@ def generate_reference_list_from_chunks(
 
     # 1. Extract all valid (file_path, workspace) pairs and count their occurrences
     path_ws_counts = {}
+    key_to_title = {}
     for chunk in chunks:
         file_path = chunk.get("file_path", "")
         workspace = chunk.get("workspace", "")
         if file_path and file_path != "unknown_source":
             key = (file_path, workspace)
             path_ws_counts[key] = path_ws_counts.get(key, 0) + 1
+            key_to_title.setdefault(key, _reference_title_from_chunk(chunk))
 
     # 2. Sort key by frequency (descending), then by first appearance order
     path_ws_with_indices = []
@@ -3723,6 +3800,7 @@ def generate_reference_list_from_chunks(
         ref_item = {
             "reference_id": str(i + 1),
             "file_path": file_path,
+            "document_title": key_to_title.get((file_path, workspace), file_path),
         }
         if workspace:
             ref_item["workspace"] = workspace

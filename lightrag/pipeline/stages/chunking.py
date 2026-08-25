@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 from lightrag.base import DocStatus
@@ -33,6 +35,19 @@ def _normalize_status(status: Any) -> str:
 
 def _is_terminal_success_status(status: Any) -> bool:
     return _normalize_status(status) in TERMINAL_SUCCESS_STATUSES
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning(
+            "[Pipeline] Invalid %s=%r, using default=%s",
+            name,
+            os.getenv(name),
+            default,
+        )
+        return default
 
 
 def _ensure_event_doc_id(event: PipelineStageEvent) -> None:
@@ -82,6 +97,51 @@ async def _read_s3_text(object_key: str) -> str:
             ) from exc
 
 
+def _normalize_s3_object_key(value: Any) -> str | None:
+    object_key = str(value or "").strip()
+    if not object_key:
+        return None
+    if object_key.startswith("s3://"):
+        bucket_and_key = object_key[5:]
+        if "/" not in bucket_and_key:
+            return None
+        object_key = bucket_and_key.split("/", 1)[1]
+    return object_key.lstrip("/") or None
+
+
+async def _legal_content_object_key(
+    event: PipelineStageEvent,
+    rag: Any,
+    legal_document_id: Any,
+) -> str | None:
+    for metadata_key in ("content_path", "contentPath", "s3_key", "object_key"):
+        object_key = _normalize_s3_object_key(event.metadata.get(metadata_key))
+        if object_key:
+            return object_key
+
+    db = getattr(getattr(rag, "doc_status", None), "db", None)
+    if db is None:
+        return None
+
+    try:
+        from lightrag.kg.postgres_impl import to_uuid
+
+        row = await db.query(
+            'SELECT content_path FROM "tbl_legal_document" WHERE workspace_id=$1 AND id=$2',
+            [to_uuid(event.workspace_id), int(legal_document_id)],
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Pipeline] Failed to load legal content_path doc_id=%s workspace_id=%s: %s",
+            event.doc_id,
+            event.workspace_id,
+            exc,
+        )
+        return None
+
+    return _normalize_s3_object_key(row.get("content_path") if row else None)
+
+
 async def _load_content(event: PipelineStageEvent, context: Any, rag: Any) -> str:
     if isinstance(event.metadata.get("content"), str):
         return event.metadata["content"]
@@ -106,9 +166,9 @@ async def _load_content(event: PipelineStageEvent, context: Any, rag: Any) -> st
     if doc_type == "legal":
         if legal_document_id is None:
             raise ValueError("legal_document_id is required for legal document content")
-        object_key = (
-            f"legal_docs/{workspace_name}/{legal_document_id}/{legal_document_id}.html"
-        )
+        object_key = await _legal_content_object_key(event, rag, legal_document_id)
+        if not object_key:
+            object_key = f"legal_docs/{workspace_name}/{legal_document_id}/{legal_document_id}.html"
     else:
         object_key = f"full_docs/{event.workspace_id}/{event.doc_id}/{event.doc_id}.md"
         if document_name and str(document_name).endswith((".md", ".html", ".txt")):
@@ -132,6 +192,34 @@ def _select_chunking_func(event: PipelineStageEvent, rag: Any, file_path: str):
     return select_chunking_function(doc_type, doc_extension)
 
 
+async def _run_chunking_func(
+    chunking_func: Any,
+    rag: Any,
+    content: str,
+    doc_id: str,
+) -> Any:
+    args = (
+        rag.tokenizer,
+        content,
+        None,
+        False,
+        rag.chunk_overlap_token_size,
+        rag.chunk_token_size,
+    )
+    kwargs = {"doc_id": doc_id}
+
+    if inspect.iscoroutinefunction(chunking_func):
+        result = await chunking_func(*args, **kwargs)
+    else:
+        loop = asyncio.get_running_loop()
+        call = partial(chunking_func, *args, **kwargs)
+        result = await loop.run_in_executor(None, call)
+
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
 async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageResult:
     _ensure_event_doc_id(event)
     rag = await context.get_rag(event.workspace_id, profile=event.stage)
@@ -150,6 +238,9 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
     file_path = (
         event.metadata.get("document_name")
         or event.metadata.get("file_path")
+        or event.metadata.get("content_path")
+        or event.metadata.get("s3_key")
+        or event.metadata.get("object_key")
         or event.doc_id
     )
     doc_type = event.metadata.get("doc_type", "general")
@@ -159,17 +250,12 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
         raise ValueError(f"Document content is empty for doc_id={event.doc_id}")
 
     chunking_func = _select_chunking_func(event, rag, file_path)
-    chunking_result = chunking_func(
-        rag.tokenizer,
+    chunking_result = await _run_chunking_func(
+        chunking_func,
+        rag,
         content,
-        None,
-        False,
-        rag.chunk_overlap_token_size,
-        rag.chunk_token_size,
-        doc_id=event.doc_id,
+        event.doc_id,
     )
-    if inspect.isawaitable(chunking_result):
-        chunking_result = await chunking_result
     if not isinstance(chunking_result, (list, tuple)):
         raise TypeError(
             f"chunking_func must return a list or tuple, got {type(chunking_result)}"
@@ -239,21 +325,41 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
         },
     )
 
-    shard_size = int(os.getenv("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", "32"))
+    chunk_embedding_shard_size = _env_int("PIPELINE_CHUNK_EMBEDDING_SHARD_SIZE", 512)
+    if event.debug_sync or context.debug_sync:
+        chunk_embedding_shard_size = len(chunk_ids)
+    chunk_embedding_shard_size = max(1, chunk_embedding_shard_size)
+    chunk_embedding_shard_count = (
+        len(chunk_ids) + chunk_embedding_shard_size - 1
+    ) // chunk_embedding_shard_size
+
+    next_events = []
+    for shard_index in range(chunk_embedding_shard_count):
+        start = shard_index * chunk_embedding_shard_size
+        end = start + chunk_embedding_shard_size
+        shard_chunk_ids = chunk_ids[start:end]
+        next_events.append(
+            event.next_event(
+                StageName.CHUNK_EMBEDDING,
+                artifact_uri=chunks_artifact.uri,
+                shard_index=shard_index,
+                shard_count=chunk_embedding_shard_count,
+                counts={"chunks": len(shard_chunk_ids)},
+                metadata={
+                    "chunks_artifact_uri": chunks_artifact.uri,
+                    "chunk_ids": shard_chunk_ids,
+                    "chunk_embedding_shard_size": chunk_embedding_shard_size,
+                },
+            )
+        )
+
+    shard_size = _env_int("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", 32)
     legal_single_shard = False
     if legal_single_shard or event.debug_sync or context.debug_sync:
         shard_size = len(chunk_ids)
     shard_size = max(1, shard_size)
     shard_count = (len(chunk_ids) + shard_size - 1) // shard_size
 
-    next_events = [
-        event.next_event(
-            StageName.CHUNK_EMBEDDING,
-            artifact_uri=chunks_artifact.uri,
-            counts={"chunks": len(chunks)},
-            metadata={"chunks_artifact_uri": chunks_artifact.uri},
-        )
-    ]
     for shard_index in range(shard_count):
         start = shard_index * shard_size
         end = start + shard_size
@@ -274,10 +380,11 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
         )
 
     logger.info(
-        "[Pipeline] Chunking produced %s chunks for doc_id=%s doc_type=%s extraction_shards=%s",
+        "[Pipeline] Chunking produced %s chunks for doc_id=%s doc_type=%s chunk_embedding_shards=%s extraction_shards=%s",
         len(chunks),
         event.doc_id,
         doc_type,
+        chunk_embedding_shard_count,
         shard_count,
     )
     return StageResult(

@@ -1108,7 +1108,7 @@ Milvus 是一个高性能、可扩展的向量数据库，适用于生产环境�
 
 ### 支持的索引类型
 
-- `AUTOINDEX`（默认）：Milvus 自动选择最佳索引
+- `HNSW_PQ`（默认）：HNSW with Product Quantization for memory efficiency
 - `HNSW`：层次可导航小世界图，适用于高召回率
 - `HNSW_SQ`：使用标量量化技术的 HNSW，可节省内存（需 Milvus 2.6.8+）
 - `HNSW_PQ`、`HNSW_PRQ`：使用乘积量化/残差乘积量化技术的 HNSW
@@ -1138,7 +1138,7 @@ MILVUS_DB_NAME=lightrag
 LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage
 
 # Index configuration (all optional — sensible defaults apply)
-MILVUS_INDEX_TYPE=HNSW              # Default: AUTOINDEX
+MILVUS_INDEX_TYPE=GPU_IVF_PQ        # Default: GPU_IVF_PQ
 MILVUS_METRIC_TYPE=COSINE           # Default: COSINE
 MILVUS_HNSW_M=16                    # Default: 16, range [2-2048]
 MILVUS_HNSW_EF_CONSTRUCTION=360     # Default: 360

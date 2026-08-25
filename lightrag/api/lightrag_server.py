@@ -349,51 +349,8 @@ def create_app(args):
         return sanitized[:200]
 
     async def _drop_workspace_milvus_collections(workspace_id: str) -> bool:
-        if args.vector_storage != "MilvusVectorDBStorage":
-            return False
-
-        try:
-            from pymilvus import MilvusClient  # type: ignore
-        except Exception as e:
-            logger.error(
-                f"[{workspace_id}] Cannot auto-heal Milvus mismatch because pymilvus import failed: {e}"
-            )
-            return False
-
-        milvus_uri = os.getenv("MILVUS_URI", "http://127.0.0.1:19530")
-        milvus_db_name = os.getenv("MILVUS_DB_NAME", None)
-
-        workspace = (workspace_id or "").strip()
-        if workspace:
-            prefix = _sanitize_workspace_for_milvus_collection(workspace)
-            target_collections = {
-                f"{prefix}_entities",
-                f"{prefix}_relationships",
-                f"{prefix}_chunks",
-            }
-        else:
-            target_collections = {"entities", "relationships", "chunks"}
-
-        client = MilvusClient(uri=milvus_uri, db_name=milvus_db_name)
-        existing_collections = set(client.list_collections())
-        to_drop = sorted(target_collections.intersection(existing_collections))
-
-        if not to_drop:
-            logger.warning(
-                f"[{workspace_id}] No matching Milvus collections found to drop for auto-heal: {sorted(target_collections)}"
-            )
-            return False
-
-        for collection_name in to_drop:
-            logger.warning(
-                f"[{workspace_id}] Dropping incompatible Milvus collection: {collection_name}"
-            )
-            client.drop_collection(collection_name)
-
-        logger.warning(
-            f"[{workspace_id}] Dropped {len(to_drop)} incompatible Milvus collections for dimension migration"
-        )
-        return True
+        logger.error(f"[{workspace_id}] Auto-drop collections is permanently disabled to prevent data loss.")
+        return False
 
     def _embedding_profile_dir() -> Path:
         profile_dir = Path(args.working_dir) / ".embedding_profiles"
@@ -646,23 +603,12 @@ def create_app(args):
                             detail=f"Workspace initialization timeout for {normalized_workspace_id}"
                         )
                     except RuntimeError as e:
-                        if not _is_milvus_dimension_mismatch_error(e):
-                            raise
-
-                        logger.warning(
-                            f"[{normalized_workspace_id}] Detected Milvus dimension mismatch during workspace initialization: {e}"
-                        )
-
-                        healed = await _drop_workspace_milvus_collections(normalized_workspace_id)
-                        if not healed:
-                            raise
-
-                        # Recreate rag instance to ensure clean storage clients after drop.
-                        workspace_rag = build_rag_instance(normalized_workspace_id)
-                        await asyncio.wait_for(
-                            workspace_rag.initialize_storages(),
-                            timeout=60.0
-                        )
+                        if _is_milvus_dimension_mismatch_error(e):
+                            logger.error(
+                                f"[{normalized_workspace_id}] Detected Milvus dimension mismatch during workspace initialization: {e}. "
+                                "Auto-drop is disabled to prevent data loss. Please resolve this manually."
+                            )
+                        raise
 
                     logger.info(f"[{normalized_workspace_id}] Checking and migrating data...")
                     await asyncio.wait_for(

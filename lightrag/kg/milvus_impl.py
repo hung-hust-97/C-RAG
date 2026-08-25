@@ -36,6 +36,7 @@ SUPPORTED_INDEX_TYPES = {
     "IVF_PQ",
     "DISKANN",
     "SCANN",
+    "IVF_RABITQ",
 }
 
 # Supported metric types
@@ -1757,137 +1758,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             raise
 
+    async def drop(self):
+        """Drop collection - Disabled by user constraint"""
+        logger.warning(f"[{self.workspace}] Drop operation is disabled by user constraint. Ignoring drop request for {self.final_namespace}.")
+        return
     def _create_collection_if_not_exist(self):
-        """Create collection if not exists and check existing collection compatibility"""
-
-        try:
-            # Check if our specific collection exists
-            collection_exists = self._milvus_call(
-                "has_collection",
-                lambda client: client.has_collection(self.final_namespace),
-            )
-            logger.info(
-                f"[{self.workspace}] VectorDB collection '{self.namespace}' (final: '{self.final_namespace}') exists check: {collection_exists}"
-            )
-
-            if collection_exists:
-                # Double-check by trying to describe the collection
-                try:
-                    self._client.describe_collection(self.final_namespace)
-                    self._validate_collection_compatibility()
-                    try:
-                        return
-                    except Exception as load_error:
-                        if not self._is_missing_vector_index_error(load_error):
-                            raise
-
-                        try:
-                            self._repair_missing_vector_index()
-                            logger.info(
-                                f"[{self.workspace}] Repaired missing vector index for existing collection '{self.namespace}'"
-                            )
-                            return
-                        except Exception as repair_error:
-                            raise RuntimeError(
-                                f"Index repair failed for collection '{self.final_namespace}'. "
-                                f"Original error: {repair_error}"
-                            ) from repair_error
-                except Exception as validation_error:
-                    # CRITICAL: Collection exists but validation failed
-                    # This indicates potential data migration failure or incompatible schema
-                    # Stop execution to prevent data loss and require manual intervention
-                    logger.error(
-                        f"[{self.workspace}] CRITICAL ERROR: Collection '{self.namespace}' exists but validation failed!"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] This indicates potential data migration failure or schema incompatibility."
-                    )
-                    logger.error(
-                        f"[{self.workspace}] Validation error: {validation_error}"
-                    )
-                    logger.error(f"[{self.workspace}] MANUAL INTERVENTION REQUIRED:")
-                    logger.error(
-                        f"[{self.workspace}] 1. Check the existing collection schema and data integrity"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] 2. Backup existing data if needed"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] 3. Manually resolve schema compatibility issues"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] 4. Consider dropping and recreating the collection if data is not critical"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] Program execution stopped to prevent potential data loss."
-                    )
-
-                    # Raise a specific exception to stop execution
-                    raise RuntimeError(
-                        f"Collection validation failed for '{self.final_namespace}'. "
-                        f"Data migration failure detected. Manual intervention required to prevent data loss. "
-                        f"Original error: {validation_error}"
-                    )
-
-            # Collection doesn't exist, create new collection
-            logger.info(f"[{self.workspace}] Creating new collection: {self.namespace}")
-            schema = self._create_schema_for_namespace()
-
-            # Create collection with schema first; indexes are built later.
-            self._create_collection_with_properties(self.final_namespace, schema)
-
-            # Index creation is deferred until index_done_callback() or first search query
-            logger.info(
-                f"[{self.workspace}] Created collection: {self.namespace} (index building deferred)"
-            )
-
-        except RuntimeError:
-            # Re-raise RuntimeError (validation failures) without modification
-            # These are critical errors that should stop execution
-            raise
-
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error in _create_collection_if_not_exist for {self.namespace}: {e}"
-            )
-
-            # If there's any error (other than validation failure), try to force create the collection
-            logger.info(
-                f"[{self.workspace}] Attempting to force create collection {self.namespace}..."
-            )
-            try:
-                # Try to drop the collection first if it exists in a bad state
-                try:
-                    if self._milvus_call(
-                        "has_collection",
-                        lambda client: client.has_collection(self.final_namespace),
-                    ):
-                        logger.info(
-                            f"[{self.workspace}] Dropping potentially corrupted collection {self.namespace}"
-                        )
-                        self._milvus_call(
-                            "drop_collection",
-                            lambda client: client.drop_collection(self.final_namespace),
-                        )
-                except Exception as drop_error:
-                    logger.warning(
-                        f"[{self.workspace}] Could not drop collection {self.namespace}: {drop_error}"
-                    )
-
-                # Create fresh collection
-                schema = self._create_schema_for_namespace()
-                self._create_collection_with_properties(self.final_namespace, schema)
-                
-                # Index creation is deferred
-                logger.info(
-                    f"[{self.workspace}] Successfully force-created collection {self.namespace} (index building deferred)"
-                )
-
-            except Exception as create_error:
-                logger.error(
-                    f"[{self.workspace}] Failed to force-create collection {self.namespace}: {create_error}"
-                )
-                raise
+        """Create collection if not exists - Disabled by user constraint"""
+        logger.info(f"[{self.workspace}] Collection creation is disabled by user constraint. Skipping _create_collection_if_not_exist.")
+        return
 
     def __post_init__(self):
         self._validate_embedding_func()
@@ -1917,20 +1795,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         else:
             effective_workspace = self.workspace
 
-        # Build final_namespace with workspace prefix for data isolation
+        # Determine effective workspace
         if effective_workspace and str(effective_workspace).strip():
-            workspace_for_collection = self._sanitize_workspace_for_collection(
-                effective_workspace
-            )
-            self.final_namespace = f"{workspace_for_collection}_{self.namespace}"
-            logger.debug(
-                f"[{self.workspace}] Initialized Milvus storage for namespace '{self.namespace}' in workspace '{effective_workspace}' -> collection '{self.final_namespace}'"
-            )
+            self.workspace = self._sanitize_workspace_for_collection(effective_workspace)
         else:
-            # When workspace is empty, final_namespace equals original namespace
-            self.final_namespace = self.namespace
             self.workspace = ""
-            logger.debug(f"[{self.workspace}] Initialized Milvus storage for namespace '{self.namespace}' without workspace isolation -> collection '{self.final_namespace}'")
+
+        # Do not prefix workspace_id for global partitioned schema
+        self.final_namespace = self.namespace
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
         if cosine_threshold is None:
             raise ValueError(
@@ -2033,8 +1905,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "created_at": current_time,
                 "workspace_id": self.workspace,
             }
-            
-            meta_dict = {k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields}
+            meta_dict = {k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields or k1 in ["entity_id", "chunk_id"]}
             
             # Enforce dynamic field size limit (~65536 bytes)
             # 1. Truncate specific known fields first
@@ -2104,19 +1975,57 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeddings_list = await asyncio.gather(*embedding_tasks)
 
         embeddings = np.concatenate(embeddings_list)
+        # Route to proper global collection
+        col_groups: dict[str, list[dict[str, Any]]] = {}
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i]
+            
+            is_legal = False
+            if "doc_type" in d and d["doc_type"] == "legal":
+                is_legal = True
+            elif d.get("legal_status") is not None or d.get("legal_document_id") is not None:
+                is_legal = True
+            elif os.environ.get("PIPELINE_DOC_TYPE") == "legal":
+                is_legal = True
+
+            if "workspace_id" not in d or not d["workspace_id"]:
+                d["workspace_id"] = self.workspace
+
+            if self.namespace.endswith("chunks"):
+                col_name = "legal_chunks" if is_legal else "general_chunks"
+                if "doc_id" in d:
+                    del d["doc_id"]
+                d["chunk_id"] = d.get("id")
+                
+                if "status" not in d or d["status"] is None:
+                    d["status"] = d.get("legal_status_code") or "UNKNOWN"
+                if "effective_from" not in d or d["effective_from"] is None:
+                    d["effective_from"] = 0
+                if "effective_to" not in d or d["effective_to"] is None:
+                    d["effective_to"] = 0
+            elif self.namespace.endswith("entities"):
+                col_name = "legal_entities" if is_legal else "general_entities"
+                d["entity_id"] = d.get("id")
+                d["entity_name"] = d.get("entity_name") or d.get("id")
+            else:
+                continue
+
+            col_groups.setdefault(col_name, []).append(d)
+
         upsert_batch_size = max(1, _get_env_int("MILVUS_UPSERT_BATCH_SIZE", 256))
         results = []
-        for i in range(0, len(list_data), upsert_batch_size):
-            batch_data = list_data[i : i + upsert_batch_size]
-            result = self._milvus_call(
-                "upsert",
-                lambda client, batch_data=batch_data: client.upsert(
-                    collection_name=self.final_namespace, data=batch_data
-                ),
-            )
-            results.append(result)
+        for col_name, col_data in col_groups.items():
+            for i in range(0, len(col_data), upsert_batch_size):
+                batch_data = col_data[i : i + upsert_batch_size]
+                
+                result = await asyncio.to_thread(
+                    self._milvus_call,
+                    "upsert",
+                    lambda client, batch_data=batch_data, c=col_name: client.upsert(
+                        collection_name=c, data=batch_data
+                    ),
+                )
+                results.append(result)
         return results[-1] if len(results) == 1 else results
 
     async def _bulk_upsert_impl(self, data: dict[str, dict[str, Any]]) -> Any:
@@ -2196,13 +2105,42 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeddings_list = await asyncio.gather(*embedding_tasks)
         embeddings = np.concatenate(embeddings_list)
 
-        rows = []
+        # Route to proper global collection
+        col_groups: dict[str, list[dict[str, Any]]] = {}
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i].tolist()
-            rows.append(d)
+            
+            is_legal = False
+            if "doc_type" in d and d["doc_type"] == "legal":
+                is_legal = True
+            elif d.get("legal_status") is not None or d.get("legal_document_id") is not None:
+                is_legal = True
+            elif os.environ.get("PIPELINE_DOC_TYPE") == "legal":
+                is_legal = True
 
-        json_payload = {"rows": rows}
-        file_content = json.dumps(json_payload).encode("utf-8")
+            if "workspace_id" not in d or not d["workspace_id"]:
+                d["workspace_id"] = self.workspace
+
+            if self.namespace.endswith("chunks"):
+                col_name = "legal_chunks" if is_legal else "general_chunks"
+                if "doc_id" in d:
+                    del d["doc_id"]
+                d["chunk_id"] = d.get("id")
+                
+                if "status" not in d or d["status"] is None:
+                    d["status"] = d.get("legal_status_code") or "UNKNOWN"
+                if "effective_from" not in d or d["effective_from"] is None:
+                    d["effective_from"] = 0
+                if "effective_to" not in d or d["effective_to"] is None:
+                    d["effective_to"] = 0
+            elif self.namespace.endswith("entities"):
+                col_name = "legal_entities" if is_legal else "general_entities"
+                d["entity_id"] = d.get("id")
+                d["entity_name"] = d.get("entity_name") or d.get("id")
+            else:
+                continue
+
+            col_groups.setdefault(col_name, []).append(d)
 
         # Upload to MinIO
         endpoint_url = os.environ.get("S3_ENDPOINT_URL")
@@ -2221,104 +2159,111 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         if not all([endpoint_url, access_key, secret_key]):
             raise ValueError("MinIO credentials missing. Cannot run bulk insert.")
 
-        object_key = f"bulk_insert/{self.final_namespace}_{uuid.uuid4().hex}.json"
-
         session = aioboto3.Session()
-        async with session.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-        ) as s3:
-            await s3.put_object(Bucket=bucket, Key=object_key, Body=file_content)
-            await self._cleanup_expired_bulk_insert_objects(
-                s3,
-                bucket,
-                current_key=object_key,
-            )
-
-        logger.info(f"Uploaded bulk insert data to {bucket}/{object_key}")
-
-        # Trigger Milvus bulk insert
-        from pymilvus import connections, utility
-
-        conn_alias = f"bulk_insert_{uuid.uuid4().hex}"
-        self._connect_bulk_insert_alias(conn_alias)
-
-        try:
-            db_name = self._get_milvus_db_name() or "default"
-            if not utility.has_collection(
-                self.final_namespace, using=conn_alias
-            ):
-                raise ValueError(
-                    f"Collection {self.final_namespace} does not exist "
-                    f"in Milvus database {db_name}"
-                )
-
-            task_id = self._milvus_call(
-                "do_bulk_insert",
-                lambda client: self._do_bulk_insert(
-                    collection_name=self.final_namespace,
-                    files=[object_key],
-                    using=conn_alias,
-                ),
-            )
-            logger.info(f"Started Milvus bulk insert task: {task_id}")
-            
-            # Start background task to poll status and cleanup file
-            async def _poll_and_cleanup(tid, s3_session, endpoint, access, secret, bucket_name, obj_key):
-                import asyncio
-                from pymilvus import connections, utility
-                poll_alias = f"poll_bulk_insert_{uuid.uuid4().hex}"
+        
+        all_task_ids = []
+        for col_name, col_data in col_groups.items():
+            if not col_data:
+                continue
                 
-                try:
-                    await asyncio.to_thread(self._connect_bulk_insert_alias, poll_alias)
-                    
-                    while True:
-                        try:
-                            def _get_state():
-                                return utility.get_bulk_insert_state(task_id=tid, using=poll_alias)
-                                
-                            state_obj = await asyncio.to_thread(_get_state)
-                            state_val = getattr(state_obj, "state", getattr(state_obj, "state_name", str(state_obj)))
-                            state_str = str(state_val).lower()
-                            
-                            # BulkInsertState.ImportCompleted = 6, ImportFailed = 7, ImportFailedAndCleaned = 8
-                            if "completed" in state_str or "failed" in state_str or getattr(state_obj, "state", -1) in (6, 7, 8):
-                                break
-                        except Exception as poll_err:
-                            logger.warning(f"Error polling bulk insert state for task {tid}: {poll_err}")
-                            break
-                        
-                        await asyncio.sleep(5)
-                        
-                    # Delete file from MinIO
-                    try:
-                        async with s3_session.client(
-                            "s3",
-                            endpoint_url=endpoint,
-                            aws_access_key_id=access,
-                            aws_secret_access_key=secret,
-                        ) as s3_client:
-                            await s3_client.delete_object(Bucket=bucket_name, Key=obj_key)
-                            logger.info(f"Successfully cleaned up bulk insert file: {bucket_name}/{obj_key}")
-                    except Exception as s3_err:
-                        logger.error(f"Failed to delete bulk insert file {obj_key}: {s3_err}")
-                finally:
-                    try:
-                        await asyncio.to_thread(connections.disconnect, poll_alias)
-                    except Exception:
-                        pass
-                        
-            asyncio.create_task(
-                _poll_and_cleanup(
-                    task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
+            json_payload = {"rows": col_data}
+            file_content = json.dumps(json_payload).encode("utf-8")
+            object_key = f"bulk_insert/{col_name}_{uuid.uuid4().hex}.json"
+
+            async with session.client(
+                "s3",
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+            ) as s3:
+                await s3.put_object(Bucket=bucket, Key=object_key, Body=file_content)
+                await self._cleanup_expired_bulk_insert_objects(
+                    s3,
+                    bucket,
+                    current_key=object_key,
                 )
-            )
-            
-            return task_id
-        finally:
-            connections.disconnect(conn_alias)
+
+            logger.info(f"Uploaded bulk insert data to {bucket}/{object_key}")
+
+            # Trigger Milvus bulk insert
+            from pymilvus import connections, utility
+
+            conn_alias = f"bulk_insert_{uuid.uuid4().hex}"
+            self._connect_bulk_insert_alias(conn_alias)
+
+            try:
+                task_id = await asyncio.to_thread(
+                    self._milvus_call,
+                    "do_bulk_insert",
+                    lambda client, o=object_key, c=col_name, a=conn_alias: self._do_bulk_insert(
+                        collection_name=c,
+                        files=[o],
+                        using=a,
+                    ),
+                )
+                logger.info(f"Started Milvus bulk insert task: {task_id}")
+                all_task_ids.append(task_id)
+                
+                # Start background task to poll status and cleanup file
+                async def _poll_and_cleanup(tid, s3_session, endpoint, access, secret, bucket_name, obj_key):
+                    import asyncio
+                    from pymilvus import connections, utility
+                    poll_alias = f"poll_bulk_insert_{uuid.uuid4().hex}"
+                    
+                    try:
+                        await asyncio.to_thread(self._connect_bulk_insert_alias, poll_alias)
+                        
+                        final_state_str = ""
+                        while True:
+                            try:
+                                def _get_state():
+                                    return utility.get_bulk_insert_state(task_id=tid, using=poll_alias)
+                                    
+                                state_obj = await asyncio.to_thread(_get_state)
+                                state_val = getattr(state_obj, "state", getattr(state_obj, "state_name", str(state_obj)))
+                                state_str = str(state_val).lower()
+                                
+                                # BulkInsertState.ImportCompleted = 6, ImportFailed = 7, ImportFailedAndCleaned = 8
+                                if "completed" in state_str or "failed" in state_str or getattr(state_obj, "state", -1) in (6, 7, 8):
+                                    final_state_str = state_str
+                                    break
+                            except Exception as poll_err:
+                                logger.warning(f"Error polling bulk insert state for task {tid}: {poll_err}")
+                                break
+                            
+                            await asyncio.sleep(5)
+                            
+                        # Delete file from MinIO only on success
+                        if "completed" in final_state_str or getattr(state_obj, "state", -1) == 6:
+                            try:
+                                async with s3_session.client(
+                                    "s3",
+                                    endpoint_url=endpoint,
+                                    aws_access_key_id=access,
+                                    aws_secret_access_key=secret,
+                                ) as s3_client:
+                                    await s3_client.delete_object(Bucket=bucket_name, Key=obj_key)
+                                    logger.info(f"Successfully cleaned up bulk insert file: {bucket_name}/{obj_key}")
+                            except Exception as s3_err:
+                                logger.error(f"Failed to delete bulk insert file {obj_key}: {s3_err}")
+                        else:
+                            # Tắt cơ chế xoá file khi bulk-insert thất bại (User requested)
+                            logger.info(f"Bulk insert incomplete or failed (state={final_state_str}). File retained in MinIO: {bucket_name}/{obj_key}")
+                    finally:
+                        try:
+                            await asyncio.to_thread(connections.disconnect, poll_alias)
+                        except Exception:
+                            pass
+                            
+                asyncio.create_task(
+                    _poll_and_cleanup(
+                        task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
+                    )
+                )
+            finally:
+                connections.disconnect(conn_alias)
+                
+        return all_task_ids if len(all_task_ids) > 1 else (all_task_ids[0] if all_task_ids else None)
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> Any:
         if not data:
@@ -2395,7 +2340,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
 
         with self._loaded_collection_context():
-            results = self._milvus_call(
+            import asyncio
+            results = await asyncio.to_thread(
+                self._milvus_call,
                 "search",
                 lambda client: client.search(
                     collection_name=self.final_namespace,
@@ -2495,7 +2442,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
 
             # Delete the entity from Milvus collection
-            result = self._milvus_call(
+            import asyncio
+            result = await asyncio.to_thread(
+                self._milvus_call,
                 "delete",
                 lambda client: client.delete(
                     collection_name=self.final_namespace, pks=[entity_id]
@@ -2525,8 +2474,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
 
             # Find all relations involving this entity
+            import asyncio
             with self._loaded_collection_context():
-                results = self._milvus_call(
+                results = await asyncio.to_thread(
+                    self._milvus_call,
                     "query",
                     lambda client: client.query(
                         collection_name=self.final_namespace,
@@ -2549,7 +2500,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
                 # Delete the relations
                 if relation_ids:
-                    delete_result = self._milvus_call(
+                    delete_result = await asyncio.to_thread(
+                        self._milvus_call,
                         "delete",
                         lambda client: client.delete(
                             collection_name=self.final_namespace, pks=relation_ids
@@ -2579,10 +2531,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             total_deleted = 0
 
             # Delete vectors by IDs in batches
+            import asyncio
             with self._loaded_collection_context():
                 for i in range(0, len(ids), batch_size):
                     batch_ids = ids[i:i + batch_size]
-                    result = self._milvus_call(
+                    result = await asyncio.to_thread(
+                        self._milvus_call,
                         "delete",
                         lambda client, b=batch_ids: client.delete(
                             collection_name=self.final_namespace, pks=b
@@ -2619,8 +2573,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             output_fields = list(self.meta_fields) + ["id"]
 
             # Query Milvus for a specific ID
+            import asyncio
             with self._loaded_collection_context():
-                result = self._milvus_call(
+                result = await asyncio.to_thread(
+                    self._milvus_call,
                     "query",
                     lambda client: client.query(
                         collection_name=self.final_namespace,
@@ -2666,7 +2622,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     filter_expr = f'id in ["{id_list}"]'
 
                     # Query Milvus with the filter
-                    result = self._milvus_call(
+                    import asyncio
+                    result = await asyncio.to_thread(
+                        self._milvus_call,
                         "query",
                         lambda client, f=filter_expr: client.query(
                             collection_name=self.final_namespace,
@@ -2719,7 +2677,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     filter_expr = f'id in ["{id_list}"]'
 
                     # Query Milvus with the filter, requesting only vector field
-                    result = self._milvus_call(
+                    import asyncio
+                    result = await asyncio.to_thread(
+                        self._milvus_call,
                         "query",
                         lambda client, f=filter_expr: client.query(
                             collection_name=self.final_namespace,

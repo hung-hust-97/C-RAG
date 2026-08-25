@@ -292,6 +292,7 @@ def create_general_citation_metadata(
     hierarchy_path: List[str],
     relevance_score: float,
     content_preview: str,
+    document_title: str = "",
 ) -> CitationMetadata:
     """Create citation metadata for general documents.
     
@@ -307,6 +308,7 @@ def create_general_citation_metadata(
         hierarchy_path: Breadcrumb path (e.g., ["Hạ tầng", "Quy trình Backup", "Bước 1"])
         relevance_score: Relevance score (0.0-1.0)
         content_preview: First 100 characters of content
+        document_title: Display title to use instead of deriving one from file_path
     
     Returns:
         CitationMetadata instance configured for general documents
@@ -326,7 +328,7 @@ def create_general_citation_metadata(
         'Hạ tầng > Quy trình Backup > Bước 1 (Tài liệu infrastructure_guide)'
     """
     # Build formatted reference from hierarchy and file name
-    doc_name = Path(file_path).stem
+    doc_name = document_title.strip() if document_title else Path(file_path).stem
     
     if hierarchy_path:
         section = " > ".join(hierarchy_path)
@@ -471,6 +473,12 @@ class CitationTracker:
         file_path = metadata.get("file_path", "")
         hierarchy_path = metadata.get("hierarchy_path", [])
         relevance_score = metadata.get("relevance_score", 0.0)
+        document_title = (
+            metadata.get("document_title")
+            or metadata.get("document_name")
+            or metadata.get("title")
+            or ""
+        )
         content_preview = content[:100] if content else ""
         
         # Create citation metadata based on document type
@@ -497,6 +505,7 @@ class CitationTracker:
                 hierarchy_path=hierarchy_path,
                 relevance_score=relevance_score,
                 content_preview=content_preview,
+                document_title=document_title,
             )
         
         # Store citation and update indexes

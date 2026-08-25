@@ -29,7 +29,7 @@ async def _read_extraction_results(event: PipelineStageEvent, context: Any) -> l
     if event.artifact_uri:
         artifact_uris.append(event.artifact_uri)
     if not artifact_uris:
-        raise ValueError("kg_merge stage requires extraction artifact URIs")
+        return []
 
     results = []
     for uri in artifact_uris:
@@ -127,8 +127,6 @@ async def run_kg_merge_stage(event: PipelineStageEvent, context: Any) -> StageRe
     read_started = time.perf_counter()
     extraction_results = await _read_extraction_results(event, context)
     read_seconds = time.perf_counter() - read_started
-    if not extraction_results:
-        raise ValueError("kg_merge stage received no extraction results")
 
     pipeline_status = {"latest_message": "", "history_messages": []}
     pipeline_status_lock = asyncio.Lock()
@@ -137,28 +135,37 @@ async def run_kg_merge_stage(event: PipelineStageEvent, context: Any) -> StageRe
     if max_async_override > 0:
         rag.llm_model_max_async = min(rag.llm_model_max_async, max_async_override)
     try:
-        merge_started = time.perf_counter()
-        merge_result = await merge_nodes_and_edges(
-            chunk_results=extraction_results,
-            knowledge_graph_inst=rag.chunk_entity_relation_graph,
-            entity_vdb=None,
-            relationships_vdb=None,
-            global_config=_merge_global_config(rag),
-            full_entities_storage=rag.full_entities,
-            full_relations_storage=rag.full_relations,
-            doc_id=event.doc_id,
-            pipeline_status=pipeline_status,
-            pipeline_status_lock=pipeline_status_lock,
-            llm_response_cache=rag.llm_response_cache,
-            entity_chunks_storage=rag.entity_chunks,
-            relation_chunks_storage=rag.relation_chunks,
-            current_file_number=1,
-            total_files=1,
-            file_path=event.metadata.get("document_name")
-            or event.metadata.get("file_path")
-            or event.doc_id,
-        )
-        merge_seconds = time.perf_counter() - merge_started
+        if extraction_results:
+            merge_started = time.perf_counter()
+            merge_result = await merge_nodes_and_edges(
+                chunk_results=extraction_results,
+                knowledge_graph_inst=rag.chunk_entity_relation_graph,
+                entity_vdb=None,
+                relationships_vdb=None,
+                global_config=_merge_global_config(rag),
+                full_entities_storage=rag.full_entities,
+                full_relations_storage=rag.full_relations,
+                doc_id=event.doc_id,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=rag.llm_response_cache,
+                entity_chunks_storage=rag.entity_chunks,
+                relation_chunks_storage=rag.relation_chunks,
+                current_file_number=1,
+                total_files=1,
+                file_path=event.metadata.get("document_name")
+                or event.metadata.get("file_path")
+                or event.doc_id,
+            )
+            merge_seconds = time.perf_counter() - merge_started
+        else:
+            merge_result = None
+            merge_seconds = 0.0
+            logger.info(
+                "[Pipeline] KG merge has no extraction results for doc_id=%s; "
+                "emitting empty KG vector payload",
+                event.doc_id,
+            )
     finally:
         rag.llm_model_max_async = original_llm_max_async
 

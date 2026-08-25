@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import os
 from typing import Any
 
+from lightrag.legal_document.extraction_mode import ExtractionMode
+from lightrag.legal_document.extraction_mode import classify_chunk_extraction_mode
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 
 from .common import filter_chunks, rows_to_chunks, serialize_extraction_results
@@ -38,10 +41,15 @@ async def run_entity_extraction_stage(
 
     doc_types = {chunk.get("doc_type", "general") for chunk in chunks.values()}
     doc_type = "legal" if doc_types == {"legal"} else "general"
+    mode_counts: Counter[str] = Counter()
+    if doc_type == "legal":
+        mode_counts.update(
+            classify_chunk_extraction_mode(chunk).value for chunk in chunks.values()
+        )
 
     original_llm_max_async = rag.llm_model_max_async
     original_addon_params = dict(rag.addon_params)
-    max_async_override = _env_int("PIPELINE_ENTITY_EXTRACTION_MAX_ASYNC", 2)
+    max_async_override = _env_int("PIPELINE_ENTITY_EXTRACTION_MAX_ASYNC", 4)
     if max_async_override > 0:
         rag.llm_model_max_async = min(rag.llm_model_max_async, max_async_override)
     if event.debug_sync or context.debug_sync:
@@ -83,7 +91,17 @@ async def run_entity_extraction_stage(
             "shard_count": event.shard_count,
             "input_artifact": event.artifact_uri,
             "output_artifact": artifact.model_dump(mode="json"),
-            "counts": {"chunks": len(chunks), "result_batches": len(extraction_results)},
+            "counts": {
+                "chunks": len(chunks),
+                "result_batches": len(extraction_results),
+                "vector_only_chunks": mode_counts.get(
+                    ExtractionMode.VECTOR_ONLY.value, 0
+                ),
+                "rule_only_chunks": mode_counts.get(
+                    ExtractionMode.KG_RULE_ONLY.value, 0
+                ),
+                "llm_chunks": mode_counts.get(ExtractionMode.KG_LLM.value, 0),
+            },
         },
     )
 
@@ -97,7 +115,15 @@ async def run_entity_extraction_stage(
     return StageResult(
         output_artifacts=[artifact],
         manifest=manifest,
-        counts={"chunks": len(chunks), "result_batches": len(extraction_results)},
+        counts={
+            "chunks": len(chunks),
+            "result_batches": len(extraction_results),
+            "vector_only_chunks": mode_counts.get(
+                ExtractionMode.VECTOR_ONLY.value, 0
+            ),
+            "rule_only_chunks": mode_counts.get(ExtractionMode.KG_RULE_ONLY.value, 0),
+            "llm_chunks": mode_counts.get(ExtractionMode.KG_LLM.value, 0),
+        },
         join_next_event=join_event,
         message=f"extracted {len(extraction_results)} chunk result batches",
     )

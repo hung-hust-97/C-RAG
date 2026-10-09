@@ -21,7 +21,7 @@ services:
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
       ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
     volumes:
-      - ../data/volumes/etcd1:/etcd
+      - ../../data/volumes/etcd1:/etcd
     mem_limit: 8g
     mem_reservation: 1g
     cpus: 2
@@ -41,7 +41,7 @@ services:
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
       ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
     volumes:
-      - ../data/volumes/etcd2:/etcd
+      - ../../data/volumes/etcd2:/etcd
 
   etcd3:
     <<: *etcd-common
@@ -52,7 +52,7 @@ services:
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
       ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
     volumes:
-      - ../data/volumes/etcd3:/etcd
+      - ../../data/volumes/etcd3:/etcd
 
   milvus-mixcoord-1: &mixcoord-common
     image: milvusdb/milvus:v2.6.21
@@ -69,7 +69,7 @@ services:
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET_NAME: milvus-vectors
     volumes:
-      - ../data/volumes/milvus-mc1:/var/lib/milvus
+      - ../../data/volumes/milvus-mc1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3 ]
     mem_limit: 8g
@@ -80,7 +80,7 @@ services:
     <<: *mixcoord-common
     container_name: crag-remote-mixcoord-2
     volumes:
-      - ../data/volumes/milvus-mc2:/var/lib/milvus
+      - ../../data/volumes/milvus-mc2:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
 
   milvus-proxy:
@@ -95,7 +95,7 @@ services:
       nofile: { soft: 65536, hard: 65536 }
     environment: *milvus-env
     volumes:
-      - ../data/volumes/milvus-proxy:/var/lib/milvus
+      - ../../data/volumes/milvus-proxy:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     ports:
       - "19531:19530"
@@ -119,7 +119,7 @@ services:
     command: [ "milvus", "run", "querynode" ]
     environment: *milvus-env
     volumes:
-      - ../data/volumes/milvus-qn1:/var/lib/milvus
+      - ../../data/volumes/milvus-qn1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
     deploy:
@@ -131,14 +131,14 @@ services:
     <<: *querynode-common
     container_name: crag-remote-querynode-2
     volumes:
-      - ../data/volumes/milvus-qn2:/var/lib/milvus
+      - ../../data/volumes/milvus-qn2:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
 
   milvus-querynode-3:
     <<: *querynode-common
     container_name: crag-remote-querynode-3
     volumes:
-      - ../data/volumes/milvus-qn3:/var/lib/milvus
+      - ../../data/volumes/milvus-qn3:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
 
   milvus-datanode-1: &datanode-common
@@ -149,7 +149,7 @@ services:
     command: [ "milvus", "run", "datanode" ]
     environment: *milvus-env
     volumes:
-      - ../data/volumes/milvus-dn1:/var/lib/milvus
+      - ../../data/volumes/milvus-dn1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
     mem_limit: 16g
@@ -160,7 +160,7 @@ services:
     <<: *datanode-common
     container_name: crag-remote-datanode-2
     volumes:
-      - ../data/volumes/milvus-dn2:/var/lib/milvus
+      - ../../data/volumes/milvus-dn2:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
   milvus-indexnode-1: &indexnode-common
     image: milvusdb/milvus:v2.6.21
@@ -170,7 +170,7 @@ services:
     command: [ "milvus", "run", "indexnode" ]
     environment: *milvus-env
     volumes:
-      - ../data/volumes/milvus-in1:/var/lib/milvus
+      - ../../data/volumes/milvus-in1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
     mem_limit: 32g
@@ -181,7 +181,7 @@ services:
     <<: *indexnode-common
     container_name: crag-remote-indexnode-2
     volumes:
-      - ../data/volumes/milvus-in2:/var/lib/milvus
+      - ../../data/volumes/milvus-in2:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
 
   milvus-streamingnode:
@@ -192,10 +192,10 @@ services:
     command: [ "milvus", "run", "streamingnode" ]
     environment: *milvus-env
     volumes:
-      - ../data/volumes/milvus-sn:/var/lib/milvus
+      - ../../data/volumes/milvus-sn:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
-    mem_limit: 16g
+    mem_limit: 32g
     networks: [ milvus_net ]
 
   attu:

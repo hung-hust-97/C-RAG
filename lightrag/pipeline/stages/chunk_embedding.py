@@ -52,6 +52,10 @@ def _is_transient_vector_upsert_error(exc: BaseException) -> bool:
             "failremainrequest",
             "syncsegmentid failed",
             "abnormal",
+            "quota exceeded",
+            "memory quota",
+            "force deny",
+            "message size too large",
         )
     )
 
@@ -97,9 +101,22 @@ async def run_chunk_embedding_stage(
     rows = await context.artifact_store.read_jsonl(event.artifact_uri)
     read_seconds = time.perf_counter() - read_started
     chunks = rows_to_chunks(rows)
-    chunks = filter_chunks(chunks, event.metadata.get("chunk_ids"))
-    if not chunks:
+    target_chunk_ids = event.metadata.get("chunk_ids")
+    filtered = filter_chunks(chunks, target_chunk_ids)
+    if not filtered:
+        if rows and target_chunk_ids:
+            logger.warning(
+                "[Pipeline] Skipping obsolete chunk_embedding shard: none of the %d chunk_ids match current artifact %s %s",
+                len(target_chunk_ids),
+                event.artifact_uri,
+                event.log_context(),
+            )
+            return StageResult(
+                counts={"chunks": 0},
+                message="Skipped obsolete shard: chunk_ids not found in current artifact",
+            )
         raise ValueError("chunk_embedding stage received no chunks")
+    chunks = filtered
 
     upsert_started = time.perf_counter()
     await upsert_vectors_with_retry(

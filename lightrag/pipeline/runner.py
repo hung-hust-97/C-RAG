@@ -505,14 +505,19 @@ class StageRunner:
     async def _handle_failure(
         self, event: PipelineStageEvent, exc: BaseException
     ) -> StageRunOutcome:
-        logger.exception("[Pipeline] Stage failed %s", event.log_context())
+        if isinstance(exc, FileNotFoundError):
+            logger.error("[Pipeline] Stage failed (artifact missing) %s: %s", event.log_context(), str(exc))
+        else:
+            logger.exception("[Pipeline] Stage failed %s", event.log_context())
+            
         pipeline_error = PipelineError(
             message=str(exc),
             stage=event.stage_name,
             error_type=type(exc).__name__,
-            traceback=traceback.format_exc(),
+            traceback=traceback.format_exc() if not isinstance(exc, FileNotFoundError) else "",
         )
         await self.context.coordinator.fail(event, pipeline_error)
+        await self._mark_document_failed(event, pipeline_error)
 
         if event.stage_name != StageName.FINALIZE:
             finalize_event = event.next_event(
@@ -541,6 +546,19 @@ class StageRunner:
         self, event: PipelineStageEvent, error: PipelineError
     ) -> None:
         try:
+            try:
+                if await self.context.coordinator.are_stages_complete(
+                    event.run_id, [StageName.FINALIZE]
+                ):
+                    logger.warning(
+                        "[Pipeline] Not marking document as failed because finalize is already completed %s run_id=%s",
+                        event.log_context(),
+                        event.run_id,
+                    )
+                    return
+            except Exception:
+                pass
+
             rag = await self.context.get_rag(
                 event.workspace_id, profile=StageName.FINALIZE.value
             )
@@ -579,6 +597,7 @@ class StageRunner:
                 "1",
                 "true",
                 "yes",
+                "on",
             }:
                 raise
             logger.exception("[Pipeline] Failed to update doc_status after stage error")
@@ -586,6 +605,19 @@ class StageRunner:
     async def _document_already_terminal(self, event: PipelineStageEvent) -> bool:
         if event.stage_name == StageName.FINALIZE or not event.doc_id:
             return False
+
+        try:
+            if await self.context.coordinator.are_stages_complete(
+                event.run_id, [StageName.FINALIZE]
+            ):
+                logger.warning(
+                    "[Pipeline] Ignoring stale stage for already finalized run_id=%s %s",
+                    event.run_id,
+                    event.log_context(),
+                )
+                return True
+        except Exception:
+            pass
 
         try:
             rag = await self.context.get_rag(event.workspace_id, profile=event.stage)

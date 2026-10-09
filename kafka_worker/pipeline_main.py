@@ -133,6 +133,7 @@ def _consumer_group(stage: StageName) -> str:
 
 
 PARALLEL_MESSAGE_STAGES = {
+    StageName.EXTRACTION,
     StageName.CHUNKING,
     StageName.CHUNK_EMBEDDING,
     StageName.ENTITY_EXTRACTION,

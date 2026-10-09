@@ -2876,6 +2876,9 @@ async def merge_nodes_and_edges(
                 batch_nodes_data = []
                 batch_vdb_data = {}
                 for entity_name, node_data, full_source_ids, data_for_vdb in results:
+                    if node_data is None:
+                        continue
+                        
                     batch_processed_entities.append(node_data)
                     batch_nodes_data.append((entity_name, node_data))
                     if data_for_vdb:

@@ -35,9 +35,23 @@ async def run_entity_extraction_stage(
     rag = await context.get_rag(event.workspace_id, profile=event.stage)
     rows = await context.artifact_store.read_jsonl(event.artifact_uri)
     chunks = rows_to_chunks(rows)
-    chunks = filter_chunks(chunks, event.metadata.get("chunk_ids"))
-    if not chunks:
+    target_chunk_ids = event.metadata.get("chunk_ids")
+    filtered = filter_chunks(chunks, target_chunk_ids)
+    if not filtered:
+        if rows and target_chunk_ids:
+            from lightrag.utils import logger
+            logger.warning(
+                "[Pipeline] Skipping obsolete entity_extraction shard: none of the %d chunk_ids match current artifact %s %s",
+                len(target_chunk_ids),
+                event.artifact_uri,
+                event.log_context(),
+            )
+            return StageResult(
+                counts={"chunks": 0},
+                message="Skipped obsolete shard: chunk_ids not found in current artifact",
+            )
         raise ValueError("entity_extraction stage received no chunks")
+    chunks = filtered
 
     doc_types = {chunk.get("doc_type", "general") for chunk in chunks.values()}
     doc_type = "legal" if doc_types == {"legal"} else "general"

@@ -113,6 +113,83 @@ def _get_env_optional_int(key: str) -> Optional[int]:
         return None
 
 
+SHARED_COLLECTIONS = {
+    "legal_chunks",
+    "general_chunks",
+    "legal_entities",
+    "general_entities",
+    "legal_relationships",
+    "general_relationships",
+}
+
+# Default max payload size per Milvus upsert batch (bytes).
+# Milvus streamingnode writes each upsert as a single WAL message to Kafka.
+# Kafka default message.max.bytes is 1 MB (1,048,576 bytes).
+# We leave ~200 KB headroom for WAL framing overhead.
+_DEFAULT_MAX_WAL_PAYLOAD_BYTES = 819_200  # 800 KB
+
+
+def _estimate_row_payload_bytes(row: dict) -> int:
+    """Estimate the serialized size of a single Milvus row for WAL payload.
+
+    Accounts for:
+    - Vector field: dim × 4 bytes (float32)
+    - Scalar / dynamic fields: UTF-8 encoded string length
+    - Per-row framing overhead: ~200 bytes
+    """
+    size = 200  # framing overhead
+    for key, value in row.items():
+        if key == "vector":
+            # numpy array or list of float32
+            size += len(value) * 4
+        elif isinstance(value, str):
+            size += len(value.encode("utf-8"))
+        elif isinstance(value, (int, float)):
+            size += 8
+        elif isinstance(value, (list, dict)):
+            import json
+            try:
+                size += len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+            except Exception:
+                size += 256
+        else:
+            size += 32
+    return size
+
+
+def _split_batch_by_payload_size(
+    batch: list[dict],
+    max_payload_bytes: int,
+) -> list[list[dict]]:
+    """Split *batch* into sub-batches whose estimated payload stays under
+    *max_payload_bytes*.
+
+    Each row is always placed in at least one sub-batch even if a single row
+    exceeds the limit (we cannot further split a row).
+    """
+    if not batch:
+        return []
+
+    sub_batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_size = 0
+
+    for row in batch:
+        row_size = _estimate_row_payload_bytes(row)
+        if current and (current_size + row_size) > max_payload_bytes:
+            sub_batches.append(current)
+            current = []
+            current_size = 0
+        current.append(row)
+        current_size += row_size
+
+    if current:
+        sub_batches.append(current)
+
+    return sub_batches
+
+
+
 @dataclass
 class MilvusIndexConfig:
     """
@@ -826,6 +903,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         self, collection_name: str, schema: CollectionSchema
     ) -> None:
         """Create a collection and apply resource-saving properties when supported."""
+        ALLOWED_COLLECTIONS = ["legal_chunks", "legal_entities", "legal_relationships", "general_chunks", "general_entities", "general_relationships"]
+        if collection_name not in ALLOWED_COLLECTIONS:
+            logger.error(f"[{self.workspace}] Attempted to create unauthorized collection: {collection_name}. Creation blocked!")
+            raise PermissionError(f"Collection '{collection_name}' is not in the allowed list.")
+            
         create_kwargs: dict[str, Any] = {
             "collection_name": collection_name,
             "schema": schema,
@@ -1801,8 +1883,26 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         else:
             self.workspace = ""
 
-        # Do not prefix workspace_id for global partitioned schema
-        self.final_namespace = self.namespace
+        # Determine doc type from environment or config
+        doc_type = (
+            kwargs.get("doc_type")
+            or self.global_config.get("doc_type")
+            or os.environ.get("PIPELINE_DOC_TYPE", "")
+        )
+        is_legal = str(doc_type).lower() == "legal"
+
+        # Use global partitioned schema for chunks, entities, and relationships
+        if self.namespace.endswith("chunks"):
+            self.final_namespace = "legal_chunks" if is_legal else "general_chunks"
+        elif self.namespace.endswith("entities"):
+            self.final_namespace = "legal_entities" if is_legal else "general_entities"
+        elif self.namespace.endswith("relationships"):
+            self.final_namespace = "legal_relationships" if is_legal else "general_relationships"
+        else:
+            if self.workspace:
+                self.final_namespace = f"{self.workspace}_{self.namespace}"
+            else:
+                self.final_namespace = self.namespace
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
         if cosine_threshold is None:
             raise ValueError(
@@ -2007,25 +2107,56 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 col_name = "legal_entities" if is_legal else "general_entities"
                 d["entity_id"] = d.get("id")
                 d["entity_name"] = d.get("entity_name") or d.get("id")
+                if "entity_type" not in d:
+                    d["entity_type"] = "UNKNOWN"
+            elif self.namespace.endswith("relationships"):
+                col_name = "legal_relationships" if is_legal else "general_relationships"
+                d["src_id"] = d.get("src_id") or ""
+                d["tgt_id"] = d.get("tgt_id") or ""
+                d["keywords"] = d.get("keywords") or ""
+                d["weight"] = float(d.get("weight") or 1.0)
             else:
                 continue
 
             col_groups.setdefault(col_name, []).append(d)
 
         upsert_batch_size = max(1, _get_env_int("MILVUS_UPSERT_BATCH_SIZE", 256))
+        max_payload = max(
+            1024,
+            _get_env_int("MILVUS_MAX_WAL_PAYLOAD_BYTES", _DEFAULT_MAX_WAL_PAYLOAD_BYTES),
+        )
         results = []
         for col_name, col_data in col_groups.items():
             for i in range(0, len(col_data), upsert_batch_size):
                 batch_data = col_data[i : i + upsert_batch_size]
-                
-                result = await asyncio.to_thread(
-                    self._milvus_call,
-                    "upsert",
-                    lambda client, batch_data=batch_data, c=col_name: client.upsert(
-                        collection_name=c, data=batch_data
-                    ),
-                )
-                results.append(result)
+
+                # Dynamic splitting: if the estimated payload exceeds the
+                # Kafka WAL message limit, split into smaller sub-batches.
+                sub_batches = _split_batch_by_payload_size(batch_data, max_payload)
+                if len(sub_batches) > 1:
+                    total_est = sum(
+                        _estimate_row_payload_bytes(r) for r in batch_data
+                    )
+                    logger.info(
+                        "[%s] Batch of %d rows (~%d bytes) exceeds max payload "
+                        "%d bytes for %s, splitting into %d sub-batches",
+                        self.workspace,
+                        len(batch_data),
+                        total_est,
+                        max_payload,
+                        col_name,
+                        len(sub_batches),
+                    )
+
+                for sub_batch in sub_batches:
+                    result = await asyncio.to_thread(
+                        self._milvus_call,
+                        "upsert",
+                        lambda client, bd=sub_batch, c=col_name: client.upsert(
+                            collection_name=c, data=bd
+                        ),
+                    )
+                    results.append(result)
         return results[-1] if len(results) == 1 else results
 
     async def _bulk_upsert_impl(self, data: dict[str, dict[str, Any]]) -> Any:
@@ -2137,6 +2268,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 col_name = "legal_entities" if is_legal else "general_entities"
                 d["entity_id"] = d.get("id")
                 d["entity_name"] = d.get("entity_name") or d.get("id")
+                if "entity_type" not in d:
+                    d["entity_type"] = "UNKNOWN"
+            elif self.namespace.endswith("relationships"):
+                col_name = "legal_relationships" if is_legal else "general_relationships"
+                d["src_id"] = d.get("src_id") or ""
+                d["tgt_id"] = d.get("tgt_id") or ""
+                d["keywords"] = d.get("keywords") or ""
+                d["weight"] = float(d.get("weight") or 1.0)
             else:
                 continue
 
@@ -2331,12 +2470,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             },
         }
 
-        # No workspace_id filter needed: the collection is already workspace-scoped
-        # via final_namespace (e.g., ws_<uuid>_relationships). Double-filtering by
-        # workspace_id breaks queries when legacy data has workspace_id="".
+        # Use workspace_id filter in shared collections to enable partition pruning
+        filter_expr = ""
+        if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+            filter_expr = f'workspace_id == "{self.workspace}"'
+
         logger.info(
             f"[{self.workspace}] Querying Milvus collection: {self.final_namespace}, "
-            f"top_k: {top_k}, threshold: {self.cosine_better_than_threshold}"
+            f"top_k: {top_k}, threshold: {self.cosine_better_than_threshold}, "
+            f"filter: '{filter_expr}'"
         )
 
         with self._loaded_collection_context():
@@ -2350,6 +2492,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     limit=top_k,
                     output_fields=output_fields,
                     search_params=search_params,
+                    filter=filter_expr,
                 ),
             )
 
@@ -2443,13 +2586,23 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
             # Delete the entity from Milvus collection
             import asyncio
-            result = await asyncio.to_thread(
-                self._milvus_call,
-                "delete",
-                lambda client: client.delete(
-                    collection_name=self.final_namespace, pks=[entity_id]
-                ),
-            )
+            if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                expr = f'id == "{entity_id}" and workspace_id == "{self.workspace}"'
+                result = await asyncio.to_thread(
+                    self._milvus_call,
+                    "delete",
+                    lambda client: client.delete(
+                        collection_name=self.final_namespace, filter=expr
+                    ),
+                )
+            else:
+                result = await asyncio.to_thread(
+                    self._milvus_call,
+                    "delete",
+                    lambda client: client.delete(
+                        collection_name=self.final_namespace, pks=[entity_id]
+                    ),
+                )
 
             if result and result.get("delete_count", 0) > 0:
                 logger.debug(
@@ -2472,6 +2625,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             # Search for relations where entity is either source or target
             expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
+            if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                expr = f'({expr}) and workspace_id == "{self.workspace}"'
 
             # Find all relations involving this entity
             import asyncio
@@ -2500,13 +2655,24 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
                 # Delete the relations
                 if relation_ids:
-                    delete_result = await asyncio.to_thread(
-                        self._milvus_call,
-                        "delete",
-                        lambda client: client.delete(
-                            collection_name=self.final_namespace, pks=relation_ids
-                        ),
-                    )
+                    if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                        id_list_str = ", ".join(f'"{rid}"' for rid in relation_ids)
+                        del_filter = f'id in [{id_list_str}] and workspace_id == "{self.workspace}"'
+                        delete_result = await asyncio.to_thread(
+                            self._milvus_call,
+                            "delete",
+                            lambda client: client.delete(
+                                collection_name=self.final_namespace, filter=del_filter
+                            ),
+                        )
+                    else:
+                        delete_result = await asyncio.to_thread(
+                            self._milvus_call,
+                            "delete",
+                            lambda client: client.delete(
+                                collection_name=self.final_namespace, pks=relation_ids
+                            ),
+                        )
 
                     logger.debug(
                         f"[{self.workspace}] Deleted {delete_result.get('delete_count', 0)} relations for {entity_name}"
@@ -2535,13 +2701,24 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             with self._loaded_collection_context():
                 for i in range(0, len(ids), batch_size):
                     batch_ids = ids[i:i + batch_size]
-                    result = await asyncio.to_thread(
-                        self._milvus_call,
-                        "delete",
-                        lambda client, b=batch_ids: client.delete(
-                            collection_name=self.final_namespace, pks=b
-                        ),
-                    )
+                    if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                        id_list_str = ", ".join(f'"{x}"' for x in batch_ids)
+                        del_filter = f'id in [{id_list_str}] and workspace_id == "{self.workspace}"'
+                        result = await asyncio.to_thread(
+                            self._milvus_call,
+                            "delete",
+                            lambda client, f=del_filter: client.delete(
+                                collection_name=self.final_namespace, filter=f
+                            ),
+                        )
+                    else:
+                        result = await asyncio.to_thread(
+                            self._milvus_call,
+                            "delete",
+                            lambda client, b=batch_ids: client.delete(
+                                collection_name=self.final_namespace, pks=b
+                            ),
+                        )
                     if result:
                         total_deleted += result.get("delete_count", 0)
 
@@ -2573,6 +2750,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             output_fields = list(self.meta_fields) + ["id"]
 
             # Query Milvus for a specific ID
+            filter_expr = f'id == "{id}"'
+            if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                filter_expr = f'{filter_expr} and workspace_id == "{self.workspace}"'
+
             import asyncio
             with self._loaded_collection_context():
                 result = await asyncio.to_thread(
@@ -2580,7 +2761,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     "query",
                     lambda client: client.query(
                         collection_name=self.final_namespace,
-                        filter=f'id == "{id}"',
+                        filter=filter_expr,
                         output_fields=output_fields,
                     ),
                 )
@@ -2620,6 +2801,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     batch_ids = ids[i:i + batch_size]
                     id_list = '", "'.join(batch_ids)
                     filter_expr = f'id in ["{id_list}"]'
+                    if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                        filter_expr = f'{filter_expr} and workspace_id == "{self.workspace}"'
 
                     # Query Milvus with the filter
                     import asyncio
@@ -2675,6 +2858,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     batch_ids = ids[i:i + batch_size]
                     id_list = '", "'.join(batch_ids)
                     filter_expr = f'id in ["{id_list}"]'
+                    if self.workspace and self.final_namespace in SHARED_COLLECTIONS:
+                        filter_expr = f'{filter_expr} and workspace_id == "{self.workspace}"'
 
                     # Query Milvus with the filter, requesting only vector field
                     import asyncio
@@ -2714,6 +2899,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             - On success: {"status": "success", "message": "data dropped"}
             - On failure: {"status": "error", "message": "<error details>"}
         """
+        # Protect shared multi-tenant collections from accidental drop
+        if self.final_namespace in SHARED_COLLECTIONS:
+            logger.warning(
+                f"[{self.workspace}] Drop operation on shared collection {self.final_namespace} is disabled to protect multi-tenant data."
+            )
+            return {"status": "ignored", "message": "drop disabled for shared collection"}
+
         try:
             # Drop the collection and recreate it
             if self._milvus_call(

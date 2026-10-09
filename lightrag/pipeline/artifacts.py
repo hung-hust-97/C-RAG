@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 from urllib.parse import urlparse
 
@@ -71,6 +72,13 @@ class PipelineArtifactStore:
             kind="manifest",
             metadata={"stage": _normalize_stage(stage)},
         )
+
+    async def cleanup_run_artifacts(self, run_id: str) -> int:
+        """Delete all intermediate artifacts associated with run_id.
+
+        Returns the number of deleted items/files.
+        """
+        raise NotImplementedError
 
 
 class LocalPipelineArtifactStore(PipelineArtifactStore):
@@ -151,6 +159,21 @@ class LocalPipelineArtifactStore(PipelineArtifactStore):
         payload = await self._read_bytes(path)
         return json.loads(payload.decode("utf-8"))
 
+    async def cleanup_run_artifacts(self, run_id: str) -> int:
+        if not run_id:
+            return 0
+        run_dir = self.root_dir / run_id
+        if not run_dir.exists():
+            return 0
+        loop = asyncio.get_running_loop()
+
+        def _rm() -> int:
+            count = sum(len(files) for _, _, files in os.walk(run_dir))
+            shutil.rmtree(run_dir, ignore_errors=True)
+            return count
+
+        return await loop.run_in_executor(None, _rm)
+
 
 class S3PipelineArtifactStore(PipelineArtifactStore):
     def __init__(
@@ -230,7 +253,7 @@ class S3PipelineArtifactStore(PipelineArtifactStore):
                 error_code = exc.response.get("Error", {}).get("Code", "")
                 # NoSuchKey is not retryable
                 if error_code == "NoSuchKey":
-                    raise
+                    raise FileNotFoundError(f"Artifact not found: {uri}") from exc
                 last_exc = exc
             except Exception as exc:
                 last_exc = exc
@@ -299,6 +322,27 @@ class S3PipelineArtifactStore(PipelineArtifactStore):
     async def read_json(self, uri: str) -> dict[str, Any]:
         payload = await self._get(uri)
         return json.loads(payload.decode("utf-8"))
+
+    async def cleanup_run_artifacts(self, run_id: str) -> int:
+        if not run_id:
+            return 0
+        prefix = f"{self.prefix}/{run_id}/"
+        deleted_count = 0
+        async with await self._client() as s3:
+            paginator = s3.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                contents = page.get("Contents", [])
+                if not contents:
+                    continue
+                delete_batch = [{"Key": obj["Key"]} for obj in contents]
+                for i in range(0, len(delete_batch), 1000):
+                    batch = delete_batch[i : i + 1000]
+                    await s3.delete_objects(
+                        Bucket=self.bucket,
+                        Delete={"Objects": batch, "Quiet": True},
+                    )
+                    deleted_count += len(batch)
+        return deleted_count
 
 
 def create_artifact_store_from_env() -> PipelineArtifactStore:

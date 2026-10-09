@@ -508,6 +508,28 @@ async def sweep_failed_stage_records(
     batch_size = int(os.getenv("PIPELINE_SWEEPER_FAILED_RETRY_BATCH_SIZE", "500"))
 
     db = await _get_db()
+
+    # Fast cleanup: mark downstream stage records with missing artifacts as max_attempts
+    # because retrying downstream stages without the required S3 artifact will never succeed.
+    try:
+        await db.execute(
+            f"""
+            UPDATE {table_name}
+            SET attempt = $1::int, updated_at = NOW()
+            WHERE status = 'failed'
+              AND attempt < $1::int
+              AND stage != 'extraction'
+              AND (
+                  error_json::text LIKE '%Artifact not found%'
+                  OR error_json->>'error_type' = 'FileNotFoundError'
+                  OR error_json::text LIKE '%received no chunks%'
+              )
+            """,
+            [max_attempts],
+        )
+    except Exception as exc:
+        logger.warning("Sweeper: failed to mark missing artifact records as exhausted: %s", exc)
+
     rows = await db.query(
         f"""
         SELECT run_id, stage, shard_index, shard_count, workspace_id, doc_id,
@@ -517,6 +539,14 @@ async def sweep_failed_stage_records(
         WHERE status = 'failed'
           AND attempt < $1::int
           AND EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) > $2::double precision
+          AND NOT (
+              stage != 'extraction'
+              AND (
+                  error_json::text LIKE '%Artifact not found%'
+                  OR error_json->>'error_type' = 'FileNotFoundError'
+                  OR error_json::text LIKE '%received no chunks%'
+              )
+          )
         ORDER BY COALESCE(updated_at, started_at, NOW()) ASC
         LIMIT $3::int
         """,

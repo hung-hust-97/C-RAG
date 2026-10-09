@@ -344,7 +344,49 @@ async def run_finalize_stage(event: PipelineStageEvent, context: Any) -> StageRe
     )
 
     if error_info:
+        try:
+            from lightrag.pipeline.models import StageName
+            rag = await context.get_rag(event.workspace_id, profile=StageName.FINALIZE.value)
+            await rag.doc_status.upsert(
+                {
+                    event.doc_id: {
+                        "status": DocStatus.FAILED,
+                        "error_msg": error_info.get("message", "Pipeline failed"),
+                        "error_stage": error_info.get("stage", "unknown"),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                }
+            )
+        except Exception as exc:
+            logger.warning("[Pipeline] Finalize failed to update doc_status: %s", exc)
         return _build_failed_result(event, error_info)
+
+    if getattr(context, "artifact_store", None):
+        cleanup_enabled = os.getenv("PIPELINE_CLEANUP_ARTIFACTS_ON_FINALIZE", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if cleanup_enabled:
+            try:
+                cleaned_count = await context.artifact_store.cleanup_run_artifacts(
+                    event.run_id
+                )
+                if cleaned_count > 0:
+                    logger.info(
+                        "[Pipeline] Cleaned up %d intermediate artifacts for run_id=%s doc_id=%s",
+                        cleaned_count,
+                        event.run_id,
+                        event.doc_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Pipeline] Failed to cleanup intermediate artifacts for run_id=%s doc_id=%s: %s",
+                    event.run_id,
+                    event.doc_id,
+                    exc,
+                )
 
     chunks_count = await _get_chunks_count(event, context)
 

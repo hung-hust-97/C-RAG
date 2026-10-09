@@ -307,7 +307,19 @@ def _is_retryable_openai_bad_request_text(error_text: str) -> bool:
     )
 
 
+import time
+
 _OPENAI_CLIENT_RR_INDEX = 0
+_FAILED_URLS: dict[str, float] = {}
+_FAILED_URL_COOLDOWN = 60.0
+
+def mark_url_failed(url: str, cooldown: float = _FAILED_URL_COOLDOWN) -> None:
+    if url:
+        _FAILED_URLS[url] = time.time() + cooldown
+
+def mark_url_success(url: str) -> None:
+    if url and url in _FAILED_URLS:
+        _FAILED_URLS.pop(url, None)
 
 def create_openai_async_client(
     api_key: str | None = None,
@@ -356,7 +368,10 @@ def create_openai_async_client(
         if base_url is not None:
             urls = [url.strip() for url in base_url.split(",") if url.strip()]
             if urls:
-                merged_configs["azure_endpoint"] = urls[_OPENAI_CLIENT_RR_INDEX % len(urls)]
+                now = time.time()
+                active_urls = [u for u in urls if _FAILED_URLS.get(u, 0) < now]
+                candidate_urls = active_urls if active_urls else urls
+                merged_configs["azure_endpoint"] = candidate_urls[_OPENAI_CLIENT_RR_INDEX % len(candidate_urls)]
                 _OPENAI_CLIENT_RR_INDEX += 1
         if azure_deployment is not None:
             merged_configs["azure_deployment"] = azure_deployment
@@ -388,7 +403,10 @@ def create_openai_async_client(
         if base_url is not None:
             urls = [url.strip() for url in base_url.split(",") if url.strip()]
             if urls:
-                merged_configs["base_url"] = urls[_OPENAI_CLIENT_RR_INDEX % len(urls)]
+                now = time.time()
+                active_urls = [u for u in urls if _FAILED_URLS.get(u, 0) < now]
+                candidate_urls = active_urls if active_urls else urls
+                merged_configs["base_url"] = candidate_urls[_OPENAI_CLIENT_RR_INDEX % len(candidate_urls)]
                 _OPENAI_CLIENT_RR_INDEX += 1
         else:
             merged_configs["base_url"] = os.environ.get(
@@ -1087,40 +1105,61 @@ async def openai_embed(
         client_configs=client_configs,
     )
 
-    async with openai_async_client:
-        # Determine the correct model identifier to use
-        # For Azure OpenAI, we must use the deployment name instead of the model name
-        api_model = azure_deployment if use_azure and azure_deployment else model
+    current_url = ""
+    if hasattr(openai_async_client, "base_url"):
+        current_url = str(openai_async_client.base_url)
 
-        # Prepare API call parameters
-        api_params = {
-            "model": api_model,
-            "input": texts,
-            "encoding_format": "base64",
-        }
+    try:
+        async with openai_async_client:
+            # Determine the correct model identifier to use
+            # For Azure OpenAI, we must use the deployment name instead of the model name
+            api_model = azure_deployment if use_azure and azure_deployment else model
 
-        # Add dimensions parameter only if embedding_dim is provided
-        if embedding_dim is not None:
-            api_params["dimensions"] = embedding_dim
-
-        # Make API call
-        response = await openai_async_client.embeddings.create(**api_params)
-
-        if token_tracker and hasattr(response, "usage"):
-            token_counts = {
-                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                "total_tokens": getattr(response.usage, "total_tokens", 0),
+            # Prepare API call parameters
+            api_params = {
+                "model": api_model,
+                "input": texts,
+                "encoding_format": "base64",
             }
-            token_tracker.add_usage(token_counts)
 
-        return np.array(
-            [
-                np.array(dp.embedding, dtype=np.float32)
-                if isinstance(dp.embedding, list)
-                else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
-                for dp in response.data
-            ]
-        )
+            # Add dimensions parameter only if embedding_dim is provided
+            if embedding_dim is not None:
+                api_params["dimensions"] = embedding_dim
+
+            # Make API call
+            response = await openai_async_client.embeddings.create(**api_params)
+
+            if current_url:
+                mark_url_success(current_url)
+
+            if token_tracker and hasattr(response, "usage"):
+                token_counts = {
+                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
+                    "total_tokens": getattr(response.usage, "total_tokens", 0),
+                }
+                token_tracker.add_usage(token_counts)
+
+            return np.array(
+                [
+                    np.array(dp.embedding, dtype=np.float32)
+                    if isinstance(dp.embedding, list)
+                    else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
+                    for dp in response.data
+                ]
+            )
+    except (APIConnectionError, APITimeoutError) as e:
+        if current_url:
+            logger.warning(
+                f"[Embedding] Endpoint {current_url} failed with {type(e).__name__}; "
+                f"putting on cooldown for {_FAILED_URL_COOLDOWN}s"
+            )
+            for base in [base_url, current_url]:
+                if base:
+                    for u in [x.strip() for x in base.split(",") if x.strip()]:
+                        if u in current_url or current_url.rstrip("/") in u.rstrip("/"):
+                            mark_url_failed(u)
+            mark_url_failed(current_url)
+        raise
 
 
 # Azure OpenAI wrapper functions for backward compatibility

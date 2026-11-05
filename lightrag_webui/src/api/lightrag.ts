@@ -530,11 +530,21 @@ export const scanNewDocuments = async (): Promise<ScanResponse> => {
   return response.data
 }
 
-export const reprocessFailedDocuments = async (docIds?: string[]): Promise<ReprocessFailedResponse> => {
+export const reprocessFailedDocuments = async (
+  docIds?: string[],
+  docType?: 'all' | 'legal' | 'general'
+): Promise<ReprocessFailedResponse> => {
   const workspaceId = getSelectedWorkspaceId()
+  const payload: { doc_ids?: string[]; doc_type?: string } = {}
+  if (docIds && docIds.length > 0) {
+    payload.doc_ids = docIds
+  }
+  if (docType && docType !== 'all') {
+    payload.doc_type = docType
+  }
   const response = await axiosInstance.post(
     '/documents/reprocess_failed',
-    docIds ? { doc_ids: docIds } : null,
+    Object.keys(payload).length > 0 ? payload : null,
     {
       params: { workspace_id: workspaceId }
     }
@@ -1131,6 +1141,8 @@ export const getWorkspaces = async (): Promise<WorkspacesResponse> => {
   return response.data
 }
 
+export type PipelineDocType = 'all' | 'legal' | 'general'
+
 export type PipelineStageRunResponse = {
   run_id: string
   stage: string
@@ -1139,6 +1151,7 @@ export type PipelineStageRunResponse = {
   workspace_id: string
   doc_id: string
   document_name: string | null
+  doc_type?: 'legal' | 'general'
   status: 'running' | 'paused' | 'done' | 'failed'
   attempt: number
   error_json: any | null
@@ -1152,6 +1165,7 @@ export type PipelineStageRunsRequest = {
   stage?: string | null
   status?: string[] | null
   search?: string | null
+  doc_type?: PipelineDocType | null
   page: number
   page_size: number
 }
@@ -1162,6 +1176,11 @@ export type PaginatedPipelineStageRunsResponse = {
   page: number
   page_size: number
   status_matrix: Record<string, Record<string, number>>
+  doc_type_counts?: {
+    all: number
+    legal: number
+    general: number
+  }
 }
 
 export const getPipelineStageRuns = async (
@@ -1196,6 +1215,23 @@ export const approveStage = async (
     stage: stage,
     shard_index: shardIndex,
     workspace_id: resolvedWorkspaceId
+  })
+  return response.data
+}
+
+export const replayFailedStage = async (
+  runId: string,
+  stage: string,
+  shardIndex: number,
+  workspaceId: string,
+  reason: string
+): Promise<{ status: string; message: string; event_id: string; attempt: number }> => {
+  const response = await axiosInstance.post('/documents/replay_stage', {
+    run_id: runId,
+    stage,
+    shard_index: shardIndex,
+    workspace_id: workspaceId,
+    reason
   })
   return response.data
 }

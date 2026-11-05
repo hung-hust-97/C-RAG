@@ -21,16 +21,19 @@ import {
   DialogTitle,
   DialogClose
 } from '@/components/ui/Dialog'
+import Badge from '@/components/ui/Badge'
 import {
   getPipelineStageRuns,
   getAllWorkspacesPipelineStageRuns,
   reprocessFailedDocuments,
   approveStage,
+  replayFailedStage,
   bulkApproveStage,
   getStageSpeed,
   getPipelineConfig,
   updatePipelineConfig,
   PipelineStageRunResponse,
+  PipelineDocType,
   StageSpeedEntry,
   getWorkspaces,
   type WorkspaceItem
@@ -54,7 +57,9 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   PlusIcon,
-  Trash2Icon
+  Trash2Icon,
+  ScaleIcon,
+  LayersIcon
 } from 'lucide-react'
 
 const CORE_STAGES = [
@@ -143,6 +148,12 @@ export default function Monitor() {
   const [searchDebounced, setSearchDebounced] = useState('')
   const [selectedStage, setSelectedStage] = useState<string | null>(null)
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([])
+  const [activeDocType, setActiveDocType] = useState<PipelineDocType>('all')
+  const [docTypeCounts, setDocTypeCounts] = useState<{ all: number; legal: number; general: number }>({
+    all: 0,
+    legal: 0,
+    general: 0
+  })
 
   // Selection state
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([])
@@ -180,11 +191,11 @@ export default function Monitor() {
     return () => clearTimeout(timer)
   }, [search])
 
-  // Reset state when activeWorkspaceId changes
+  // Reset state when activeWorkspaceId or activeDocType changes
   useEffect(() => {
     setPage(1)
     setSelectedDocIds([])
-  }, [activeWorkspaceId])
+  }, [activeWorkspaceId, activeDocType])
 
   // Fetch runs
   const fetchRuns = useCallback(async (options?: { showLoading?: boolean; quiet?: boolean }) => {
@@ -200,6 +211,7 @@ export default function Monitor() {
         stage: selectedStage,
         status: selectedStatuses.length > 0 ? selectedStatuses : null,
         search: searchDebounced || null,
+        doc_type: activeDocType !== 'all' ? activeDocType : null,
         page,
         page_size: pageSize
       }
@@ -209,6 +221,9 @@ export default function Monitor() {
       setRuns(response.runs)
       setTotal(response.total)
       setStatusMatrix(response.status_matrix)
+      if (response.doc_type_counts) {
+        setDocTypeCounts(response.doc_type_counts)
+      }
       setLastUpdatedAt(new Date())
 
       // Fetch speed stats alongside if not querying all workspaces
@@ -237,7 +252,7 @@ export default function Monitor() {
       fetchInFlightRef.current = false
       if (showLoading) setLoading(false)
     }
-  }, [activeWorkspaceId, selectedStage, selectedStatuses, searchDebounced, page, pageSize, t])
+  }, [activeWorkspaceId, selectedStage, selectedStatuses, searchDebounced, activeDocType, page, pageSize, t])
 
   // Fetch on change
   useEffect(() => {
@@ -309,6 +324,7 @@ export default function Monitor() {
     setSelectedStage(null)
     setSelectedStatuses([])
     setSearch('')
+    setActiveDocType('all')
     setPage(1)
   }
 
@@ -357,12 +373,18 @@ export default function Monitor() {
   }
 
   const handleReprocessAllFailed = async () => {
-    const promise = reprocessFailedDocuments()
+    const promise = reprocessFailedDocuments(undefined, activeDocType)
+    const toastLoading = activeDocType === 'legal'
+      ? t('monitorPanel.reprocessingLegal', 'Initiating reprocessing for legal documents...')
+      : activeDocType === 'general'
+        ? t('monitorPanel.reprocessingGeneral', 'Initiating reprocessing for general documents...')
+        : t('monitorPanel.reprocessing', 'Initiating reprocessing...')
+
     toast.promise(promise, {
-      loading: t('monitorPanel.reprocessing', 'Initiating reprocessing...'),
-      success: () => {
+      loading: toastLoading,
+      success: (result) => {
         setTimeout(fetchRuns, 1500)
-        return t('monitorPanel.reprocessSuccess', 'Reprocessing initiated successfully')
+        return result?.message || t('monitorPanel.reprocessSuccess', 'Reprocessing initiated successfully')
       },
       error: (err) => `${t('monitorPanel.reprocessFailed', 'Failed to reprocess')}: ${errorMessage(err)}`
     })
@@ -378,6 +400,31 @@ export default function Monitor() {
         return t('monitorPanel.approveSuccess', 'Stage approved successfully')
       },
       error: (err) => `Failed to approve stage: ${errorMessage(err)}`
+    })
+  }
+
+  const handleReplayStage = async (
+    run: PipelineStageRunResponse
+  ) => {
+    const reason = window.prompt(
+      t('monitorPanel.replayReasonPrompt', 'Why should this failed stage be replayed?')
+    )
+    if (!reason?.trim()) return
+
+    const promise = replayFailedStage(
+      run.run_id,
+      run.stage,
+      run.shard_index,
+      run.workspace_id,
+      reason.trim()
+    )
+    toast.promise(promise, {
+      loading: t('monitorPanel.replayingStage', 'Queueing stage replay...'),
+      success: (result) => {
+        setTimeout(fetchRuns, 1500)
+        return result.message
+      },
+      error: (err) => `${t('monitorPanel.replayFailed', 'Failed to queue stage replay')}: ${errorMessage(err)}`
     })
   }
 
@@ -461,7 +508,11 @@ export default function Monitor() {
             className="border-red-200 dark:border-red-900/50 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-600 dark:text-red-400"
           >
             <AlertTriangleIcon className="size-4 mr-2" />
-            {t('monitorPanel.reprocessAllFailed', 'Reprocess All Failed')}
+            {activeDocType === 'legal'
+              ? t('monitorPanel.reprocessAllFailedLegal', 'Reprocess Failed Legal')
+              : activeDocType === 'general'
+                ? t('monitorPanel.reprocessAllFailedGeneral', 'Reprocess Failed General')
+                : t('monitorPanel.reprocessAllFailed', 'Reprocess All Failed')}
           </Button>
         </div>
       </div>
@@ -732,6 +783,108 @@ export default function Monitor() {
         )}
       </div>
 
+      {/* Document Type Tabs Bar */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-zinc-50/80 dark:bg-zinc-900/40 p-2.5 rounded-xl border border-zinc-200/80 dark:border-zinc-800">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {/* Tab 1: All */}
+          <button
+            onClick={() => {
+              setActiveDocType('all')
+              setPage(1)
+            }}
+            className={cn(
+              'px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all duration-150',
+              activeDocType === 'all'
+                ? 'bg-emerald-500 text-white shadow-sm'
+                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+            )}
+          >
+            <LayersIcon className="size-3.5" />
+            <span>{t('monitorPanel.tabs.all', 'All Documents')}</span>
+            <span
+              className={cn(
+                'px-1.5 py-0.5 rounded-full text-[10px] font-mono',
+                activeDocType === 'all'
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'
+              )}
+            >
+              {docTypeCounts.all}
+            </span>
+          </button>
+
+          {/* Tab 2: Legal Documents */}
+          <button
+            onClick={() => {
+              setActiveDocType('legal')
+              setPage(1)
+            }}
+            className={cn(
+              'px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all duration-150',
+              activeDocType === 'legal'
+                ? 'bg-purple-600 text-white shadow-sm'
+                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+            )}
+          >
+            <ScaleIcon className="size-3.5" />
+            <span>{t('monitorPanel.tabs.legal', 'Legal Documents')}</span>
+            <span
+              className={cn(
+                'px-1.5 py-0.5 rounded-full text-[10px] font-mono',
+                activeDocType === 'legal'
+                  ? 'bg-purple-700 text-white'
+                  : 'bg-purple-100 dark:bg-purple-950/40 text-purple-700 dark:text-purple-300'
+              )}
+            >
+              {docTypeCounts.legal}
+            </span>
+          </button>
+
+          {/* Tab 3: General Documents */}
+          <button
+            onClick={() => {
+              setActiveDocType('general')
+              setPage(1)
+            }}
+            className={cn(
+              'px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all duration-150',
+              activeDocType === 'general'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100 dark:hover:bg-zinc-800/60'
+            )}
+          >
+            <FileTextIcon className="size-3.5" />
+            <span>{t('monitorPanel.tabs.general', 'General Documents')}</span>
+            <span
+              className={cn(
+                'px-1.5 py-0.5 rounded-full text-[10px] font-mono',
+                activeDocType === 'general'
+                  ? 'bg-blue-700 text-white'
+                  : 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
+              )}
+            >
+              {docTypeCounts.general}
+            </span>
+          </button>
+        </div>
+
+        <div className="text-xs text-zinc-500 dark:text-zinc-400 font-medium px-1">
+          {activeDocType === 'legal' && (
+            <span className="text-purple-600 dark:text-purple-400">
+              ⚖️ {t('monitorPanel.filterActiveLegal', 'Viewing Vietnamese Legal Documents')}
+            </span>
+          )}
+          {activeDocType === 'general' && (
+            <span className="text-blue-600 dark:text-blue-400">
+              📄 {t('monitorPanel.filterActiveGeneral', 'Viewing General Documents')}
+            </span>
+          )}
+          {activeDocType === 'all' && (
+            <span>{t('monitorPanel.filterActiveAll', 'Viewing all document types')}</span>
+          )}
+        </div>
+      </div>
+
       {/* Stage Cards Matrix */}
       <div>
         <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-3">
@@ -945,7 +1098,7 @@ export default function Monitor() {
               })}
             </div>
 
-            {(selectedStage || selectedStatuses.length > 0 || search) && (
+            {(selectedStage || selectedStatuses.length > 0 || search || activeDocType !== 'all') && (
               <Button variant="ghost" size="sm" onClick={resetFilters} className="text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">
                 <XIcon className="size-4 mr-1.5" />
                 Clear Filters
@@ -988,6 +1141,7 @@ export default function Monitor() {
                   />
                 </TableHead>
                 <TableHead>{t('monitorPanel.document', 'Document')}</TableHead>
+                <TableHead className="w-28">{t('monitorPanel.docType', 'Type')}</TableHead>
                 <TableHead>Workspace</TableHead>
                 <TableHead>{t('monitorPanel.stage', 'Stage')}</TableHead>
                 <TableHead className="w-24 text-center">Shard</TableHead>
@@ -1001,7 +1155,7 @@ export default function Monitor() {
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="h-48 text-center">
+                  <TableCell colSpan={11} className="h-48 text-center">
                     <div className="flex flex-col items-center justify-center gap-2 text-zinc-500">
                       <RefreshCwIcon className="h-8 w-8 animate-spin text-emerald-500" />
                       <span>Loading runs...</span>
@@ -1010,7 +1164,7 @@ export default function Monitor() {
                 </TableRow>
               ) : runs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="h-48 text-center">
+                  <TableCell colSpan={11} className="h-48 text-center">
                     <div className="flex flex-col items-center justify-center p-6">
                       <FileTextIcon className="h-10 w-10 text-zinc-300 dark:text-zinc-700 mb-2" />
                       <p className="text-sm text-zinc-500 dark:text-zinc-400">
@@ -1048,6 +1202,25 @@ export default function Monitor() {
                             </span>
                           )}
                         </div>
+                      </TableCell>
+                      <TableCell>
+                        {run.doc_type === 'legal' ? (
+                          <Badge
+                            variant="outline"
+                            className="bg-purple-50 dark:bg-purple-950/30 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800/60 font-medium text-[11px] px-2 py-0.5 inline-flex items-center gap-1"
+                          >
+                            <ScaleIcon className="size-3 text-purple-500" />
+                            {t('monitorPanel.badges.legal', 'Legal')}
+                          </Badge>
+                        ) : (
+                          <Badge
+                            variant="outline"
+                            className="bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800/60 font-medium text-[11px] px-2 py-0.5 inline-flex items-center gap-1"
+                          >
+                            <FileTextIcon className="size-3 text-blue-500" />
+                            {t('monitorPanel.badges.general', 'General')}
+                          </Badge>
+                        )}
                       </TableCell>
                       <TableCell>
                         <span className="text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 px-2 py-1 rounded font-semibold font-mono">
@@ -1110,6 +1283,17 @@ export default function Monitor() {
                               tooltip={t('monitorPanel.approve', 'Approve / Resume')}
                             >
                               <PlayIcon className="size-4" />
+                            </Button>
+                          )}
+                          {run.status === 'failed' && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-8 px-2.5 text-red-600 hover:text-emerald-600 dark:text-red-400 dark:hover:text-emerald-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/80"
+                              onClick={() => handleReplayStage(run)}
+                              tooltip={t('monitorPanel.replayStage', 'Replay failed stage')}
+                            >
+                              <RotateCcwIcon className="size-4" />
                             </Button>
                           )}
                           {hasError && (

@@ -5,6 +5,7 @@ import contextlib
 import os
 import signal
 import socket
+import time
 import traceback
 from aiohttp import web
 
@@ -204,6 +205,22 @@ def _stage_int_env(
         return default
 
 
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return max(minimum, int(raw_value))
+    except ValueError:
+        logger.warning(
+            "[Pipeline] Invalid integer config %s=%r, using default=%s",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
+
 def _consumer_timeout_config(stage: StageName) -> dict[str, int]:
     defaults = DEFAULT_CONSUMER_TIMEOUTS_BY_STAGE[stage]
     config = {
@@ -380,6 +397,28 @@ async def _publish_event(
     doc_type = _canonical_doc_type(event)
     topic = STAGE_TOPICS[event.stage_name][doc_type]
     await publish_pipeline_event(producer, partition_allocator, topic, event)
+
+
+async def _relay_pipeline_outbox(
+    coordinator,
+    producer: AIOKafkaProducer,
+    partition_allocator,
+    shutdown_event: asyncio.Event,
+) -> None:
+    interval_seconds = max(
+        1, _env_int("PIPELINE_OUTBOX_POLL_INTERVAL_SECONDS", 10)
+    )
+    while not shutdown_event.is_set():
+        try:
+            await coordinator.publish_outbox(
+                lambda event: _publish_event(producer, partition_allocator, event)
+            )
+        except Exception:
+            logger.exception("[Pipeline] Outbox relay iteration failed")
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            continue
 
 
 async def _publish_kms_response(
@@ -614,6 +653,68 @@ async def _process_partition_in_parallel(
         await asyncio.sleep(2)
 
 
+class GeneralPriorityGate:
+    """Decides when legal partitions must be paused so general documents go first.
+
+    Legal consumption is paused while general records keep arriving and for
+    ``hold_seconds`` after the last one, then resumed so legal still progresses
+    whenever general traffic is idle.
+    """
+
+    def __init__(self, hold_seconds: float, clock=time.monotonic) -> None:
+        self.hold_seconds = max(0.0, hold_seconds)
+        self._clock = clock
+        self._last_general_at: float | None = None
+
+    def observe(self, has_general: bool) -> None:
+        if has_general:
+            self._last_general_at = self._clock()
+
+    def should_pause_legal(self) -> bool:
+        if self._last_general_at is None:
+            return False
+        return self._clock() - self._last_general_at < self.hold_seconds
+
+
+def _create_priority_gate(stage: StageName) -> GeneralPriorityGate | None:
+    """Priority applies only to a worker that consumes both doc types."""
+    enabled = os.getenv("PIPELINE_GENERAL_PRIORITY_ENABLED", "true").lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+    if os.environ.get("PIPELINE_DOC_TYPE", "all").lower() != "all":
+        return None
+    hold_ms = _stage_int_env(
+        "PIPELINE_GENERAL_PRIORITY_HOLD_MS", stage, 3000, minimum=0
+    )
+    return GeneralPriorityGate(hold_seconds=hold_ms / 1000)
+
+
+def _general_first(result, legal_topic: str):
+    """Order polled partitions so general partitions are handled before legal."""
+    return sorted(result.items(), key=lambda item: item[0].topic == legal_topic)
+
+
+def _apply_legal_pause(
+    consumer: AIOKafkaConsumer, legal_topic: str, paused: set, pause: bool
+) -> set:
+    """Pause or resume the legal partitions; returns the currently paused set."""
+    legal_tps = {tp for tp in consumer.assignment() if tp.topic == legal_topic}
+    if pause:
+        newly_paused = legal_tps - paused
+        if newly_paused:
+            consumer.pause(*newly_paused)
+            logger.info(
+                "[Pipeline] Pausing legal partitions for general priority: %s",
+                sorted(str(tp) for tp in newly_paused),
+            )
+        return paused | newly_paused
+    to_resume = paused & legal_tps
+    if to_resume:
+        consumer.resume(*to_resume)
+        logger.info("[Pipeline] Resuming legal partitions after general idle")
+    return set()
+
+
 async def _consume_loop(
     consumer: AIOKafkaConsumer,
     stage: StageName,
@@ -638,13 +739,27 @@ async def _consume_loop(
         timeout_config["rebalance_timeout_ms"],
         timeout_config["request_timeout_ms"],
     )
+    gate = _create_priority_gate(stage)
+    legal_topic = STAGE_TOPICS[stage]["legal"]
+    legal_paused: set = set()
     while not shutdown_event.is_set():
         try:
+            if gate is not None:
+                legal_paused = _apply_legal_pause(
+                    consumer, legal_topic, legal_paused, gate.should_pause_legal()
+                )
             result = await consumer.getmany(timeout_ms=1000, max_records=max_records)
+            if gate is not None:
+                gate.observe(
+                    has_general=any(
+                        tp.topic != legal_topic and messages
+                        for tp, messages in result.items()
+                    )
+                )
             if not result:
                 continue
 
-            for tp, messages in result.items():
+            for tp, messages in _general_first(result, legal_topic):
                 if parallel_messages:
                     await _process_partition_in_parallel(
                         consumer, tp, messages, stage, runner, producer
@@ -785,6 +900,12 @@ async def main() -> None:
         )
         raise
     started_at = utc_now_iso()
+    outbox_task = asyncio.create_task(
+        _relay_pipeline_outbox(
+            coordinator, producer, partition_allocator, shutdown_event
+        ),
+        name=f"pipeline-outbox-relay-{stage.value}",
+    )
     logger.info(
         "[Pipeline] Worker started %s debug_sync=%s",
         _format_worker_context(_worker_context(stage)),
@@ -800,6 +921,9 @@ async def main() -> None:
             started_at,
         )
     finally:
+        shutdown_event.set()
+        outbox_task.cancel()
+        await asyncio.gather(outbox_task, return_exceptions=True)
         logger.info(
             "[Pipeline] Shutting down stage worker %s",
             _format_worker_context(_worker_context(stage)),

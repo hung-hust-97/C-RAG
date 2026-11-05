@@ -85,6 +85,8 @@ CLAUDE.md
 # Kiro
 .kiro
 .kiro/
+.kiro/*
+.kiro/tests/*
 .agent/
 .agents/
 .codex/
@@ -97,4 +99,10 @@ TASK_*.md
 *WALKTHROUGH*.md
 *IMPLEMENTATION*.md
 test*
+!.kiro/
+!.kiro/tests/
+!.kiro/tests/test_entity_extraction_strictness.py
+!.kiro/tests/test_legal_chunking_limits.py
+!.kiro/tests/test_pipeline_outbox.py
+!.kiro/tests/test_pipeline_retry_budget.py
 data_backups/

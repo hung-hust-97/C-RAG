@@ -488,6 +488,10 @@
     "document": "Tài liệu",
     "actions": "Hành động",
     "reprocess": "Xử lý lại",
+    "replayStage": "Chạy lại giai đoạn lỗi",
+    "replayReasonPrompt": "Vì sao cần chạy lại giai đoạn này?",
+    "replayingStage": "Đang xếp hàng chạy lại giai đoạn...",
+    "replayFailed": "Không thể xếp hàng chạy lại giai đoạn",
     "viewError": "Xem lỗi",
     "errorDetail": "Chi tiết lỗi",
     "noStageRuns": "Không có tiến trình chạy nào khớp với bộ lọc.",
@@ -510,6 +514,23 @@
     "approve": "Duyệt / Chạy tiếp",
     "reprocessSuccess": "Yêu cầu xử lý lại đã được gửi thành công",
     "reprocessFailed": "Gửi yêu cầu xử lý lại thất bại",
+    "reprocessingLegal": "Đang gửi yêu cầu xử lý lại các văn bản pháp luật bị lỗi...",
+    "reprocessingGeneral": "Đang gửi yêu cầu xử lý lại các văn bản thường bị lỗi...",
+    "reprocessAllFailedLegal": "Xử lý lại lỗi (Pháp luật)",
+    "reprocessAllFailedGeneral": "Xử lý lại lỗi (Thường)",
+    "docType": "Loại văn bản",
+    "tabs": {
+      "all": "Tất cả tài liệu",
+      "legal": "Văn bản pháp luật",
+      "general": "Văn bản thường"
+    },
+    "badges": {
+      "legal": "Pháp luật",
+      "general": "Thường"
+    },
+    "filterActiveAll": "Đang xem toàn bộ văn bản",
+    "filterActiveLegal": "Đang xem riêng Văn bản pháp luật",
+    "filterActiveGeneral": "Đang xem riêng Văn bản thường",
     "close": "Đóng"
   }
 }

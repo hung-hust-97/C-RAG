@@ -488,6 +488,10 @@
     "document": "Document",
     "actions": "Actions",
     "reprocess": "Reprocess",
+    "replayStage": "Replay failed stage",
+    "replayReasonPrompt": "Why should this failed stage be replayed?",
+    "replayingStage": "Queueing stage replay...",
+    "replayFailed": "Failed to queue stage replay",
     "viewError": "View Error",
     "errorDetail": "Error Detail",
     "noStageRuns": "No stage runs matching current filters.",
@@ -510,6 +514,23 @@
     "approve": "Approve / Resume",
     "reprocessSuccess": "Reprocess initiated successfully",
     "reprocessFailed": "Failed to initiate reprocess",
+    "reprocessingLegal": "Initiating reprocessing for legal documents...",
+    "reprocessingGeneral": "Initiating reprocessing for general documents...",
+    "reprocessAllFailedLegal": "Reprocess Failed Legal",
+    "reprocessAllFailedGeneral": "Reprocess Failed General",
+    "docType": "Type",
+    "tabs": {
+      "all": "All Documents",
+      "legal": "Legal Documents",
+      "general": "General Documents"
+    },
+    "badges": {
+      "legal": "Legal",
+      "general": "General"
+    },
+    "filterActiveAll": "Viewing all document types",
+    "filterActiveLegal": "Viewing Vietnamese Legal Documents",
+    "filterActiveGeneral": "Viewing General Documents",
     "close": "Close"
   }
 }

@@ -8,7 +8,7 @@ from typing import Any
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 from lightrag.utils import logger
 
-from .common import filter_chunks, rows_to_chunks
+from .common import filter_chunks, get_rag_for_event, rows_to_chunks
 
 
 def _env_int(name: str, default: int) -> int:
@@ -96,7 +96,7 @@ async def run_chunk_embedding_stage(
         raise ValueError("chunk_embedding stage requires artifact_uri")
 
     stage_started = time.perf_counter()
-    rag = await context.get_rag(event.workspace_id, profile=event.stage)
+    rag = await get_rag_for_event(context, event, profile=event.stage)
     read_started = time.perf_counter()
     rows = await context.artifact_store.read_jsonl(event.artifact_uri)
     read_seconds = time.perf_counter() - read_started

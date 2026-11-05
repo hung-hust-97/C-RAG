@@ -60,8 +60,8 @@ function App() {
     // Health check function
     const performHealthCheck = async () => {
       try {
-        // Only perform health check if component is still mounted
-        if (isMountedRef.current) {
+        // Only perform health check if component is still mounted and page is visible
+        if (isMountedRef.current && (typeof document === 'undefined' || !document.hidden)) {
           await useBackendState.getState().check();
         }
       } catch (error) {

@@ -9,6 +9,7 @@ from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 from lightrag.utils import logger
 
 from .chunk_embedding import upsert_vectors_with_retry
+from .common import get_rag_for_event
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -23,7 +24,7 @@ async def run_kg_embedding_stage(event: PipelineStageEvent, context: Any) -> Sta
         raise ValueError("kg_embedding stage requires artifact_uri")
 
     stage_started = time.perf_counter()
-    rag = await context.get_rag(event.workspace_id, profile=event.stage)
+    rag = await get_rag_for_event(context, event, profile=event.stage)
     read_started = time.perf_counter()
     rows = await context.artifact_store.read_jsonl(event.artifact_uri)
     read_seconds = time.perf_counter() - read_started

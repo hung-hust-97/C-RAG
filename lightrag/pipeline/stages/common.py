@@ -9,7 +9,25 @@ from lightrag.kg.postgres_impl import ClientManager
 from lightrag.kg.postgres_impl import to_uuid
 
 from lightrag.constants import GRAPH_FIELD_SEP
+from lightrag.pipeline.models import PipelineStageEvent
 from lightrag.utils import compute_mdhash_id
+
+
+async def get_rag_for_event(
+    context: Any,
+    event: PipelineStageEvent,
+    profile: object | None = None,
+) -> Any:
+    if event.generation_id is None and event.storage_workspace_id is None:
+        return await context.get_rag(event.workspace_id, profile=profile)
+
+    getter = getattr(context, "get_rag_for_event", None)
+    if not callable(getter):
+        raise RuntimeError(
+            "Generation-targeted pipeline events require a generation-aware "
+            "RAG context"
+        )
+    return await getter(event, profile=profile)
 
 
 def chunks_to_rows(chunks: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:

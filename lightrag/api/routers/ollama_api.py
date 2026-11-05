@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional, Type
+from typing import List, Dict, Any, Awaitable, Callable, Optional, Type
 from lightrag.utils import logger
 import time
 import json
@@ -218,8 +218,17 @@ def parse_query_mode(query: str) -> tuple[str, SearchMode, bool, Optional[str]]:
 
 
 class OllamaAPI:
-    def __init__(self, rag: LightRAG, top_k: int = 60, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        rag: LightRAG,
+        top_k: int = 60,
+        api_key: Optional[str] = None,
+        get_rag_for_workspace: (
+            Callable[[str], Awaitable[LightRAG]] | None
+        ) = None,
+    ):
         self.rag = rag
+        self.get_rag_for_workspace = get_rag_for_workspace
         self.ollama_server_infos = rag.ollama_server_infos
         self.top_k = top_k
         self.api_key = api_key
@@ -471,6 +480,11 @@ class OllamaAPI:
             try:
                 # Parse the request body manually
                 request = await parse_request_body(raw_request, OllamaChatRequest)
+                query_rag = (
+                    await self.get_rag_for_workspace(self.rag.workspace)
+                    if self.get_rag_for_workspace is not None
+                    else self.rag
+                )
 
                 # Get all messages
                 messages = request.messages
@@ -524,7 +538,7 @@ class OllamaAPI:
                             **self.rag.llm_model_kwargs,
                         )
                     else:
-                        response = await self.rag.aquery(
+                        response = await query_rag.aquery(
                             cleaned_query, param=query_param
                         )
 
@@ -687,7 +701,7 @@ class OllamaAPI:
                             **self.rag.llm_model_kwargs,
                         )
                     else:
-                        response_text = await self.rag.aquery(
+                        response_text = await query_rag.aquery(
                             cleaned_query, param=query_param
                         )
 

@@ -31,7 +31,12 @@ queryCoord:
   loadTimeoutSeconds: 600
   segmentTaskTimeout: 600000
   channelTaskTimeout: 300000
-  overloadedMemoryThresholdPercentage: 90
+  overloadedMemoryThresholdPercentage: 88
+  balanceIntervalSeconds: 30
+  memoryUsageMaxDifferencePercentage: 15
+  taskExecutionCap: 16
+  dispatchInterval: 1500
+  checkSegmentInterval: 2000
 
 indexCoord:
   enableActiveStandby: true
@@ -65,10 +70,10 @@ quotaAndLimits:
     forceDeny: false
     memProtection:
       enabled: true
-      dataNodeMemoryLowWaterLevel: 0.75
+      dataNodeMemoryLowWaterLevel: 0.80
       dataNodeMemoryHighWaterLevel: 0.90
-      queryNodeMemoryLowWaterLevel: 0.75
-      queryNodeMemoryHighWaterLevel: 0.90
+      queryNodeMemoryLowWaterLevel: 0.85
+      queryNodeMemoryHighWaterLevel: 0.92
     growingSegmentsSizeProtection:
       enabled: true
       lowWaterLevel: 0.1

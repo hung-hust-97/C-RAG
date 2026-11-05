@@ -51,6 +51,8 @@ class PipelineStageEvent(BaseModel):
     run_id: str = Field(default_factory=lambda: f"run-{uuid4()}")
     workspace_id: str
     doc_id: str
+    generation_id: str | None = None
+    storage_workspace_id: str | None = None
     doc_type: str = "general"
     stage: StageName
     artifact_uri: str | None = None
@@ -102,6 +104,8 @@ class PipelineStageEvent(BaseModel):
             run_id=self.run_id,
             workspace_id=self.workspace_id,
             doc_id=self.doc_id,
+            generation_id=self.generation_id,
+            storage_workspace_id=self.storage_workspace_id,
             doc_type=self.doc_type,
             stage=stage,
             artifact_uri=artifact_uri,

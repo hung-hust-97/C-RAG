@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # LightRAG instance factory for Celery workers
 # ---------------------------------------------------------------------------
 
-_rag_cache: dict[str, tuple[object, int]] = {}
+_rag_cache: dict[tuple[str, str], tuple[object, int]] = {}
 
 
 def _run_async(coro):
@@ -65,13 +65,23 @@ async def _get_rag(workspace_id: str):
     except RuntimeError:
         current_loop_id = 0
 
-    if workspace_id in _rag_cache:
-        rag, loop_id = _rag_cache[workspace_id]
+    from lightrag.pipeline.generation_routing import resolve_storage_workspace_id
+
+    storage_workspace_id = await resolve_storage_workspace_id(workspace_id)
+    cache_key = (workspace_id, storage_workspace_id)
+
+    if cache_key in _rag_cache:
+        rag, loop_id = _rag_cache[cache_key]
         if loop_id == current_loop_id:
             return rag
         else:
             logger.debug(
-                f"[Celery] Event loop changed for {workspace_id} ({loop_id} -> {current_loop_id}), recreating instance."
+                "[Celery] Event loop changed for workspace=%s "
+                "storage_workspace=%s (%s -> %s), recreating instance.",
+                workspace_id,
+                storage_workspace_id,
+                loop_id,
+                current_loop_id,
             )
 
     from lightrag.api.config import global_args
@@ -81,12 +91,23 @@ async def _get_rag(workspace_id: str):
     config_cache = LLMConfigCache(global_args)
 
     # Use factory to build the instance
-    rag = build_rag_instance(workspace_id, global_args, config_cache)
+    rag = build_rag_instance(
+        workspace_id,
+        global_args,
+        config_cache,
+        storage_workspace=(
+            storage_workspace_id if storage_workspace_id != workspace_id else None
+        ),
+    )
 
     await rag.initialize_storages()
-    _rag_cache[workspace_id] = (rag, current_loop_id)
+    _rag_cache[cache_key] = (rag, current_loop_id)
     logger.info(
-        f"[Celery] Initialized factory-based RAG instance for workspace: {workspace_id} (Loop ID: {current_loop_id})"
+        "[Celery] Initialized RAG instance workspace=%s storage_workspace=%s "
+        "(Loop ID: %s)",
+        workspace_id,
+        storage_workspace_id,
+        current_loop_id,
     )
     return rag
 

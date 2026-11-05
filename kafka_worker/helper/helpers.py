@@ -9,8 +9,8 @@ from kafka_worker.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_GROUP_ID
 from kafka_worker.models import KmsEvent
 
 _config_cache = None
-_rag_instances: dict[str, LightRAG] = {}
-_rag_init_locks: dict[str, asyncio.Lock] = {}
+_rag_instances: dict[tuple[str, str, str | None], LightRAG] = {}
+_rag_init_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -88,7 +88,10 @@ def validate_config() -> None:
         )
 
 
-def _get_rag_instance(workspace_id: str) -> LightRAG:
+def _get_rag_instance(
+    workspace_id: str,
+    storage_workspace_id: str,
+) -> LightRAG:
     """Khởi tạo một instance LightRAG hoàn chỉnh cho một workspace."""
     global _config_cache
     from lightrag.api.lightrag_factory import LLMConfigCache, build_rag_instance
@@ -100,7 +103,16 @@ def _get_rag_instance(workspace_id: str) -> LightRAG:
     copied_args = copy.deepcopy(global_args)
     copied_args.working_dir = f"./rag_storage/{workspace_id}"
 
-    return build_rag_instance(workspace_id, copied_args, _config_cache)
+    return build_rag_instance(
+        workspace_id,
+        copied_args,
+        _config_cache,
+        storage_workspace=(
+            storage_workspace_id
+            if storage_workspace_id != workspace_id
+            else None
+        ),
+    )
 
 
 def _normalize_profile(profile: object | None) -> str | None:
@@ -109,39 +121,63 @@ def _normalize_profile(profile: object | None) -> str | None:
 
 
 async def get_initialized_rag_instance(
-    workspace_id: str, profile: object | None = None
+    workspace_id: str,
+    profile: object | None = None,
+    *,
+    storage_workspace_id: str | None = None,
 ) -> LightRAG:
     """Return a cached, initialized LightRAG instance for the worker process."""
     profile_name = _normalize_profile(profile)
-    cache_key = f"{workspace_id}_{profile_name}" if profile_name else workspace_id
+    if storage_workspace_id is None:
+        from lightrag.pipeline.generation_routing import (
+            resolve_storage_workspace_id,
+        )
+
+        storage_workspace_id = await resolve_storage_workspace_id(workspace_id)
+    cache_key = (workspace_id, storage_workspace_id, profile_name)
     if cache_key not in _rag_init_locks:
         _rag_init_locks[cache_key] = asyncio.Lock()
 
     async with _rag_init_locks[cache_key]:
         rag = _rag_instances.get(cache_key)
         if rag is None:
-            rag = _get_rag_instance(workspace_id)
+            rag = _get_rag_instance(workspace_id, storage_workspace_id)
             await _initialize_rag_with_retry(rag, profile_name)
             _rag_instances[cache_key] = rag
             logger.info(
-                f"[Kafka] Initialized cached LightRAG for workspace {workspace_id} (profile: {profile_name})"
+                "[Kafka] Initialized cached LightRAG for workspace %s "
+                "storage_workspace=%s (profile: %s)",
+                workspace_id,
+                storage_workspace_id,
+                profile_name,
             )
         return rag
 
 
 async def close_cached_rag_instances() -> None:
     """Finalize cached LightRAG instances during worker shutdown."""
-    for workspace_id, rag in list(_rag_instances.items()):
+    for cache_key, rag in list(_rag_instances.items()):
+        workspace_id, storage_workspace_id, profile_name = cache_key
         try:
             await rag.finalize_storages()
             logger.info(
-                f"[Kafka] Finalized cached LightRAG for workspace {workspace_id}"
+                "[Kafka] Finalized cached LightRAG workspace=%s "
+                "storage_workspace=%s profile=%s",
+                workspace_id,
+                storage_workspace_id,
+                profile_name,
             )
         except Exception as e:
             logger.warning(
-                f"[Kafka] Failed to finalize LightRAG for workspace {workspace_id}: {e}"
+                "[Kafka] Failed to finalize LightRAG workspace=%s "
+                "storage_workspace=%s profile=%s: %s",
+                workspace_id,
+                storage_workspace_id,
+                profile_name,
+                e,
             )
     _rag_instances.clear()
+    _rag_init_locks.clear()
 
 
 async def _publish_event(

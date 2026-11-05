@@ -962,8 +962,14 @@ class PGKVStorage(BaseKVStorage):
             if self.db is None:
                 self.db = await ClientManager.get_client()
 
-            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
+            explicit_storage_workspace = self.global_config.get(
+                "_storage_workspace_explicit", False
+            )
+            # An explicit generation workspace must not be overridden by the
+            # process-wide PostgreSQL workspace setting.
+            if explicit_storage_workspace:
+                self.workspace = self.workspace or "default"
+            elif self.db.workspace:
                 # Use PostgreSQLDB's workspace (highest priority)
                 logger.info(
                     f"Using PG_WORKSPACE environment variable: '{self.db.workspace}' (overriding '{self.workspace}/{self.namespace}')"
@@ -1681,8 +1687,14 @@ class PGDocStatusStorage(DocStatusStorage):
             if self.db is None:
                 self.db = await ClientManager.get_client()
 
-            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
+            explicit_storage_workspace = self.global_config.get(
+                "_storage_workspace_explicit", False
+            )
+            # An explicit generation workspace must not be overridden by the
+            # process-wide PostgreSQL workspace setting.
+            if explicit_storage_workspace:
+                self.workspace = self.workspace or "default"
+            elif self.db.workspace:
                 # Use PostgreSQLDB's workspace (highest priority)
                 logger.info(
                     f"Using PG_WORKSPACE environment variable: '{self.db.workspace}' (overriding '{self.workspace}/{self.namespace}')"
@@ -2105,19 +2117,21 @@ class PGDocStatusStorage(DocStatusStorage):
         params = {"workspace": to_uuid(self.workspace)}
         param_count = 1
 
-        # Build WHERE clause with parameterized query
+        # Build WHERE clauses with parameterized queries pushed down into each table
         if status_filter is not None:
             param_count += 1
-            where_clause = 'WHERE "workspace_id"=$1 AND status=$2'
+            doc_where = 'WHERE "workspace_id"=$1 AND status=$2'
+            legal_where = 'WHERE "workspace_id"=$1 AND COALESCE(process_status, \'EXTRACTED\')=$2'
             params["status"] = status_filter.value
         else:
-            where_clause = 'WHERE "workspace_id"=$1'
+            doc_where = 'WHERE "workspace_id"=$1'
+            legal_where = 'WHERE "workspace_id"=$1'
 
         # Build ORDER BY clause using validated whitelist values
         order_clause = f"ORDER BY {db_sort_field} {sort_direction.upper()}"
 
-        # Unified document CTE
-        unified_sql_base = """
+        # Unified document CTE with pushed-down filters to leverage workspace index
+        unified_sql_base = f"""
             WITH all_docs AS (
                 SELECT 
                     workspace_id,
@@ -2131,6 +2145,7 @@ class PGDocStatusStorage(DocStatusStorage):
                     create_time,
                     update_time
                 FROM "tbl_document"
+                {doc_where}
                 UNION ALL
                 SELECT 
                     workspace_id,
@@ -2144,13 +2159,14 @@ class PGDocStatusStorage(DocStatusStorage):
                     created_at AS create_time,
                     updated_at AS update_time
                 FROM "tbl_legal_document"
+                {legal_where}
             )
         """
 
         # Query for total count
         count_sql = f"""
             {unified_sql_base}
-            SELECT COUNT(*) as total FROM all_docs {where_clause}
+            SELECT COUNT(*) as total FROM all_docs
         """
         count_result = await self.db.query(count_sql, list(params.values()))
         total_count = count_result["total"] if count_result else 0
@@ -2159,7 +2175,6 @@ class PGDocStatusStorage(DocStatusStorage):
         data_sql = f"""
             {unified_sql_base}
             SELECT * FROM all_docs
-            {where_clause}
             {order_clause}
             LIMIT ${param_count + 1} OFFSET ${param_count + 2}
         """

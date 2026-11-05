@@ -18,6 +18,8 @@ from kafka_worker.config import (
 from kafka_worker.models import KmsEvent
 from kafka_worker.partitioned_publish import publish_pipeline_event
 
+from .common import get_rag_for_event
+
 
 DocType = Literal["general", "legal"]
 
@@ -296,7 +298,7 @@ async def _publish_finalize_events(
 
 async def _get_chunks_count(event: PipelineStageEvent, context: Any) -> int:
     try:
-        rag = await context.get_rag(event.workspace_id, profile=event.stage)
+        rag = await get_rag_for_event(context, event, profile=event.stage)
         status_doc = await rag.doc_status.get_by_id(event.doc_id)
     except Exception:
         return 0
@@ -346,7 +348,9 @@ async def run_finalize_stage(event: PipelineStageEvent, context: Any) -> StageRe
     if error_info:
         try:
             from lightrag.pipeline.models import StageName
-            rag = await context.get_rag(event.workspace_id, profile=StageName.FINALIZE.value)
+            rag = await get_rag_for_event(
+                context, event, profile=StageName.FINALIZE.value
+            )
             await rag.doc_status.upsert(
                 {
                     event.doc_id: {

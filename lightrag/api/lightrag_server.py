@@ -58,6 +58,7 @@ from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.reembed import reembed_workspace_vectors
+from lightrag.pipeline.generation_routing import resolve_storage_workspace_id
 
 # Import logger first for use in Celery import handling
 from lightrag.utils import logger, set_verbose_debug
@@ -80,8 +81,28 @@ async def monkeypatch_apipeline_process_enqueue_documents(
     doc_ids=None,
 ):
     """
-    Monkeypatch for LightRAG.apipeline_process_enqueue_documents to use Celery.
+    Monkeypatch for LightRAG.apipeline_process_enqueue_documents to use Celery or Kafka.
     """
+    from lightrag.pipeline.ingest_flags import (
+        build_ingest_stage_event,
+        enqueue_kafka_stage_events,
+        resolve_reprocess_backend,
+    )
+    from lightrag.pipeline.models import StageName
+
+    if resolve_reprocess_backend() == "kafka" and doc_ids:
+        events = [
+            build_ingest_stage_event(
+                workspace_id=self.workspace or "default",
+                doc_id=str(doc_id),
+                stage=StageName.CHUNKING,
+                metadata={"reprocess_failed": bool(reprocess_failed)},
+            )
+            for doc_id in doc_ids
+        ]
+        await enqueue_kafka_stage_events(events)
+        return True
+
     if CELERY_AVAILABLE and celery_app is not None:
         celery_app.send_task(
             "lightrag.api.lightrag_server.apipeline_process_enqueue_documents_task",
@@ -447,10 +468,18 @@ def create_app(args):
                     pipeline_status["busy"] = False
                     pipeline_status["job_name"] = ""
 
-    def build_rag_instance(workspace_id: str) -> LightRAG:
-        return factory_build_rag_instance(workspace_id, args, config_cache)
+    def build_rag_instance(
+        workspace_id: str, storage_workspace_id: str | None = None
+    ) -> LightRAG:
+        return factory_build_rag_instance(
+            workspace_id,
+            args,
+            config_cache,
+            storage_workspace=storage_workspace_id,
+        )
 
     rag_instances: dict[str, LightRAG] = {}
+    generation_rag_instances: dict[tuple[str, str], LightRAG] = {}
     doc_manager_instances: dict[str, DocumentManager] = {}
     rag_instances_lock = asyncio.Lock()
     workspace_alias_cache: dict[str, str] = {}
@@ -569,25 +598,53 @@ def create_app(args):
 
     async def get_rag_for_workspace(workspace_id: str) -> LightRAG:
         normalized_workspace_id = await resolve_workspace_id_alias(workspace_id)
+        storage_workspace_id = await resolve_storage_workspace_id(
+            normalized_workspace_id
+        )
+        cache_key = (normalized_workspace_id, storage_workspace_id)
 
-        # Fast path: return existing instance without lock
-        if normalized_workspace_id in rag_instances:
-            return rag_instances[normalized_workspace_id]
+        if storage_workspace_id == normalized_workspace_id:
+            cached_rag = rag_instances.get(normalized_workspace_id)
+            if cached_rag is not None and cached_rag.storage_workspace == storage_workspace_id:
+                return cached_rag
+        cached_generation_rag = generation_rag_instances.get(cache_key)
+        if cached_generation_rag is not None:
+            return cached_generation_rag
 
         # Slow path: acquire lock and initialize
-        logger.info(f"[{normalized_workspace_id}] Acquiring lock for workspace initialization...")
+        logger.info(
+            "[%s] Acquiring lock for workspace initialization storage_workspace=%s...",
+            normalized_workspace_id,
+            storage_workspace_id,
+        )
         
         try:
             # Add timeout for lock acquisition and initialization to prevent infinite waiting
             async with asyncio.timeout(600.0):  # 600 second timeout to accommodate large migrations
                 async with rag_instances_lock:
                     # Double-check after acquiring lock
-                    if normalized_workspace_id in rag_instances:
-                        logger.info(f"[{normalized_workspace_id}] Instance already created by another request")
-                        return rag_instances[normalized_workspace_id]
+                    cached_generation_rag = generation_rag_instances.get(cache_key)
+                    if cached_generation_rag is not None:
+                        return cached_generation_rag
+                    if storage_workspace_id == normalized_workspace_id:
+                        cached_rag = rag_instances.get(normalized_workspace_id)
+                        if (
+                            cached_rag is not None
+                            and cached_rag.storage_workspace == storage_workspace_id
+                        ):
+                            return cached_rag
 
-                    logger.info(f"[{normalized_workspace_id}] Building RAG instance...")
-                    workspace_rag = build_rag_instance(normalized_workspace_id)
+                    logger.info(
+                        "[%s] Building RAG instance storage_workspace=%s...",
+                        normalized_workspace_id,
+                        storage_workspace_id,
+                    )
+                    workspace_rag = build_rag_instance(
+                        normalized_workspace_id,
+                        storage_workspace_id
+                        if storage_workspace_id != normalized_workspace_id
+                        else None,
+                    )
 
                     try:
                         logger.info(f"[{normalized_workspace_id}] Initializing storages...")
@@ -622,8 +679,13 @@ def create_app(args):
                         timeout=10.0  # 10 second timeout
                     )
                     
+                    generation_rag_instances[cache_key] = workspace_rag
                     rag_instances[normalized_workspace_id] = workspace_rag
-                    logger.info(f"[{normalized_workspace_id}] Workspace initialization complete")
+                    logger.info(
+                        "[%s] Workspace initialization complete storage_workspace=%s",
+                        normalized_workspace_id,
+                        storage_workspace_id,
+                    )
                     return workspace_rag
                     
         except asyncio.TimeoutError:
@@ -661,7 +723,10 @@ def create_app(args):
         finally:
             # Clean up database connections
             finalized_rag_ids: set[int] = set()
-            for cached_rag in rag_instances.values():
+            for cached_rag in [
+                *rag_instances.values(),
+                *generation_rag_instances.values(),
+            ]:
                 if id(cached_rag) in finalized_rag_ids:
                     continue
                 await cached_rag.finalize_storages()
@@ -1101,7 +1166,12 @@ def create_app(args):
     )
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    ollama_api = OllamaAPI(
+        rag,
+        top_k=args.top_k,
+        api_key=api_key,
+        get_rag_for_workspace=get_rag_for_workspace,
+    )
     app.include_router(ollama_api.router, prefix="/api")
 
     # Custom Swagger UI endpoint for offline support
@@ -1466,13 +1536,7 @@ def create_app(args):
             # pipeline_status namespace may not exist for unused workspaces.
             pass
 
-        workspace_rag = rag_instances.get(canonical_workspace_id)
-        created_temp_rag = False
-
-        if workspace_rag is None:
-            workspace_rag = build_rag_instance(canonical_workspace_id)
-            await workspace_rag.initialize_storages()
-            created_temp_rag = True
+        workspace_rag = await get_rag_for_workspace(canonical_workspace_id)
 
         storages = [
             workspace_rag.text_chunks,
@@ -1528,8 +1592,18 @@ def create_app(args):
         # Remove in-memory instances and aliases after storage cleanup.
         async with rag_instances_lock:
             cached_rag = rag_instances.pop(canonical_workspace_id, None)
-            if cached_rag is not None and cached_rag is not workspace_rag:
-                await cached_rag.finalize_storages()
+            workspace_generation_rags = [
+                generation_rag_instances.pop(cache_key)
+                for cache_key in list(generation_rag_instances)
+                if cache_key[0] == canonical_workspace_id
+            ]
+            instances_to_finalize = {
+                id(instance): instance
+                for instance in [cached_rag, *workspace_generation_rags]
+                if instance is not None and instance is not workspace_rag
+            }
+            for cached_generation_rag in instances_to_finalize.values():
+                await cached_generation_rag.finalize_storages()
 
             for alias_key in list(workspace_alias_cache.keys()):
                 alias_value = workspace_alias_cache.get(alias_key)
@@ -1538,7 +1612,7 @@ def create_app(args):
 
         doc_manager_instances.pop(canonical_workspace_id, None)
 
-        if created_temp_rag or workspace_rag is not rag:
+        if workspace_rag is not rag:
             await workspace_rag.finalize_storages()
 
         return {

@@ -14,6 +14,7 @@ from .common import (
     build_entity_vector_payload,
     build_relation_vector_payload,
     deserialize_extraction_results,
+    get_rag_for_event,
 )
 
 
@@ -122,7 +123,9 @@ def _shard_rows(rows: list[dict[str, Any]], shard_size: int) -> list[list[dict[s
 
 async def run_kg_merge_stage(event: PipelineStageEvent, context: Any) -> StageResult:
     stage_started = time.perf_counter()
-    rag = await context.get_rag(event.workspace_id, profile=StageName.KG_MERGE.value)
+    rag = await get_rag_for_event(
+        context, event, profile=StageName.KG_MERGE.value
+    )
 
     read_started = time.perf_counter()
     extraction_results = await _read_extraction_results(event, context)

@@ -9,14 +9,12 @@ from lightrag.legal_document.extraction_mode import ExtractionMode
 from lightrag.legal_document.extraction_mode import classify_chunk_extraction_mode
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 
-from .common import filter_chunks, rows_to_chunks, serialize_extraction_results
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+from .common import (
+    filter_chunks,
+    get_rag_for_event,
+    rows_to_chunks,
+    serialize_extraction_results,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -32,7 +30,7 @@ async def run_entity_extraction_stage(
     if not event.artifact_uri:
         raise ValueError("entity_extraction stage requires artifact_uri")
 
-    rag = await context.get_rag(event.workspace_id, profile=event.stage)
+    rag = await get_rag_for_event(context, event, profile=event.stage)
     rows = await context.artifact_store.read_jsonl(event.artifact_uri)
     chunks = rows_to_chunks(rows)
     target_chunk_ids = event.metadata.get("chunk_ids")
@@ -68,8 +66,7 @@ async def run_entity_extraction_stage(
         rag.llm_model_max_async = min(rag.llm_model_max_async, max_async_override)
     if event.debug_sync or context.debug_sync:
         rag.llm_model_max_async = 1
-    if _env_bool("PIPELINE_ENTITY_EXTRACTION_SKIP_FAILED_CHUNKS", True):
-        rag.addon_params["entity_extraction_skip_failed_chunks"] = True
+    rag.addon_params["entity_extraction_skip_failed_chunks"] = False
     try:
         extraction_results = await rag._process_extract_entities(
             chunks,

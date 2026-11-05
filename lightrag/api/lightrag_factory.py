@@ -451,7 +451,12 @@ def create_optimized_embedding_function(config_cache: LLMConfigCache, binding, m
         model_name=model,
     )
 
-def build_rag_instance(workspace_id: str, args, config_cache: LLMConfigCache) -> LightRAG:
+def build_rag_instance(
+    workspace_id: str,
+    args,
+    config_cache: LLMConfigCache,
+    storage_workspace: str | None = None,
+) -> LightRAG:
     # Resolve timeouts
     llm_timeout = get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
     embedding_timeout = get_env_value("EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT, int)
@@ -472,6 +477,7 @@ def build_rag_instance(workspace_id: str, args, config_cache: LLMConfigCache) ->
     return LightRAG(
         working_dir=args.working_dir,
         workspace=workspace_id,
+        storage_workspace=storage_workspace,
         llm_model_func=create_llm_model_func(args.llm_binding, config_cache, args, llm_timeout),
         llm_model_name=args.llm_model,
         llm_model_max_async=args.max_async,

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import asyncio
 from dataclasses import dataclass
 from typing import Any, final
@@ -2186,6 +2187,13 @@ class Neo4JStorage(BaseGraphStorage):
             List of labels(entity names) sorted by degree (highest first)
         """
         workspace_label = self._get_workspace_label()
+        cache_key = (workspace_label, limit)
+        now = time.monotonic()
+        if hasattr(self, "_popular_labels_cache"):
+            cached_data, cached_time = self._popular_labels_cache.get(cache_key, (None, 0))
+            if cached_data is not None and (now - cached_time) < 60:
+                return cached_data
+
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
         ) as session:
@@ -2194,8 +2202,7 @@ class Neo4JStorage(BaseGraphStorage):
                 query = f"""
                 MATCH (n:`{workspace_label}`)
                 WHERE n.entity_id IS NOT NULL
-                OPTIONAL MATCH (n)-[r]-()
-                WITH n.entity_id AS label, count(r) AS degree
+                WITH n.entity_id AS label, COUNT {{ (n)--() }} AS degree
                 ORDER BY degree DESC, label ASC
                 LIMIT $limit
                 RETURN label
@@ -2205,6 +2212,10 @@ class Neo4JStorage(BaseGraphStorage):
                 async for record in result:
                     labels.append(record["label"])
                 await result.consume()
+
+                if not hasattr(self, "_popular_labels_cache"):
+                    self._popular_labels_cache = {}
+                self._popular_labels_cache[cache_key] = (labels, now)
 
                 logger.debug(
                     f"[{self.workspace}] Retrieved {len(labels)} popular labels (limit: {limit})"

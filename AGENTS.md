@@ -4,7 +4,11 @@ LightRAG is an advanced Retrieval-Augmented Generation (RAG) framework designed 
 
 ## Project Structure & Module Organization
 - `lightrag/`: Core Python package with orchestrators (`lightrag/lightrag.py`), storage adapters in `kg/`, LLM bindings in `llm/`, and helpers such as `operate.py` and `utils_*.py`.
-- `lightrag-api/`: FastAPI service (`lightrag_server.py`) with routers under `routers/` and Gunicorn launcher `run_with_gunicorn.py`.
+  - `lightrag/api/`: FastAPI service (`lightrag_server.py`) with routers under `routers/` and Gunicorn launcher `run_with_gunicorn.py`.
+  - `lightrag/pipeline/`: Multi-stage asynchronous pipeline coordinator (`coordinator.py`, `runner.py`, `slo.py`, stages in `stages/`).
+  - `lightrag/legal_document/`: Vietnamese legal parsing, clause-aware chunking (`chunking.py`), hierarchy extraction, and benchmarking (`vlegal_bench.py`).
+- `kafka_worker/`: Distributed Kafka workers executing pipeline stages asynchronously (`pipeline_main.py`, `pipeline_sweeper.py`, `ingress.py`).
+- `celery_worker/`: Celery task worker for heavy OCR and document extraction (`tasks.py`).
 - `lightrag_webui/`: React 19 + TypeScript client driven by Bun + Vite; UI components live in `src/`.
 - `scripts/setup/`: Interactive environment setup wizard. `setup.sh` orchestrates staged `--base` / `--storage` / `--server` / validation flows, `lib/` holds prompt/validation/file helpers, and `templates/*.yml` contains compose fragments for bundled services.
 - Tests live in `tests/` and root-level `test_*.py`. Working datasets stay in `inputs/`, `rag_storage/`, `temp/`; deployment collateral lives in `docs/`, `k8s-deploy/`, and `docker-compose.yml`.

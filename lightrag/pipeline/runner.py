@@ -5,20 +5,33 @@ import os
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from lightrag.base import DocStatus
 from lightrag.utils import logger
 
 from .artifacts import PipelineArtifactStore
-from .coordinator import ClaimStatus, PipelineCoordinator
+from .coordinator import (
+    ClaimStatus,
+    PipelineCoordinator,
+    WorkspaceGenerationStatus,
+)
 from .models import PipelineError, PipelineStageEvent, StageName, StageResult
 
 StageHandler = Callable[
     [PipelineStageEvent, "StageExecutionContext"], Awaitable[StageResult]
 ]
 EventPublisher = Callable[[PipelineStageEvent], Awaitable[None]]
-RagFactory = Callable[[str, object | None], Awaitable[Any]]
+
+
+class RagFactory(Protocol):
+    async def __call__(
+        self,
+        workspace_id: str,
+        profile: object | None = None,
+        *,
+        storage_workspace_id: str | None = None,
+    ) -> Any: ...
 
 TERMINAL_SUCCESS_STATUSES = {"PROCESSED", "COMPLETED", "DUPLICATED"}
 
@@ -133,8 +146,50 @@ class StageExecutionContext:
     partition_allocator: Any = None
     producer: Any = None
 
-    async def get_rag(self, workspace_id: str, profile: object | None = None) -> Any:
+    async def get_rag(
+        self,
+        workspace_id: str,
+        profile: object | None = None,
+        *,
+        generation_id: str | None = None,
+        storage_workspace_id: str | None = None,
+    ) -> Any:
+        if generation_id is not None or storage_workspace_id is not None:
+            if not generation_id or not storage_workspace_id:
+                raise ValueError(
+                    "generation_id and storage_workspace_id must be provided together"
+                )
+            generation = await self.coordinator.get_workspace_generation(
+                workspace_id, generation_id
+            )
+            if (
+                generation is None
+                or generation.status != WorkspaceGenerationStatus.BUILDING
+                or generation.storage_workspace_id != storage_workspace_id
+                or not await self.coordinator.is_workspace_write_locked(workspace_id)
+            ):
+                raise RuntimeError(
+                    "Generation stage event does not match the locked building "
+                    f"generation: workspace_id={workspace_id}, "
+                    f"generation_id={generation_id}"
+                )
+            return await self.rag_factory(
+                workspace_id,
+                profile,
+                storage_workspace_id=storage_workspace_id,
+            )
+
         return await self.rag_factory(workspace_id, profile)
+
+    async def get_rag_for_event(
+        self, event: PipelineStageEvent, profile: object | None = None
+    ) -> Any:
+        return await self.get_rag(
+            event.workspace_id,
+            profile=profile,
+            generation_id=event.generation_id,
+            storage_workspace_id=event.storage_workspace_id,
+        )
 
 
 @dataclass
@@ -221,34 +276,15 @@ class StageRunner:
             if result.manifest:
                 artifacts.append(result.manifest)
 
-            completion = await self.context.coordinator.complete(event, artifacts)
-            next_events = list(result.next_events)
-
-            if result.join_next_event and completion.all_shards_done:
-                stage_outputs = await self.context.coordinator.get_stage_outputs(
-                    event.run_id, event.stage_name
-                )
-                join_event = result.join_next_event.model_copy(deep=True)
-                join_metadata = dict(join_event.metadata)
-                join_metadata["input_artifact_uris"] = [
-                    artifact.uri
-                    for artifact in stage_outputs
-                    if artifact.kind != "manifest"
-                ]
-                join_metadata["input_manifest_uris"] = [
-                    artifact.uri
-                    for artifact in stage_outputs
-                    if artifact.kind == "manifest"
-                ]
-                join_event.metadata = join_metadata
-                next_events.append(join_event)
-
-            if result.finalize_event and result.finalize_after_stages:
-                ready = await self.context.coordinator.are_stages_complete(
-                    event.run_id, result.finalize_after_stages
-                )
-                if ready:
-                    next_events.append(result.finalize_event)
+            completion = await self.context.coordinator.complete_and_enqueue(
+                event,
+                artifacts,
+                next_events=result.next_events,
+                join_next_event=result.join_next_event,
+                finalize_event=result.finalize_event,
+                finalize_after_stages=result.finalize_after_stages,
+            )
+            next_events = completion.next_events
 
             await self._emit_events(event, next_events)
             logger.info("[Pipeline] Stage done %s", context_line)
@@ -306,18 +342,31 @@ class StageRunner:
         self, current_event: PipelineStageEvent, next_events: list[PipelineStageEvent]
     ) -> None:
         # Pause logic disabled per user request
-        for next_event in next_events:
-            if current_event.fast_path:
+        if current_event.fast_path:
+            for next_event in next_events:
                 logger.info("[Pipeline] Fast-path handoff %s", next_event.log_context())
                 await self.run(next_event)
-                continue
-            if self.event_publisher is None:
-                logger.info(
-                    "[Pipeline] No publisher configured; next event retained %s",
-                    next_event.log_context(),
-                )
-                continue
-            await self.event_publisher(next_event)
+            return
+        if not next_events:
+            return
+        await self.context.coordinator.enqueue_events(next_events)
+        if self.event_publisher is None:
+            logger.info(
+                "[Pipeline] No publisher configured; %s downstream events retained in outbox",
+                len(next_events),
+            )
+            return
+        try:
+            await self.context.coordinator.publish_outbox(
+                self.event_publisher,
+                event_ids=[event.event_id for event in next_events],
+                limit=len(next_events),
+            )
+        except Exception:
+            logger.exception(
+                "[Pipeline] Could not dispatch durable downstream events %s",
+                current_event.log_context(),
+            )
 
     async def _recover_next_events_for_completed_stage(
         self, event: PipelineStageEvent
@@ -559,8 +608,8 @@ class StageRunner:
             except Exception:
                 pass
 
-            rag = await self.context.get_rag(
-                event.workspace_id, profile=StageName.FINALIZE.value
+            rag = await self.context.get_rag_for_event(
+                event, profile=StageName.FINALIZE.value
             )
             status_doc = await rag.doc_status.get_by_id(event.doc_id)
             existing_metadata = {}
@@ -620,7 +669,7 @@ class StageRunner:
             pass
 
         try:
-            rag = await self.context.get_rag(event.workspace_id, profile=event.stage)
+            rag = await self.context.get_rag_for_event(event, profile=event.stage)
             status_doc = await rag.doc_status.get_by_id(event.doc_id)
         except Exception:
             logger.exception(

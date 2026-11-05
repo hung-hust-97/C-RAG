@@ -13,7 +13,7 @@ from lightrag.utils import compute_mdhash_id, logger
 
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 
-from .common import chunks_to_rows
+from .common import chunks_to_rows, get_rag_for_event
 
 TERMINAL_SUCCESS_STATUSES = {"PROCESSED", "COMPLETED", "DUPLICATED"}
 
@@ -63,6 +63,17 @@ def _ensure_event_doc_id(event: PipelineStageEvent) -> None:
         )
         return
     raise ValueError("Pipeline chunking event requires doc_id or legal_document_id")
+
+
+def _compute_chunk_id(content: str, event: PipelineStageEvent) -> str:
+    workspace = event.workspace_id
+    if event.generation_id is not None:
+        if not event.storage_workspace_id:
+            raise ValueError(
+                "Generation chunking event requires storage_workspace_id"
+            )
+        workspace = event.storage_workspace_id
+    return compute_mdhash_id(content, prefix="chunk-", workspace=workspace)
 
 
 async def _read_s3_text(object_key: str) -> str:
@@ -222,7 +233,7 @@ async def _run_chunking_func(
 
 async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageResult:
     _ensure_event_doc_id(event)
-    rag = await context.get_rag(event.workspace_id, profile=event.stage)
+    rag = await get_rag_for_event(context, event, profile=event.stage)
     status_doc = await rag.doc_status.get_by_id(event.doc_id)
     current_status = _status_get(status_doc, "status")
     if _is_terminal_success_status(current_status):
@@ -265,11 +276,7 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
     for index, chunk in enumerate(chunking_result):
         if "chunk_order_index" not in chunk:
             chunk["chunk_order_index"] = index
-        chunk_id = compute_mdhash_id(
-            chunk["content"],
-            prefix="chunk-",
-            workspace=event.workspace_id,
-        )
+        chunk_id = _compute_chunk_id(chunk["content"], event)
         chunks[chunk_id] = {
             **chunk,
             "full_doc_id": event.doc_id,

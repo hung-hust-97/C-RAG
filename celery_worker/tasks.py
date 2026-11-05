@@ -88,17 +88,19 @@ def init_worker_process(**kwargs):
 # LightRAG instance factory for Celery workers
 # ---------------------------------------------------------------------------
 
-_rag_cache: dict[tuple[str, int], tuple[object, int]] = {}
+_rag_cache: dict[tuple[str, str, int], tuple[object, int]] = {}
 
 
-def _get_rag_key(workspace_id: str) -> tuple[str, int]:
+def _get_rag_key(
+    workspace_id: str, storage_workspace_id: str
+) -> tuple[str, str, int]:
     """Get a cache key that is both workspace and event-loop aware."""
     try:
         loop = asyncio.get_running_loop()
         loop_id = id(loop)
     except RuntimeError:
         loop_id = 0
-    return (workspace_id, loop_id)
+    return (workspace_id, storage_workspace_id, loop_id)
 
 
 def _run_async(coro):
@@ -129,10 +131,18 @@ async def _get_rag(workspace_id: str):
     Build and initialize a LightRAG instance from environment variables.
     Re-uses cached instances per workspace and event loop.
     """
-    cache_key = _get_rag_key(workspace_id)
+    from lightrag.pipeline.generation_routing import resolve_storage_workspace_id
+
+    storage_workspace_id = await resolve_storage_workspace_id(workspace_id)
+    cache_key = _get_rag_key(workspace_id, storage_workspace_id)
     if cache_key in _rag_cache:
         rag, _ = _rag_cache[cache_key]
-        logger.debug(f"[Celery] Reusing cached RAG instance for workspace: {workspace_id} (loop: {cache_key[1]})")
+        logger.debug(
+            "[Celery] Reusing cached RAG instance workspace=%s storage_workspace=%s loop=%s",
+            workspace_id,
+            storage_workspace_id,
+            cache_key[2],
+        )
         return rag
 
     from lightrag.api.config import global_args
@@ -142,14 +152,25 @@ async def _get_rag(workspace_id: str):
     config_cache = LLMConfigCache(global_args)
 
     # Use factory to build the instance
-    rag = build_rag_instance(workspace_id, global_args, config_cache)
+    rag = build_rag_instance(
+        workspace_id,
+        global_args,
+        config_cache,
+        storage_workspace=(
+            storage_workspace_id if storage_workspace_id != workspace_id else None
+        ),
+    )
 
     await rag.initialize_storages()
     
     # Cache with loop_id to prevent loop-binding issues
     _rag_cache[cache_key] = (rag, 0)
     logger.info(
-        f"[Celery] Initialized factory-based RAG instance for workspace: {workspace_id} (loop: {cache_key[1]})"
+        "[Celery] Initialized factory-based RAG instance workspace=%s "
+        "storage_workspace=%s loop=%s",
+        workspace_id,
+        storage_workspace_id,
+        cache_key[2],
     )
     return rag
 

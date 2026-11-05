@@ -178,6 +178,41 @@ def _chunk_fields_from_status_doc(
     return chunks_list, len(chunks_list)
 
 
+def _validate_explicit_storage_workspace(
+    storage_workspace: str, storage_names: set[str]
+) -> None:
+    workspace_overrides = {
+        "MONGODB_WORKSPACE": {
+            "MongoKVStorage",
+            "MongoDocStatusStorage",
+            "MongoGraphStorage",
+            "MongoVectorDBStorage",
+        },
+        "REDIS_WORKSPACE": {"RedisKVStorage", "RedisDocStatusStorage"},
+        "OPENSEARCH_WORKSPACE": {
+            "OpenSearchKVStorage",
+            "OpenSearchDocStatusStorage",
+            "OpenSearchGraphStorage",
+            "OpenSearchVectorDBStorage",
+        },
+        "QDRANT_WORKSPACE": {"QdrantVectorDBStorage"},
+        "NEO4J_WORKSPACE": {"Neo4JStorage"},
+        "MEMGRAPH_WORKSPACE": {"MemgraphStorage"},
+        "MILVUS_WORKSPACE": {"MilvusVectorDBStorage"},
+    }
+    for env_name, supported_storages in workspace_overrides.items():
+        override = os.getenv(env_name, "").strip()
+        if (
+            override
+            and override != storage_workspace
+            and storage_names.intersection(supported_storages)
+        ):
+            raise ValueError(
+                f"{env_name}={override!r} conflicts with explicit "
+                f"storage_workspace={storage_workspace!r}"
+            )
+
+
 @final
 @dataclass
 class LightRAG:
@@ -209,6 +244,9 @@ class LightRAG:
 
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
+
+    storage_workspace: str | None = field(default=None, kw_only=True)
+    """Physical storage namespace; defaults to workspace for backward compatibility."""
 
     # ---
     # TODO: Deprecated, use setup_logger in utils.py instead
@@ -618,8 +656,27 @@ class LightRAG:
             )
         self.embedding_token_limit = embedding_max_token_size
 
+        storage_workspace_is_explicit = self.storage_workspace is not None
+        storage_workspace = (
+            self.workspace if self.storage_workspace is None else self.storage_workspace
+        )
+        self.storage_workspace = storage_workspace
+
+        storage_names = {
+            self.kv_storage,
+            self.vector_storage,
+            self.graph_storage,
+            self.doc_status_storage,
+            os.getenv("FULL_DOCS_STORAGE", ""),
+        }
+        if storage_workspace_is_explicit:
+            _validate_explicit_storage_workspace(
+                storage_workspace, storage_names
+            )
+
         # Fix global_config now
         global_config = asdict(self)
+        global_config["_storage_workspace_explicit"] = storage_workspace_is_explicit
         # Restore original EmbeddingFunc object (asdict converts it to dict)
         global_config["embedding_func"] = original_embedding_func
 
@@ -663,70 +720,109 @@ class LightRAG:
         # Initialize document status storage
         self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
 
-        self.llm_response_cache: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
-            workspace=self.workspace,
-            global_config=global_config,
-            embedding_func=self.embedding_func,
+        is_shadow_storage = (
+            storage_workspace_is_explicit and storage_workspace != self.workspace
         )
+        if is_shadow_storage and (
+            self.kv_storage == "PGKVStorage"
+            or self.doc_status_storage == "PGDocStatusStorage"
+        ):
+            from .kg.postgres_shadow_impl import (
+                PGShadowDocStatusStorage,
+                PGShadowTextChunksStorage,
+                ReadOnlyKVView,
+                ShadowNullKVStorage,
+            )
+        else:
+            from .kg.postgres_shadow_impl import ReadOnlyKVView  # type: ignore
 
-        self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
+        if is_shadow_storage and self.kv_storage == "PGKVStorage":
+            self.llm_response_cache: BaseKVStorage = ShadowNullKVStorage(
+                namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
+                workspace=storage_workspace,
+                global_config=global_config,
+                embedding_func=self.embedding_func,
+            )
+            self.text_chunks: BaseKVStorage = PGShadowTextChunksStorage(
+                namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
+                workspace=storage_workspace,
+                global_config=global_config,
+                embedding_func=self.embedding_func,
+            )
+        else:
+            self.llm_response_cache = self.key_string_value_json_storage_cls(  # type: ignore
+                namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
+                workspace=storage_workspace,
+                global_config=global_config,
+                embedding_func=self.embedding_func,
+            )
+            self.text_chunks = self.key_string_value_json_storage_cls(  # type: ignore
+                namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
+                workspace=storage_workspace,
+                embedding_func=self.embedding_func,
+            )
+
+        full_docs_workspace = self.workspace if is_shadow_storage else storage_workspace
+        full_docs_config = (
+            {**global_config, "_storage_workspace_explicit": False}
+            if is_shadow_storage
+            else global_config
         )
-
         full_docs_storage_type = os.getenv("FULL_DOCS_STORAGE")
         if full_docs_storage_type:
             full_docs_storage_cls = self._get_storage_class(full_docs_storage_type)
             full_docs_storage_cls = partial(  # type: ignore
-                full_docs_storage_cls, global_config=global_config
+                full_docs_storage_cls, global_config=full_docs_config
             )
-            self.full_docs: BaseKVStorage = full_docs_storage_cls(
+            raw_full_docs: BaseKVStorage = full_docs_storage_cls(
                 namespace=NameSpace.KV_STORE_FULL_DOCS,
-                workspace=self.workspace,
+                workspace=full_docs_workspace,
                 embedding_func=self.embedding_func,
             )
         else:
-            self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+            raw_full_docs = self._get_storage_class(self.kv_storage)(  # type: ignore
                 namespace=NameSpace.KV_STORE_FULL_DOCS,
-                workspace=self.workspace,
+                workspace=full_docs_workspace,
+                global_config=full_docs_config,
                 embedding_func=self.embedding_func,
             )
+        self.full_docs: BaseKVStorage = (
+            ReadOnlyKVView(raw_full_docs) if is_shadow_storage else raw_full_docs  # type: ignore
+        )
 
         self.full_entities: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_ENTITIES,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
         )
 
         self.full_relations: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_RELATIONS,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
         )
 
         self.entity_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_ENTITY_CHUNKS,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
         )
 
         self.relation_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_RELATION_CHUNKS,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
         )
 
         self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
             namespace=NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
         )
 
         self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
             meta_fields={
                 "entity_name",
@@ -743,7 +839,7 @@ class LightRAG:
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
             meta_fields={
                 "src_id",
@@ -761,7 +857,7 @@ class LightRAG:
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
-            workspace=self.workspace,
+            workspace=storage_workspace,
             embedding_func=self.embedding_func,
             meta_fields={
                 "full_doc_id",
@@ -777,12 +873,20 @@ class LightRAG:
         )
 
         # Initialize document status storage
-        self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
-            namespace=NameSpace.DOC_STATUS,
-            workspace=self.workspace,
-            global_config=global_config,
-            embedding_func=None,
-        )
+        if is_shadow_storage and self.doc_status_storage == "PGDocStatusStorage":
+            self.doc_status: DocStatusStorage = PGShadowDocStatusStorage(
+                namespace=NameSpace.DOC_STATUS,
+                workspace=storage_workspace,
+                global_config=global_config,
+                embedding_func=None,
+            )
+        else:
+            self.doc_status = self.doc_status_storage_cls(
+                namespace=NameSpace.DOC_STATUS,
+                workspace=storage_workspace,
+                global_config=global_config,
+                embedding_func=None,
+            )
 
         # Directly use llm_response_cache, don't create a new object
         hashing_kv = self.llm_response_cache
@@ -1985,34 +2089,53 @@ class LightRAG:
                 pipeline_status["latest_message"] = reextract_message
                 pipeline_status["history_messages"].append(reextract_message)
 
-            # Import Celery task here to avoid circular dependency
-            try:
-                from celery_worker.tasks import task_extract_and_enqueue
+            from .pipeline.ingest_flags import (
+                build_ingest_stage_event,
+                enqueue_kafka_stage_events,
+                resolve_reprocess_backend,
+            )
+            from .pipeline.models import StageName
 
-                for doc_info in docs_to_reextract:
-                    logger.info(
-                        f"[Reprocess] Triggering re-extraction for {doc_info['doc_id']} ({doc_info['original_file_name']})"
-                    )
-                    task_extract_and_enqueue.delay(
-                        workspace_id=self.workspace,
-                        file_path_str=doc_info["file_path"],
+            if resolve_reprocess_backend() == "kafka":
+                reextract_events = [
+                    build_ingest_stage_event(
+                        workspace_id=self.workspace or "default",
                         doc_id=doc_info["doc_id"],
+                        stage=StageName.EXTRACTION,
+                        file_path=doc_info["file_path"],
                     )
-            except ImportError as e:
-                logger.error(f"[Reprocess] Failed to import Celery task: {e}")
-                docs_to_mark_failed_celery = {}
-                for doc_info in docs_to_reextract:
-                    d_id = doc_info["doc_id"]
-                    docs_to_mark_failed_celery[d_id] = {
-                        "status": DocStatus.FAILED,
-                        "content_summary": "",
-                        "content_length": 0,
-                        "error_msg": "Failed to import Celery task. Cannot re-extract.",
-                        "error_stage": "extraction",
-                        "metadata": {},
-                    }
-                if docs_to_mark_failed_celery:
-                    await self.doc_status.upsert(docs_to_mark_failed_celery)
+                    for doc_info in docs_to_reextract
+                ]
+                await enqueue_kafka_stage_events(reextract_events)
+            else:
+                # Import Celery task here to avoid circular dependency
+                try:
+                    from celery_worker.tasks import task_extract_and_enqueue
+
+                    for doc_info in docs_to_reextract:
+                        logger.info(
+                            f"[Reprocess] Triggering re-extraction for {doc_info['doc_id']} ({doc_info['original_file_name']})"
+                        )
+                        task_extract_and_enqueue.delay(
+                            workspace_id=self.workspace,
+                            file_path_str=doc_info["file_path"],
+                            doc_id=doc_info["doc_id"],
+                        )
+                except ImportError as e:
+                    logger.error(f"[Reprocess] Failed to import Celery task: {e}")
+                    docs_to_mark_failed_celery = {}
+                    for doc_info in docs_to_reextract:
+                        d_id = doc_info["doc_id"]
+                        docs_to_mark_failed_celery[d_id] = {
+                            "status": DocStatus.FAILED,
+                            "content_summary": "",
+                            "content_length": 0,
+                            "error_msg": "Failed to import Celery task. Cannot re-extract.",
+                            "error_stage": "extraction",
+                            "metadata": {},
+                        }
+                    if docs_to_mark_failed_celery:
+                        await self.doc_status.upsert(docs_to_mark_failed_celery)
 
         # Log information about failed documents that will be preserved
         if failed_docs_to_preserve:

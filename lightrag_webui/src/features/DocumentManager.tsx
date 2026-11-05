@@ -818,6 +818,11 @@ export default function DocumentManager() {
           return; // Skip this polling cycle
         }
 
+        // Skip polling when browser tab is hidden to save API and database resources
+        if (typeof document !== 'undefined' && document.hidden) {
+          return;
+        }
+
         // Only perform fetch if component is still mounted
         if (isMountedRef.current) {
           await fetchDocuments();

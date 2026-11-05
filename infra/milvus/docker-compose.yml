@@ -62,7 +62,7 @@ services:
     command: [ "milvus", "run", "mixcoord" ]
     environment: &milvus-env
       ETCD_ENDPOINTS: etcd1:2379,etcd2:2379,etcd3:2379
-      MINIO_ADDRESS: 10.2.6.25:19000
+      MINIO_ADDRESS: 10.1.6.134:19000
       MINIO_ACCESS_KEY_ID: minioadmin
       MINIO_SECRET_ACCESS_KEY: minioadmin
       MINIO_ACCESS_KEY: minioadmin
@@ -72,7 +72,7 @@ services:
       - ../../data/volumes/milvus-mc1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3 ]
-    mem_limit: 8g
+    mem_limit: 2g
     cpus: 4
     networks: [ milvus_net ]
 
@@ -107,7 +107,7 @@ services:
       timeout: 5s
       retries: 20
       start_period: 60s
-    mem_limit: 8g
+    mem_limit: 2g
     cpus: 4
     networks: [ milvus_net ]
 
@@ -124,7 +124,8 @@ services:
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
     deploy:
       resources:
-        limits: { memory: 190G }
+        limits: { memory: 60G }
+        reservations: { memory: 35G }
     networks: [ milvus_net ]
 
   milvus-querynode-2:
@@ -152,7 +153,7 @@ services:
       - ../../data/volumes/milvus-dn1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
-    mem_limit: 16g
+    mem_limit: 4g
     cpus: 4
     networks: [ milvus_net ]
 
@@ -173,8 +174,8 @@ services:
       - ../../data/volumes/milvus-in1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
-    mem_limit: 32g
-    cpus: 8
+    mem_limit: 8g
+    cpus: 4
     networks: [ milvus_net ]
 
   milvus-indexnode-2:
@@ -195,7 +196,7 @@ services:
       - ../../data/volumes/milvus-sn:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
-    mem_limit: 32g
+    mem_limit: 4g
     networks: [ milvus_net ]
 
   attu:

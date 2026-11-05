@@ -25,6 +25,10 @@ from kafka_worker.pipeline_main import (
     _canonical_doc_type,
     _normalize_event_doc_type,
 )
+from lightrag.pipeline.coordinator import (
+    create_coordinator_from_env,
+    max_stage_retry_attempts,
+)
 from lightrag.pipeline.models import PipelineStageEvent, StageName, utc_now_iso
 from lightrag.pipeline.partitioning import create_partition_allocator_from_env
 
@@ -191,6 +195,40 @@ async def _publish_stage_events(events: list[PipelineStageEvent]) -> int:
         await partition_allocator.finalize()
 
     return published
+
+
+async def sweep_pipeline_outbox() -> int:
+    if not KAFKA_BOOTSTRAP_SERVERS:
+        raise RuntimeError("KAFKA_BOOTSTRAP_SERVERS is not configured")
+
+    coordinator = create_coordinator_from_env()
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    partition_allocator = create_partition_allocator_from_env()
+    try:
+        await producer.start()
+
+        async def publish_event(event: PipelineStageEvent) -> None:
+            normalized = _normalize_event_doc_type(event)
+            doc_type = _canonical_doc_type(normalized)
+            topic = STAGE_TOPICS[normalized.stage_name][doc_type]
+            await publish_pipeline_event(
+                producer, partition_allocator, topic, normalized
+            )
+
+        return await coordinator.publish_outbox(publish_event)
+    finally:
+        cleanup_results = await asyncio.gather(
+            producer.stop(),
+            partition_allocator.finalize(),
+            coordinator.finalize(),
+            return_exceptions=True,
+        )
+        for operation, result in zip(
+            ("producer stop", "partition allocator finalize", "coordinator finalize"),
+            cleanup_results,
+        ):
+            if isinstance(result, BaseException):
+                logger.error("Sweeper: %s failed: %s", operation, result)
 
 
 async def _mark_auto_approved_rows(
@@ -501,7 +539,7 @@ async def sweep_failed_stage_records(
     table_name: str = "lightrag_pipeline_stage_runs",
 ) -> int:
     """Requeue failed stage records across all stages that still have retry budget."""
-    max_attempts = int(os.getenv("PIPELINE_MAX_STAGE_RETRY_ATTEMPTS", "5"))
+    max_attempts = max_stage_retry_attempts()
     retry_cooldown_seconds = int(
         os.getenv("PIPELINE_FAILED_RETRY_COOLDOWN_SECONDS", "300")
     )
@@ -948,6 +986,20 @@ async def report_pipeline_gaps(table_name: str = "lightrag_pipeline_stage_runs")
             )
 
 
+async def sweep_expired_retained_generations() -> int:
+    """Clean up shadow data for retained generations past their 7-day window."""
+    from lightrag.pipeline.generation_orchestrator import (
+        cleanup_expired_retained_generations,
+    )
+
+    coordinator = create_coordinator_from_env()
+    try:
+        cleaned = await cleanup_expired_retained_generations(coordinator)
+        return len(cleaned)
+    finally:
+        await coordinator.finalize()
+
+
 async def run_sweep() -> None:
     """Run all sweep operations once."""
     logger.info(
@@ -958,19 +1010,31 @@ async def run_sweep() -> None:
     
     try:
         await report_pipeline_gaps()
+        try:
+            outbox_count = await sweep_pipeline_outbox()
+        except Exception:
+            outbox_count = 0
+            logger.exception("Sweeper: failed to relay the pipeline outbox")
         stale_count = await sweep_stale_running()
         failed_stage_count = await sweep_failed_stage_records()
         orphan_kg_merge_count = await sweep_orphaned_documents()
         orphan_kg_embedding_count = await sweep_orphaned_kg_embedding_documents()
         auto_approved_count = await auto_approve_next_stages()
-        
+        try:
+            cleaned_generations_count = await sweep_expired_retained_generations()
+        except Exception:
+            cleaned_generations_count = 0
+            logger.exception("Sweeper: failed to clean expired retained generations")
+
         logger.info(
-            "Sweeper: cycle complete. Requeued %s stale running, requeued %s failed records, found %s orphaned kg_merge, found %s orphaned kg_embedding, auto-approved %s paused next-stage records.",
+            "Sweeper: cycle complete. Published %s outbox events, requeued %s stale running, requeued %s failed records, found %s orphaned kg_merge, found %s orphaned kg_embedding, auto-approved %s paused next-stage records, cleaned %s expired generations.",
+            outbox_count,
             stale_count,
             failed_stage_count,
             orphan_kg_merge_count,
             orphan_kg_embedding_count,
             auto_approved_count,
+            cleaned_generations_count,
         )
     except Exception:
         logger.exception("Sweeper: error during sweep cycle")

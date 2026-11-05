@@ -21,7 +21,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV UV_SYSTEM_PYTHON=1
-ENV UV_COMPILE_BYTECODE=1
+ENV UV_COMPILE_BYTECODE=0
 
 WORKDIR /app
 
@@ -44,9 +44,9 @@ COPY pyproject.toml .
 COPY setup.py .
 COPY uv.lock .
 
-# Install project dependencies (base + API extras) without the project to improve caching
+# Install project dependencies (base + offline extras including storage backends and LLMs) without the project to improve caching
 RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --no-install-project --no-editable
+    uv sync --frozen --no-dev --extra offline --no-install-project --no-editable
 
 # Copy project sources after dependency layer
 COPY lightrag/ ./lightrag/
@@ -56,7 +56,7 @@ COPY --from=frontend-builder /app/lightrag/api/webui ./lightrag/api/webui
 
 # Sync project in non-editable mode and ensure pip is available for runtime installs
 RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --no-editable \
+    uv sync --frozen --no-dev --extra offline --no-editable \
     && /app/.venv/bin/python -m ensurepip --upgrade
 
 # Prepare tiktoken cache directory and pre-populate tokenizer data
@@ -74,6 +74,7 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 ENV UV_SYSTEM_PYTHON=1
+ENV UV_COMPILE_BYTECODE=0
 
 # Copy installed packages and application code
 COPY --from=builder /root/.local /root/.local
@@ -89,7 +90,7 @@ ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
 # Sync dependencies inside the final image using uv
 # And ensure pip is available for runtime installs
 RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --no-editable \
+    uv sync --frozen --no-dev --extra offline --no-editable \
     && /app/.venv/bin/python -m ensurepip --upgrade
 
 # Create persistent data directories

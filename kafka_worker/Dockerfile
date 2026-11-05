@@ -6,6 +6,7 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 ENV UV_SYSTEM_PYTHON=1
+ENV UV_COMPILE_BYTECODE=0
 ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 ENV UV_INDEX_STRATEGY=unsafe-best-match
 

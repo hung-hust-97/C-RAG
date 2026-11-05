@@ -7,6 +7,55 @@ from bs4 import BeautifulSoup
 from lightrag.utils import Tokenizer, logger
 
 
+def _validate_chunking_limits(
+    chunk_token_size: int, chunk_overlap_token_size: int
+) -> None:
+    if chunk_token_size <= 0:
+        raise ValueError("chunk_token_size must be greater than zero")
+    if not 0 <= chunk_overlap_token_size < chunk_token_size:
+        raise ValueError(
+            "chunk_overlap_token_size must be non-negative and smaller "
+            "than chunk_token_size"
+        )
+
+
+def _split_oversized_content(
+    tokenizer: Tokenizer,
+    content: str,
+    context_prefix: str,
+    chunk_token_size: int,
+    chunk_overlap_token_size: int,
+) -> list[tuple[str, int, int]]:
+    source_tokens = tokenizer.encode(content)
+    if not source_tokens:
+        return []
+
+    chunks = []
+    start = 0
+    while start < len(source_tokens):
+        end = min(start + chunk_token_size, len(source_tokens))
+        while end > start:
+            chunk_content = (
+                f"{context_prefix}{tokenizer.decode(source_tokens[start:end])}"
+            ).strip()
+            if len(tokenizer.encode(chunk_content)) <= chunk_token_size:
+                break
+            end -= 1
+
+        if end == start:
+            raise ValueError(
+                "The legal context prefix leaves no room for content within "
+                f"the {chunk_token_size}-token chunk limit"
+            )
+
+        chunks.append((chunk_content, start, end))
+        if end == len(source_tokens):
+            break
+        start = max(start + 1, end - chunk_overlap_token_size)
+
+    return chunks
+
+
 def legal_chunking_markdown(
     tokenizer: Tokenizer,
     content: str,
@@ -41,6 +90,7 @@ def legal_chunking_markdown(
     """
     import re
 
+    _validate_chunking_limits(chunk_token_size, chunk_overlap_token_size)
     chunks = []
     current_chapter = ""
     current_article = ""
@@ -223,18 +273,16 @@ def legal_chunking_markdown(
                 f"Article '{current_article}' exceeds token limit ({len(tokens)} > {chunk_token_size}) "
                 f"but no clause structure detected. Falling back to token-based splitting."
             )
-            for start in range(
-                0, len(tokens), chunk_token_size - chunk_overlap_token_size
+            for chunk_content, _, _ in _split_oversized_content(
+                tokenizer,
+                article_content.strip(),
+                context_prefix,
+                chunk_token_size,
+                chunk_overlap_token_size,
             ):
-                chunk_tokens = tokens[start : start + chunk_token_size]
-                chunk_content = tokenizer.decode(chunk_tokens)
-
-                if not chunk_content.startswith(context_prefix):
-                    chunk_content = context_prefix + chunk_content
-
                 chunks.append(
                     {
-                        "tokens": len(chunk_tokens),
+                        "tokens": len(tokenizer.encode(chunk_content)),
                         "content": chunk_content.strip(),
                         "chunk_order_index": len(chunks),
                         "context": {
@@ -289,15 +337,13 @@ def legal_chunking_markdown(
                     current_group = []
 
                 # Split the current huge clause into multiple chunks using token-based boundaries
-                content_tokens = tokenizer.encode(clause_content)
-                for start in range(
-                    0, len(content_tokens), chunk_token_size - chunk_overlap_token_size
+                for chunk_content_str, _, _ in _split_oversized_content(
+                    tokenizer,
+                    clause_content,
+                    clause_prefix,
+                    chunk_token_size,
+                    chunk_overlap_token_size,
                 ):
-                    chunk_tokens = content_tokens[start : start + chunk_token_size]
-                    chunk_content_str = tokenizer.decode(chunk_tokens)
-                    if not chunk_content_str.startswith(clause_prefix):
-                        chunk_content_str = clause_prefix + chunk_content_str
-
                     chunks.append(
                         {
                             "tokens": len(tokenizer.encode(chunk_content_str)),
@@ -573,6 +619,7 @@ def legal_chunking_html(
             continue
         blocks.append(element)
 
+    _validate_chunking_limits(chunk_token_size, chunk_overlap_token_size)
     chunks = []
     current_chapter = ""
     current_article = ""
@@ -731,18 +778,17 @@ def legal_chunking_html(
         clauses = parse_clauses(article_blocks)
 
         if len(clauses) <= 1:
-            encoded = tokenizer.encode(article_content)
-            for start in range(
-                0, len(encoded), chunk_token_size - chunk_overlap_token_size
+            for chunk_content_str, start, end in _split_oversized_content(
+                tokenizer,
+                article_content,
+                context_prefix,
+                chunk_token_size,
+                chunk_overlap_token_size,
             ):
-                chunk_content_str = tokenizer.decode(
-                    encoded[start : start + chunk_token_size]
-                )
-                if not chunk_content_str.startswith(context_prefix):
-                    chunk_content_str = context_prefix + chunk_content_str
+                chunk_tokens = len(tokenizer.encode(chunk_content_str))
                 chunks.append(
                     {
-                        "tokens": len(encoded[start : start + chunk_token_size]),
+                        "tokens": chunk_tokens,
                         "content": chunk_content_str.strip(),
                         "chunk_order_index": len(chunks),
                         "context": attach_citation_position(
@@ -752,7 +798,7 @@ def legal_chunking_html(
                             },
                             collect_block_anchors(article_blocks),
                             start,
-                            start + len(encoded[start : start + chunk_token_size]),
+                            end,
                         ),
                     }
                 )
@@ -803,15 +849,13 @@ def legal_chunking_html(
                     current_group = []
 
                 # Split the current huge clause into multiple chunks using token-based boundaries
-                content_tokens = tokenizer.encode(clause_content)
-                for start in range(
-                    0, len(content_tokens), chunk_token_size - chunk_overlap_token_size
+                for chunk_content_str, start, end in _split_oversized_content(
+                    tokenizer,
+                    clause_content,
+                    clause_prefix,
+                    chunk_token_size,
+                    chunk_overlap_token_size,
                 ):
-                    chunk_tokens = content_tokens[start : start + chunk_token_size]
-                    chunk_content_str = tokenizer.decode(chunk_tokens)
-                    if not chunk_content_str.startswith(clause_prefix):
-                        chunk_content_str = clause_prefix + chunk_content_str
-
                     chunks.append(
                         {
                             "tokens": len(tokenizer.encode(chunk_content_str)),
@@ -826,7 +870,7 @@ def legal_chunking_html(
                                 },
                                 collect_clause_anchors([clause]),
                                 start,
-                                start + len(chunk_tokens),
+                                end,
                             ),
                         }
                     )

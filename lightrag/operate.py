@@ -3650,9 +3650,20 @@ async def extract_entities(
         except (TypeError, ValueError):
             return default
 
-    skip_failed_chunks = bool(
-        addon_params.get("entity_extraction_skip_failed_chunks")
-    ) or _env_bool("ENTITY_EXTRACTION_SKIP_FAILED_CHUNKS", False)
+    configured_skip_failed_chunks = addon_params.get(
+        "entity_extraction_skip_failed_chunks"
+    )
+    if isinstance(configured_skip_failed_chunks, str):
+        skip_failed_chunks = configured_skip_failed_chunks.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    elif configured_skip_failed_chunks is None:
+        skip_failed_chunks = _env_bool("ENTITY_EXTRACTION_SKIP_FAILED_CHUNKS", False)
+    else:
+        skip_failed_chunks = bool(configured_skip_failed_chunks)
     max_failed_chunk_ratio = _env_float(
         "ENTITY_EXTRACTION_MAX_FAILED_CHUNK_RATIO", 0.35
     )

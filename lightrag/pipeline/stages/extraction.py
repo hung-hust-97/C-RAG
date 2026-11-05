@@ -6,6 +6,7 @@ from typing import Any
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 from lightrag.pipeline.stages.common import (
     check_duplicate_by_content_hash,
+    get_rag_for_event,
     mark_document_as_duplicated,
     read_file_from_storage,
     read_legal_pdf_from_storage,
@@ -37,7 +38,7 @@ def _create_markdown_content(content: str, title: str, add_title: bool) -> str:
 
 
 async def run_extraction_stage(event: PipelineStageEvent, context: Any) -> StageResult:
-    rag = await context.get_rag(event.workspace_id, profile=event.stage)
+    rag = await get_rag_for_event(context, event, profile=event.stage)
     document_id = event.doc_id
     workspace_id = event.workspace_id
     document_name = (

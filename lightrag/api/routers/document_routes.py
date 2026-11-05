@@ -4,9 +4,11 @@ This module contains all document-related routes for the LightRAG API.
 
 import asyncio
 import base64
+import contextvars
+import inspect
 import os
 import textwrap
-from functools import lru_cache
+from functools import lru_cache, wraps
 from lightrag.utils import logger, get_pinyin_sort_key
 import aiofiles
 import traceback
@@ -966,6 +968,10 @@ class ReprocessRequest(BaseModel):
         default=None,
         description="Optional list of document IDs to reprocess. If not provided, all failed/stuck documents in the workspace are reprocessed."
     )
+    doc_type: Optional[str] = Field(
+        default=None,
+        description="Optional doc_type filter ('legal' or 'general') to reprocess only failed documents of this type."
+    )
 
 
 class PipelineStageRunsRequest(BaseModel):
@@ -975,6 +981,10 @@ class PipelineStageRunsRequest(BaseModel):
     stage: Optional[str] = Field(default=None, description="Filter by stage name")
     status: Optional[list[str]] = Field(default=None, description="Filter by status list (e.g. ['running', 'failed'])")
     search: Optional[str] = Field(default=None, description="Search term for document title or ID")
+    doc_type: Optional[Literal["all", "legal", "general"]] = Field(
+        default=None,
+        description="Filter by document type ('all', 'legal', 'general')"
+    )
     page: int = Field(default=1, ge=1, description="Page number")
     page_size: int = Field(default=10, ge=1, le=500, description="Items per page")
 
@@ -989,6 +999,7 @@ class PipelineStageRunResponse(BaseModel):
     workspace_id: str = Field(description="Workspace ID")
     doc_id: str = Field(description="Document ID")
     document_name: Optional[str] = Field(default=None, description="Document name / title")
+    doc_type: Optional[str] = Field(default="general", description="Document type ('legal' or 'general')")
     status: str = Field(description="Status of the stage run")
     attempt: int = Field(description="Attempt number")
     error_json: Optional[Any] = Field(default=None, description="Error JSON structure if failed")
@@ -1008,6 +1019,10 @@ class PaginatedPipelineStageRunsResponse(BaseModel):
         default_factory=dict,
         description="Nested dictionary of counts grouped by stage and status"
     )
+    doc_type_counts: Optional[Dict[str, int]] = Field(
+        default_factory=dict,
+        description="Counts by doc_type: {'all': X, 'legal': Y, 'general': Z}"
+    )
 
 
 class ApproveStageRequest(BaseModel):
@@ -1024,6 +1039,70 @@ class ApproveStageResponse(BaseModel):
 
     status: str = Field(description="Response status")
     message: str = Field(description="Message detailing the result of the action")
+
+
+class ReplayStageRequest(BaseModel):
+    """Request model for an audited replay of a failed pipeline stage."""
+
+    run_id: str = Field(min_length=1, description="Pipeline run ID")
+    stage: str = Field(min_length=1, description="Failed stage name")
+    shard_index: int = Field(default=0, ge=0, description="Failed shard index")
+    workspace_id: Optional[str] = Field(default=None, description="Workspace ID")
+    reason: str = Field(
+        min_length=3,
+        max_length=500,
+        description="Operator reason for replay",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 3:
+            raise ValueError("reason must contain at least three non-space characters")
+        return normalized
+
+
+class ReplayStageResponse(BaseModel):
+    status: str = Field(description="Replay status")
+    message: str = Field(description="Replay result")
+    event_id: str = Field(description="Queued replay event ID")
+    attempt: int = Field(description="Attempt number for the replay event")
+
+
+class GenerationStartRequest(BaseModel):
+    workspace_id: Optional[str] = Field(default=None, description="Workspace ID")
+    generation_id: Optional[str] = Field(
+        default=None, description="Optional explicit generation ID"
+    )
+    reason: str = Field(
+        min_length=3,
+        max_length=500,
+        description="Operator reason for starting shadow generation rebuild",
+    )
+
+
+class GenerationActionRequest(BaseModel):
+    workspace_id: Optional[str] = Field(default=None, description="Workspace ID")
+    reason: str = Field(
+        min_length=3,
+        max_length=500,
+        description="Operator reason for cutover or rollback",
+    )
+
+
+class GenerationStatusResponse(BaseModel):
+    workspace_id: str
+    generation_id: str
+    storage_workspace_id: str
+    status: str
+    snapshot_complete: Optional[bool] = None
+    expected_documents: Optional[int] = None
+    pending_documents: Optional[int] = None
+    running_documents: Optional[int] = None
+    completed_documents: Optional[int] = None
+    failed_documents: Optional[int] = None
+
 
 
 class BulkApproveStageRequest(BaseModel):
@@ -2303,14 +2382,31 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, doc_id: str = None
     if doc_id is None:
         doc_id = generate_doc_id("doc-")
     
-    # Resolve workspace_id for Celery task
+    # Resolve workspace_id for Celery/Kafka task
     if resolved_workspace_id is None:
         resolved_workspace_id = rag.workspace if rag.workspace else "default"
-    
-    # Check if Celery is available and enabled
-    use_celery = (
-        os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
+
+    from lightrag.pipeline.ingest_flags import (
+        build_ingest_stage_event,
+        enqueue_kafka_stage_events,
+        resolve_ingest_backend,
     )
+    from lightrag.pipeline.models import StageName
+
+    ingest_backend = resolve_ingest_backend()
+    if ingest_backend == "kafka":
+        event = build_ingest_stage_event(
+            workspace_id=resolved_workspace_id,
+            doc_id=doc_id,
+            stage=StageName.EXTRACTION,
+            doc_type=doc_type,
+            file_path=str(file_path),
+        )
+        await enqueue_kafka_stage_events([event])
+        return doc_id
+
+    # Check if Celery is available and enabled
+    use_celery = ingest_backend == "celery"
     
     try:
         from celery_worker.tasks import task_extract_and_enqueue
@@ -2362,11 +2458,36 @@ async def pipeline_index_files(
         resolved_workspace_id = rag.workspace if rag.workspace else "default"
     
     doc_ids = []
-    
-    # Check if Celery is available and enabled
-    use_celery = (
-        os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
+
+    from lightrag.pipeline.ingest_flags import (
+        build_ingest_stage_event,
+        enqueue_kafka_stage_events,
+        resolve_ingest_backend,
     )
+    from lightrag.pipeline.models import StageName
+
+    ingest_backend = resolve_ingest_backend()
+    if ingest_backend == "kafka":
+        sorted_file_paths = sorted(
+            file_paths, key=lambda p: get_pinyin_sort_key(str(p))
+        )
+        events = []
+        for file_path in sorted_file_paths:
+            doc_id = generate_doc_id("doc-")
+            doc_ids.append(doc_id)
+            events.append(
+                build_ingest_stage_event(
+                    workspace_id=resolved_workspace_id,
+                    doc_id=doc_id,
+                    stage=StageName.EXTRACTION,
+                    file_path=str(file_path),
+                )
+            )
+        await enqueue_kafka_stage_events(events)
+        return doc_ids
+
+    # Check if Celery is available and enabled
+    use_celery = ingest_backend == "celery"
     
     try:
         from celery_worker.tasks import task_extract_and_enqueue
@@ -2466,11 +2587,31 @@ async def pipeline_index_texts(
     await rag.apipeline_enqueue_documents(
         input=texts, ids=doc_ids, file_paths=normalized_file_sources, doc_type=doc_type
     )
-    
-    # Check if Celery is available and enabled
-    use_celery = (
-        os.environ.get("EMBEDDING_USE_CELERY", "false").lower() == "true"
+
+    from lightrag.pipeline.ingest_flags import (
+        build_ingest_stage_event,
+        enqueue_kafka_stage_events,
+        resolve_ingest_backend,
     )
+    from lightrag.pipeline.models import StageName
+
+    ingest_backend = resolve_ingest_backend()
+    if ingest_backend == "kafka":
+        events = [
+            build_ingest_stage_event(
+                workspace_id=rag.workspace or "default",
+                doc_id=doc_id,
+                stage=StageName.CHUNKING,
+                doc_type=doc_type,
+                file_path=src,
+            )
+            for doc_id, src in zip(doc_ids, normalized_file_sources)
+        ]
+        await enqueue_kafka_stage_events(events)
+        return doc_ids
+
+    # Check if Celery is available and enabled
+    use_celery = ingest_backend == "celery"
     
     try:
         from celery_worker.tasks import task_chunk_and_graph
@@ -2813,6 +2954,55 @@ async def background_delete_documents(
                 logger.error(f"Error processing pending documents after deletion: {e}")
 
 
+_STAGE_RUNS_WS_CACHE: dict[str, Any] = {"data": None, "ts": 0.0}
+_STAGE_RUNS_METRICS_CACHE: dict[str, tuple[float, Any]] = {}
+_STAGE_RUNS_METRICS_TTL = 30.0  # 30 seconds TTL for expensive aggregate metrics
+
+
+def _get_stage_metrics_cache(key: str) -> Optional[Any]:
+    import time
+    entry = _STAGE_RUNS_METRICS_CACHE.get(key)
+    if entry:
+        ts, data = entry
+        if time.time() - ts < _STAGE_RUNS_METRICS_TTL:
+            return data
+    return None
+
+
+def _set_stage_metrics_cache(key: str, data: Any):
+    import time
+    if len(_STAGE_RUNS_METRICS_CACHE) > 500:
+        _STAGE_RUNS_METRICS_CACHE.clear()
+    _STAGE_RUNS_METRICS_CACHE[key] = (time.time(), data)
+
+
+async def _get_stage_runs_workspace_map(db) -> tuple[list[str], list[Any]]:
+    from lightrag.kg.postgres_impl import to_uuid
+    import time
+    now = time.monotonic()
+    if _STAGE_RUNS_WS_CACHE["data"] is not None and (now - _STAGE_RUNS_WS_CACHE["ts"]) < 60.0:
+        return _STAGE_RUNS_WS_CACHE["data"]
+
+    ws_ids = set()
+    try:
+        ws_rows = await db.query("SELECT id, name FROM tbl_workspace", [], multirows=True)
+        for r in (ws_rows or []):
+            if r.get("id"):
+                ws_ids.add(str(r["id"]).strip())
+            if r.get("name"):
+                ws_ids.add(str(r["name"]).strip())
+    except Exception:
+        pass
+    ws_ids.add("default")
+
+    ws_id_list = sorted([ws for ws in ws_ids if ws])
+    ws_uuid_list = [to_uuid(ws) for ws in ws_id_list]
+    res = (ws_id_list, ws_uuid_list)
+    _STAGE_RUNS_WS_CACHE["data"] = res
+    _STAGE_RUNS_WS_CACHE["ts"] = now
+    return res
+
+
 def create_document_routes(
     rag: LightRAG,
     doc_manager: DocumentManager,
@@ -2832,6 +3022,251 @@ def create_document_routes(
             return rag.workspace
 
         return normalized_workspace_id
+
+    def generation_workspace_id(workspace_id: str) -> str:
+        return workspace_id or "default"
+
+    async def ensure_workspace_generation_writable(workspace_id: str) -> None:
+        from lightrag.pipeline.coordinator import create_coordinator_from_env
+
+        workspace_id = generation_workspace_id(workspace_id)
+        coordinator = create_coordinator_from_env()
+        try:
+            if await coordinator.is_workspace_write_locked(workspace_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Workspace '{workspace_id}' is locked for a generation "
+                        "build or cutover. Retry this write after the operation completes."
+                    ),
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Failed to verify generation write lock for workspace_id=%s",
+                workspace_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to verify workspace generation state",
+            ) from exc
+        finally:
+            try:
+                await coordinator.finalize()
+            except Exception:
+                logger.exception(
+                    "Failed to release generation coordinator for workspace_id=%s",
+                    workspace_id,
+                )
+
+    class WorkspaceWriteLeaseManager:
+        def __init__(self, coordinator):
+            self.coordinator = coordinator
+            self.leases = {}
+            self.renewal_task = asyncio.create_task(self._renew_leases())
+
+        async def acquire(self, workspace_ids: list[str]) -> None:
+            from lightrag.pipeline.coordinator import WorkspaceGenerationConflictError
+
+            for workspace_id in sorted(
+                {generation_workspace_id(item) for item in workspace_ids}
+            ):
+                if workspace_id in self.leases:
+                    continue
+                try:
+                    lease = await self.coordinator.acquire_workspace_write_lease(
+                        workspace_id
+                    )
+                except WorkspaceGenerationConflictError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Workspace '{workspace_id}' is locked for a generation "
+                            "build or cutover. Retry this write after the operation completes."
+                        ),
+                    ) from exc
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to acquire generation write lease workspace_id=%s",
+                        workspace_id,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Unable to acquire workspace write lease",
+                    ) from exc
+                self.leases[workspace_id] = lease
+
+        async def _renew_leases(self) -> None:
+            while True:
+                await asyncio.sleep(60)
+                for workspace_id, lease in list(self.leases.items()):
+                    self.leases[workspace_id] = (
+                        await self.coordinator.renew_workspace_write_lease(lease)
+                    )
+
+        async def run_background_tasks(self, tasks) -> None:
+            try:
+                for task in tasks:
+                    task_run = asyncio.create_task(task())
+                    done, _ = await asyncio.wait(
+                        {task_run, self.renewal_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if self.renewal_task in done:
+                        try:
+                            self.renewal_task.result()
+                        except Exception:
+                            task_run.cancel()
+                            await asyncio.gather(task_run, return_exceptions=True)
+                            logger.exception(
+                                "Workspace write lease renewal failed during background work"
+                            )
+                            raise
+                        raise RuntimeError("Workspace write lease renewal stopped")
+                    await task_run
+            finally:
+                await self.close()
+
+        async def close(self) -> None:
+            cleanup_errors = []
+            self.renewal_task.cancel()
+            await asyncio.gather(self.renewal_task, return_exceptions=True)
+            for workspace_id, lease in self.leases.items():
+                try:
+                    await self.coordinator.release_workspace_write_lease(lease)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+                    logger.exception(
+                        "Failed to release workspace write lease workspace_id=%s",
+                        workspace_id,
+                    )
+            self.leases.clear()
+            try:
+                await self.coordinator.finalize()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.exception("Failed to finalize generation coordinator")
+            if cleanup_errors:
+                raise RuntimeError("Workspace write lease cleanup failed") from cleanup_errors[0]
+
+    lease_context = contextvars.ContextVar("workspace_write_lease_context", default=None)
+
+    async def acquire_workspace_write_leases(workspace_ids: list[str]) -> None:
+        manager = lease_context.get()
+        if manager is None:
+            raise RuntimeError("Workspace write lease context is unavailable")
+        await manager.acquire(workspace_ids)
+
+    def with_workspace_write_lease(
+        endpoint: Callable[..., Awaitable[Any]],
+    ) -> Callable[..., Awaitable[Any]]:
+        @wraps(endpoint)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            bound = inspect.signature(endpoint).bind_partial(*args, **kwargs)
+            request = next(
+                (
+                    value
+                    for value in bound.arguments.values()
+                    if isinstance(value, Request)
+                ),
+                None,
+            )
+            requested_workspace = bound.arguments.get("workspace_id")
+            if not requested_workspace:
+                requested_workspace = next(
+                    (
+                        getattr(value, "workspace_id", None)
+                        for value in bound.arguments.values()
+                        if getattr(value, "workspace_id", None)
+                    ),
+                    None,
+                )
+            dynamic_workspace_selection = requested_workspace == "all" or (
+                endpoint.__name__ == "reprocess_failed_documents"
+                and not requested_workspace
+            )
+            background_tasks = bound.arguments.get("background_tasks")
+            initial_task_count = (
+                len(background_tasks.tasks) if background_tasks is not None else 0
+            )
+
+            from lightrag.pipeline.coordinator import create_coordinator_from_env
+
+            coordinator = create_coordinator_from_env()
+            manager = WorkspaceWriteLeaseManager(coordinator)
+            token = lease_context.set(manager)
+            endpoint_succeeded = False
+            transferred_to_background = False
+            try:
+                if not dynamic_workspace_selection:
+                    if not requested_workspace and request is not None:
+                        requested_workspace = (
+                            request.headers.get("LIGHTRAG-WORKSPACE-ID")
+                            or request.headers.get("LIGHTRAG-WORKSPACE")
+                        )
+                    resolved_workspace = normalize_workspace_id(requested_workspace)
+                    current_rag = (
+                        await get_rag_for_workspace(resolved_workspace)
+                        if get_rag_for_workspace is not None
+                        else rag
+                    )
+                    await manager.acquire(
+                        [generation_workspace_id(current_rag.workspace)]
+                    )
+
+                endpoint_task = asyncio.create_task(endpoint(*args, **kwargs))
+                try:
+                    done, _ = await asyncio.wait(
+                        {endpoint_task, manager.renewal_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if manager.renewal_task in done:
+                        try:
+                            manager.renewal_task.result()
+                        except Exception as exc:
+                            endpoint_task.cancel()
+                            await asyncio.gather(
+                                endpoint_task, return_exceptions=True
+                            )
+                            logger.exception(
+                                "Workspace write lease renewal failed during request"
+                            )
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Workspace write lease could not be maintained",
+                            ) from exc
+                        raise RuntimeError(
+                            "Workspace write lease renewal stopped"
+                        )
+                    result = await endpoint_task
+                except asyncio.CancelledError:
+                    endpoint_task.cancel()
+                    await asyncio.gather(endpoint_task, return_exceptions=True)
+                    raise
+
+                endpoint_succeeded = True
+                if background_tasks is not None and len(background_tasks.tasks) > initial_task_count:
+                    pending_tasks = list(background_tasks.tasks)
+                    background_tasks.tasks.clear()
+                    background_tasks.add_task(
+                        manager.run_background_tasks, pending_tasks
+                    )
+                    transferred_to_background = True
+                return result
+            finally:
+                lease_context.reset(token)
+                if not transferred_to_background:
+                    try:
+                        await manager.close()
+                    except Exception as exc:
+                        if endpoint_succeeded:
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Workspace write lease cleanup failed",
+                            ) from exc
+
+        return wrapped
 
     async def resolve_request_context(
         request: Optional[Request] = None,
@@ -2874,6 +3309,7 @@ def create_document_routes(
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
+    @with_workspace_write_lease
     async def scan_for_new_documents(
         background_tasks: BackgroundTasks,
         request: Request,
@@ -2891,6 +3327,7 @@ def create_document_routes(
         resolved_workspace_id, current_rag, current_doc_manager = (
             await resolve_request_context(request, workspace_id)
         )
+        await ensure_workspace_generation_writable(current_rag.workspace)
 
         # Scan for new files to get count
         new_files = current_doc_manager.scan_directory_for_new_files()
@@ -2917,6 +3354,7 @@ def create_document_routes(
     @router.post(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
+    @with_workspace_write_lease
     async def upload_to_input_dir(
         background_tasks: BackgroundTasks,
         request: Request,
@@ -2986,6 +3424,7 @@ def create_document_routes(
             resolved_workspace_id, current_rag, current_doc_manager = (
                 await resolve_request_context(request, workspace_id)
             )
+            await ensure_workspace_generation_writable(current_rag.workspace)
 
             # Sanitize filename to prevent Path Traversal attacks
             safe_filename = sanitize_filename(
@@ -3342,6 +3781,7 @@ def create_document_routes(
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
+    @with_workspace_write_lease
     async def insert_text(
         request: InsertTextRequest,
         background_tasks: BackgroundTasks,
@@ -3372,6 +3812,7 @@ def create_document_routes(
             resolved_workspace_id, current_rag, _ = await resolve_request_context(
                 http_request, request.workspace_id
             )
+            await ensure_workspace_generation_writable(current_rag.workspace)
             logger.info(f"[insert_text] Resolved workspace: {resolved_workspace_id}")
 
             # Auto-generate title if file_source is not provided or is unknown_source
@@ -3446,6 +3887,8 @@ def create_document_routes(
                 workspace_id=resolved_workspace_id,
                 doc_id=doc_id,
             )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error /documents/text: {str(e)}")
             logger.error(traceback.format_exc())
@@ -3456,6 +3899,7 @@ def create_document_routes(
         response_model=BatchInsertResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def insert_texts(
         request: InsertTextsRequest,
         background_tasks: BackgroundTasks,
@@ -3484,6 +3928,7 @@ def create_document_routes(
             resolved_workspace_id, current_rag, _ = await resolve_request_context(
                 http_request, request.workspace_id
             )
+            await ensure_workspace_generation_writable(current_rag.workspace)
 
             # Auto-generate titles for texts without file_sources
             if not request.file_sources:
@@ -3570,6 +4015,8 @@ def create_document_routes(
                 queued_files=len(doc_ids),
                 failed_files=0,
             )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error /documents/texts: {str(e)}")
             logger.error(traceback.format_exc())
@@ -3578,6 +4025,7 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
+    @with_workspace_write_lease
     async def clear_documents(
         request: Request, workspace_id: Optional[str] = None
     ):
@@ -3604,6 +4052,7 @@ def create_document_routes(
         resolved_workspace_id, current_rag, current_doc_manager = (
             await resolve_request_context(request, workspace_id)
         )
+        await ensure_workspace_generation_writable(current_rag.workspace)
 
         from lightrag.kg.shared_storage import (
             get_namespace_data,
@@ -4021,6 +4470,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Delete documents by IDs within a workspace.",
     )
+    @with_workspace_write_lease
     async def delete_document(
         delete_request: DeleteDocRequest,
         request: Request,
@@ -4060,6 +4510,7 @@ def create_document_routes(
             _, current_rag, current_doc_manager = await resolve_request_context(
                 request, workspace_id
             )
+            await ensure_workspace_generation_writable(current_rag.workspace)
 
             # Validate all documents belong to the resolved workspace before enqueueing deletion.
             existing_docs = await asyncio.gather(
@@ -4115,6 +4566,8 @@ def create_document_routes(
                 doc_id=", ".join(doc_ids),
             )
 
+        except HTTPException:
+            raise
         except Exception as e:
             error_msg = f"Error initiating document deletion for {delete_request.doc_ids}: {str(e)}"
             logger.error(error_msg)
@@ -4127,6 +4580,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Rebuild chunk/entity/relation vectors for a workspace.",
     )
+    @with_workspace_write_lease
     async def reembed_documents(
         reembed_request: ReembedRequest,
         request: Request,
@@ -4136,6 +4590,7 @@ def create_document_routes(
             _, current_rag, _ = await resolve_request_context(
                 request, reembed_request.workspace_id
             )
+            await ensure_workspace_generation_writable(current_rag.workspace)
 
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
@@ -4192,6 +4647,8 @@ def create_document_routes(
                 entities=stats["entities"],
                 relations=stats["relations"],
             )
+        except HTTPException:
+            raise
         except Exception as e:
             error_msg = f"Error re-embedding workspace vectors: {str(e)}"
             logger.error(error_msg)
@@ -4207,6 +4664,7 @@ def create_document_routes(
         response_model=ClearCacheResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def clear_cache(request: ClearCacheRequest):
         """
         Clear all cache data from the LLM response cache storage.
@@ -4241,6 +4699,7 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def delete_entity(request: DeleteEntityRequest):
         """
         Delete an entity and all its relationships from the knowledge graph.
@@ -4255,6 +4714,7 @@ def create_document_routes(
             HTTPException: If the entity is not found (404) or an error occurs (500).
         """
         try:
+            await ensure_workspace_generation_writable(rag.workspace)
             result = await rag.adelete_by_entity(entity_name=request.entity_name)
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
@@ -4276,6 +4736,7 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def delete_relation(request: DeleteRelationRequest):
         """
         Delete a relationship between two entities from the knowledge graph.
@@ -4290,6 +4751,7 @@ def create_document_routes(
             HTTPException: If the relation is not found (404) or an error occurs (500).
         """
         try:
+            await ensure_workspace_generation_writable(rag.workspace)
             result = await rag.adelete_by_relation(
                 source_entity=request.source_entity,
                 target_entity=request.target_entity,
@@ -4627,6 +5089,7 @@ def create_document_routes(
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def reprocess_failed_documents(
         background_tasks: BackgroundTasks,
         request: Request,
@@ -4662,12 +5125,51 @@ def create_document_routes(
         """
         try:
             _, current_rag, _ = await resolve_request_context(request, workspace_id)
+            await ensure_workspace_generation_writable(current_rag.workspace)
 
             # Count documents that will be reprocessed
             documents_count = 0
             workspaces_to_process = []
             
             doc_ids = reprocess_req.doc_ids if reprocess_req is not None else None
+            
+            # If doc_type filter is specified and doc_ids not explicitly provided, find failed doc_ids matching doc_type
+            if not doc_ids and reprocess_req and reprocess_req.doc_type in ("legal", "general"):
+                from lightrag.kg.postgres_impl import ClientManager, to_uuid
+                db = await ClientManager.get_client()
+                target_dt = reprocess_req.doc_type
+                if workspace_id:
+                    ws_uuid = to_uuid(current_rag.workspace)
+                    doc_query = """
+                        SELECT DISTINCT sr.doc_id
+                        FROM lightrag_pipeline_stage_runs sr
+                        LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = $2
+                        WHERE sr.workspace_id = $1 AND sr.status = 'failed'
+                    """
+                    if target_dt == "legal":
+                        doc_query += " AND (ld.id IS NOT NULL OR sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal')"
+                    else:
+                        doc_query += " AND (ld.id IS NULL AND (sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal'))"
+                    doc_rows = await db.query(doc_query, [current_rag.workspace, ws_uuid], multirows=True)
+                else:
+                    doc_query = """
+                        SELECT DISTINCT sr.doc_id
+                        FROM lightrag_pipeline_stage_runs sr
+                        LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text
+                        WHERE sr.status = 'failed'
+                    """
+                    if target_dt == "legal":
+                        doc_query += " AND (ld.id IS NOT NULL OR sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal')"
+                    else:
+                        doc_query += " AND (ld.id IS NULL AND (sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal'))"
+                    doc_rows = await db.query(doc_query, [], multirows=True)
+                
+                doc_ids = [str(r["doc_id"]) for r in (doc_rows or []) if r.get("doc_id")]
+                if not doc_ids:
+                    return ReprocessResponse(
+                        status="success",
+                        message=f"No failed {target_dt} documents found to reprocess."
+                    )
             
             if doc_ids:
                 documents_count = len(doc_ids)
@@ -4710,6 +5212,13 @@ def create_document_routes(
                     documents_count = 0
                     workspaces_to_process = [current_rag.workspace] if workspace_id else []
 
+            if not workspace_id:
+                for workspace_to_process in workspaces_to_process:
+                    await ensure_workspace_generation_writable(workspace_to_process)
+
+            if not workspace_id:
+                await acquire_workspace_write_leases(workspaces_to_process)
+
             # Start the reprocessing in the background for each workspace
             if workspace_id:
                 # Single workspace reprocess
@@ -4720,28 +5229,49 @@ def create_document_routes(
                 if doc_ids:
                     workspace_msg += f" for {len(doc_ids)} document(s)"
             else:
-                # Multi-workspace reprocess - use Celery task for each workspace
-                try:
-                    from celery_worker.tasks import apipeline_process_enqueue_documents_task
-                    
-                    for ws_id in workspaces_to_process:
-                        try:
-                            # Trigger Celery task for each workspace
-                            apipeline_process_enqueue_documents_task.delay(
-                                workspace_id=ws_id,
-                                reprocess_failed=True,
-                                doc_ids=doc_ids
-                            )
-                            logger.info(f"Triggered reprocess Celery task for workspace: {ws_id}")
-                        except Exception as e:
-                            logger.error(f"Failed to trigger reprocess for workspace {ws_id}: {str(e)}")
-                            logger.error(traceback.format_exc())
-                    
-                    workspace_msg = f"across {len(workspaces_to_process)} workspace(s)"
-                except ImportError as e:
-                    logger.error(f"Failed to import Celery task: {e}")
-                    workspace_msg = "failed - Celery not available"
-                    documents_count = 0
+                from lightrag.pipeline.ingest_flags import (
+                    build_ingest_stage_event,
+                    enqueue_kafka_stage_events,
+                    resolve_reprocess_backend,
+                )
+                from lightrag.pipeline.models import StageName
+
+                if resolve_reprocess_backend() == "kafka" and doc_ids:
+                    events = [
+                        build_ingest_stage_event(
+                            workspace_id=ws_id,
+                            doc_id=str(doc_id),
+                            stage=StageName.CHUNKING,
+                            metadata={"reprocess_failed": True},
+                        )
+                        for ws_id in workspaces_to_process
+                        for doc_id in doc_ids
+                    ]
+                    await enqueue_kafka_stage_events(events)
+                    workspace_msg = f"across {len(workspaces_to_process)} workspace(s) via Kafka"
+                else:
+                    # Multi-workspace reprocess - use Celery task for each workspace
+                    try:
+                        from celery_worker.tasks import apipeline_process_enqueue_documents_task
+
+                        for ws_id in workspaces_to_process:
+                            try:
+                                # Trigger Celery task for each workspace
+                                apipeline_process_enqueue_documents_task.delay(
+                                    workspace_id=ws_id,
+                                    reprocess_failed=True,
+                                    doc_ids=doc_ids
+                                )
+                                logger.info(f"Triggered reprocess Celery task for workspace: {ws_id}")
+                            except Exception as e:
+                                logger.error(f"Failed to trigger reprocess for workspace {ws_id}: {str(e)}")
+                                logger.error(traceback.format_exc())
+
+                        workspace_msg = f"across {len(workspaces_to_process)} workspace(s)"
+                    except ImportError as e:
+                        logger.error(f"Failed to import Celery task: {e}")
+                        workspace_msg = "failed - Celery not available"
+                        documents_count = 0
             
             logger.info(f"Reprocessing of {documents_count} failed documents {workspace_msg} initiated")
 
@@ -4751,6 +5281,8 @@ def create_document_routes(
                 documents_count=documents_count
             )
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
             logger.error(traceback.format_exc())
@@ -4769,44 +5301,63 @@ def create_document_routes(
         Get paginated pipeline stage runs with status matrix and document names.
         """
         try:
-            from lightrag.kg.postgres_impl import ClientManager, to_uuid
+            from lightrag.kg.postgres_impl import ClientManager
             
             db = await ClientManager.get_client()
             
             # Resolve request context for workspace ID
             resolved_workspace_id, current_rag, _ = await resolve_request_context(request, req.workspace_id)
             
-            # 1. Fetch status matrix (counts grouped by stage and status)
-            matrix_sql = """
-                SELECT stage, status, COUNT(DISTINCT run_id) as cnt
-                FROM lightrag_pipeline_stage_runs
-                WHERE workspace_id = $1
-                GROUP BY stage, status
-            """
-            matrix_rows = await db.query(matrix_sql, [resolved_workspace_id], multirows=True)
+            # 1. Fetch doc_type counts for workspace with in-memory caching
+            cached_dtc = _get_stage_metrics_cache(f"dtc:{resolved_workspace_id}")
+            dt_task = None
+            if cached_dtc is None:
+                doc_type_counts_sql = """
+                    SELECT 
+                        COUNT(*) as all_cnt,
+                        COUNT(*) FILTER (WHERE sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal' OR sr.doc_id ~ '^[0-9]+$') as legal_cnt,
+                        COUNT(*) FILTER (WHERE (sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal') AND sr.doc_id !~ '^[0-9]+$') as general_cnt
+                    FROM lightrag_pipeline_stage_runs sr
+                    WHERE sr.workspace_id = $1
+                """
+                dt_task = db.query(doc_type_counts_sql, [resolved_workspace_id])
+
+            # 2. Fetch status matrix with in-memory caching
+            cached_mat = _get_stage_metrics_cache(f"mat:{resolved_workspace_id}:{req.doc_type}")
+            matrix_task = None
+            if cached_mat is None:
+                if req.doc_type == "legal":
+                    matrix_sql = """
+                        SELECT sr.stage, sr.status, COUNT(DISTINCT sr.run_id) as cnt
+                        FROM lightrag_pipeline_stage_runs sr
+                        WHERE sr.workspace_id = $1 AND (sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal' OR sr.doc_id ~ '^[0-9]+$')
+                        GROUP BY sr.stage, sr.status
+                    """
+                elif req.doc_type == "general":
+                    matrix_sql = """
+                        SELECT sr.stage, sr.status, COUNT(DISTINCT sr.run_id) as cnt
+                        FROM lightrag_pipeline_stage_runs sr
+                        WHERE sr.workspace_id = $1 AND (sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal') AND sr.doc_id !~ '^[0-9]+$'
+                        GROUP BY sr.stage, sr.status
+                    """
+                else:
+                    matrix_sql = """
+                        SELECT stage, status, COUNT(DISTINCT run_id) as cnt
+                        FROM lightrag_pipeline_stage_runs
+                        WHERE workspace_id = $1
+                        GROUP BY stage, status
+                    """
+                matrix_task = db.query(matrix_sql, [resolved_workspace_id], multirows=True)
+
+            # 3. Build paginated query with filters
+            query_parts = ["sr.workspace_id = $1"]
+            params = [resolved_workspace_id]
             
-            status_matrix = {}
-            for row in matrix_rows:
-                stage = row["stage"]
-                status = row["status"]
-                count = row["cnt"]
-                if stage not in status_matrix:
-                    status_matrix[stage] = {}
-                status_matrix[stage][status] = count
-                
-            # 2. Build paginated query with filters
-            query_parts = []
-            params = []
-            
-            # Param 1: workspace_id (string)
-            params.append(resolved_workspace_id)
-            query_parts.append("sr.workspace_id = $1")
-            
-            # Param 2: workspace_uuid (for joins)
-            workspace_uuid = to_uuid(resolved_workspace_id)
-            params.append(workspace_uuid)
-            workspace_join_ref = "$2"
-            
+            if req.doc_type == "legal":
+                query_parts.append("(sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal' OR sr.doc_id ~ '^[0-9]+$')")
+            elif req.doc_type == "general":
+                query_parts.append("((sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal') AND sr.doc_id !~ '^[0-9]+$')")
+
             if req.stage:
                 params.append(req.stage)
                 query_parts.append(f"sr.stage = ${len(params)}")
@@ -4815,26 +5366,32 @@ def create_document_routes(
                 params.append(req.status)
                 query_parts.append(f"sr.status = ANY(${len(params)})")
                 
+            doc_search_join = ""
             if req.search:
                 params.append(f"%{req.search}%")
                 query_parts.append(
                     f"(COALESCE(d.document_name, ld.title) ILIKE ${len(params)} OR sr.doc_id ILIKE ${len(params)})"
                 )
+                doc_search_join = (
+                    "LEFT JOIN tbl_document d ON d.document_id = (CASE WHEN sr.doc_id ~ '^[0-9a-fA-F-]{36}$' THEN sr.doc_id::uuid ELSE NULL END) "
+                    "LEFT JOIN tbl_legal_document ld ON ld.id = (CASE WHEN sr.doc_id ~ '^[0-9]+$' THEN sr.doc_id::integer ELSE NULL END)"
+                )
                 
             where_clause = " AND ".join(query_parts) if query_parts else "1=1"
-            
-            # Count query
-            count_sql = f"""
-                SELECT COUNT(*) as total
-                FROM lightrag_pipeline_stage_runs sr
-                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
-                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
-                WHERE {where_clause}
-            """
-            count_row = await db.query(count_sql, params)
-            total = count_row["total"] if count_row else 0
-            
-            # Data query
+
+            # 4. Count query (skip if no extra filters, reuse doc_type_counts directly)
+            has_extra_filters = bool(req.stage or req.status or req.search)
+            count_task = None
+            if has_extra_filters:
+                count_sql = f"""
+                    SELECT COUNT(*) as total
+                    FROM lightrag_pipeline_stage_runs sr
+                    {doc_search_join}
+                    WHERE {where_clause}
+                """
+                count_task = db.query(count_sql, params)
+
+            # 5. Data query with Late Materialization (filter and paginate top rows first, join document names only for those rows)
             limit = req.page_size
             offset = (req.page - 1) * req.page_size
             
@@ -4845,30 +5402,108 @@ def create_document_routes(
             offset_idx = len(data_params)
             
             data_sql = f"""
+                WITH paged_sr AS (
+                    SELECT 
+                        sr.run_id,
+                        sr.stage,
+                        sr.shard_index,
+                        sr.shard_count,
+                        sr.workspace_id,
+                        sr.doc_id,
+                        sr.status,
+                        sr.attempt,
+                        sr.error_json,
+                        sr.started_at,
+                        sr.completed_at,
+                        sr.updated_at,
+                        sr.event_json
+                    FROM lightrag_pipeline_stage_runs sr
+                    {doc_search_join}
+                    WHERE {where_clause}
+                    ORDER BY COALESCE(sr.started_at, sr.updated_at) DESC, sr.run_id DESC, sr.stage DESC, sr.shard_index DESC
+                    LIMIT ${limit_idx} OFFSET ${offset_idx}
+                )
                 SELECT 
-                    sr.run_id,
-                    sr.stage,
-                    sr.shard_index,
-                    sr.shard_count,
-                    sr.workspace_id,
-                    sr.doc_id,
-                    sr.status,
-                    sr.attempt,
-                    sr.error_json,
-                    sr.started_at,
-                    sr.completed_at,
-                    sr.updated_at,
-                    COALESCE(d.document_name, ld.title) as document_name
-                FROM lightrag_pipeline_stage_runs sr
-                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
-                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
-                WHERE {where_clause}
-                ORDER BY COALESCE(sr.started_at, sr.updated_at) DESC, sr.run_id DESC, sr.stage DESC, sr.shard_index DESC
-                LIMIT ${limit_idx} OFFSET ${offset_idx}
+                    psr.run_id,
+                    psr.stage,
+                    psr.shard_index,
+                    psr.shard_count,
+                    psr.workspace_id,
+                    psr.doc_id,
+                    psr.status,
+                    psr.attempt,
+                    psr.error_json,
+                    psr.started_at,
+                    psr.completed_at,
+                    psr.updated_at,
+                    COALESCE(d.document_name, ld.title) as document_name,
+                    CASE 
+                        WHEN (ld.id IS NOT NULL OR psr.event_json->>'doc_type' = 'legal' OR psr.event_json->'metadata'->>'doc_type' = 'legal') THEN 'legal'
+                        ELSE 'general'
+                    END as doc_type
+                FROM paged_sr psr
+                LEFT JOIN tbl_document d ON d.document_id = (CASE WHEN psr.doc_id ~ '^[0-9a-fA-F-]{{36}}$' THEN psr.doc_id::uuid ELSE NULL END)
+                LEFT JOIN tbl_legal_document ld ON ld.id = (CASE WHEN psr.doc_id ~ '^[0-9]+$' THEN psr.doc_id::integer ELSE NULL END)
+                ORDER BY COALESCE(psr.started_at, psr.updated_at) DESC, psr.run_id DESC, psr.stage DESC, psr.shard_index DESC
             """
             
-            data_rows = await db.query(data_sql, data_params, multirows=True)
-            
+            # 6. Execute all independent queries concurrently via asyncio.gather
+            data_task = db.query(data_sql, data_params, multirows=True)
+            task_dict: dict[str, Any] = {}
+            if dt_task is not None:
+                task_dict["dtc"] = dt_task
+            if matrix_task is not None:
+                task_dict["matrix"] = matrix_task
+            task_dict["data"] = data_task
+            if count_task is not None:
+                task_dict["count"] = count_task
+
+            keys = list(task_dict.keys())
+            import time
+            t_gather_start = time.monotonic()
+            logger.info(f"[STAGE_RUNS_PERF] Running tasks: {keys}")
+            results = await asyncio.gather(*task_dict.values())
+            logger.info(f"[STAGE_RUNS_PERF] Tasks {keys} finished in {time.monotonic() - t_gather_start:.2f}s")
+            res_map = dict(zip(keys, results))
+
+            data_rows = res_map["data"]
+
+            if "dtc" in res_map:
+                dt_row = res_map["dtc"]
+                doc_type_counts = {
+                    "all": int(dt_row["all_cnt"]) if dt_row and dt_row.get("all_cnt") is not None else 0,
+                    "legal": int(dt_row["legal_cnt"]) if dt_row and dt_row.get("legal_cnt") is not None else 0,
+                    "general": int(dt_row["general_cnt"]) if dt_row and dt_row.get("general_cnt") is not None else 0,
+                }
+                _set_stage_metrics_cache(f"dtc:{resolved_workspace_id}", doc_type_counts)
+            else:
+                doc_type_counts = cached_dtc
+
+            if "matrix" in res_map:
+                matrix_rows = res_map["matrix"]
+                status_matrix = {}
+                for row in matrix_rows:
+                    stage = row["stage"]
+                    status = row["status"]
+                    count = row["cnt"]
+                    if stage not in status_matrix:
+                        status_matrix[stage] = {}
+                    status_matrix[stage][status] = count
+                _set_stage_metrics_cache(f"mat:{resolved_workspace_id}:{req.doc_type}", status_matrix)
+            else:
+                status_matrix = cached_mat
+
+            if count_task is not None:
+                count_row = res_map.get("count")
+                total = count_row["total"] if count_row else 0
+            else:
+                if req.doc_type == "legal":
+                    total = doc_type_counts["legal"]
+                elif req.doc_type == "general":
+                    total = doc_type_counts["general"]
+                else:
+                    total = doc_type_counts["all"]
+
             runs = []
             for row in data_rows:
                 err_json = row["error_json"]
@@ -4888,6 +5523,7 @@ def create_document_routes(
                         workspace_id=row["workspace_id"],
                         doc_id=row["doc_id"],
                         document_name=row["document_name"],
+                        doc_type=row.get("doc_type", "general"),
                         status=row["status"],
                         attempt=row["attempt"],
                         error_json=err_json,
@@ -4903,6 +5539,7 @@ def create_document_routes(
                 page=req.page,
                 page_size=req.page_size,
                 status_matrix=status_matrix,
+                doc_type_counts=doc_type_counts,
             )
             
         except Exception as e:
@@ -4923,57 +5560,57 @@ def create_document_routes(
         Get paginated pipeline stage runs across all workspaces with status matrix and document names.
         """
         try:
-            from lightrag.kg.postgres_impl import ClientManager, to_uuid
+            from lightrag.kg.postgres_impl import ClientManager
             
             db = await ClientManager.get_client()
             
-            # 1. Fetch status matrix (counts grouped by stage and status) across all workspaces
-            matrix_sql = """
-                SELECT stage, status, COUNT(DISTINCT run_id) as cnt
-                FROM lightrag_pipeline_stage_runs
-                GROUP BY stage, status
-            """
-            matrix_rows = await db.query(matrix_sql, [], multirows=True)
-            
-            status_matrix = {}
-            for row in matrix_rows:
-                stage = row["stage"]
-                status = row["status"]
-                count = row["cnt"]
-                if stage not in status_matrix:
-                    status_matrix[stage] = {}
-                status_matrix[stage][status] = count
-                
-            # 2. Build paginated query with filters
+            # 1. Fetch doc_type counts across all workspaces with in-memory caching
+            cached_dtc = _get_stage_metrics_cache("dtc:all")
+            dt_task = None
+            if cached_dtc is None:
+                doc_type_counts_sql = """
+                    SELECT 
+                        COUNT(*) as all_cnt,
+                        COUNT(*) FILTER (WHERE sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal' OR sr.doc_id ~ '^[0-9]+$') as legal_cnt,
+                        COUNT(*) FILTER (WHERE (sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal') AND sr.doc_id !~ '^[0-9]+$') as general_cnt
+                    FROM lightrag_pipeline_stage_runs sr
+                """
+                dt_task = db.query(doc_type_counts_sql, [])
+
+            # 2. Fetch status matrix across all workspaces with in-memory caching
+            cached_mat = _get_stage_metrics_cache(f"mat:all:{req.doc_type}")
+            matrix_task = None
+            if cached_mat is None:
+                if req.doc_type == "legal":
+                    matrix_sql = """
+                        SELECT sr.stage, sr.status, COUNT(DISTINCT sr.run_id) as cnt
+                        FROM lightrag_pipeline_stage_runs sr
+                        WHERE (sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal' OR sr.doc_id ~ '^[0-9]+$')
+                        GROUP BY sr.stage, sr.status
+                    """
+                elif req.doc_type == "general":
+                    matrix_sql = """
+                        SELECT sr.stage, sr.status, COUNT(DISTINCT sr.run_id) as cnt
+                        FROM lightrag_pipeline_stage_runs sr
+                        WHERE (sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal') AND sr.doc_id !~ '^[0-9]+$'
+                        GROUP BY sr.stage, sr.status
+                    """
+                else:
+                    matrix_sql = """
+                        SELECT stage, status, COUNT(DISTINCT run_id) as cnt
+                        FROM lightrag_pipeline_stage_runs
+                        GROUP BY stage, status
+                    """
+                matrix_task = db.query(matrix_sql, [], multirows=True)
+
+            # 3. Build paginated query with filters
             query_parts = []
             params = []
-            
-            # Get distinct workspaces to build workspace map
-            workspace_rows = await db.query(
-                """
-                SELECT DISTINCT workspace_id
-                FROM lightrag_pipeline_stage_runs
-                """,
-                [],
-                multirows=True,
-            )
-            workspace_ids = [
-                str(row["workspace_id"]).strip()
-                for row in workspace_rows or []
-                if str(row["workspace_id"] or "").strip()
-            ]
-            workspace_uuids = [to_uuid(workspace_id) for workspace_id in workspace_ids]
-            params.extend([workspace_ids, workspace_uuids])
-            workspace_map_cte = """
-                WITH workspace_map(stage_workspace_id, workspace_uuid) AS (
-                    SELECT * FROM UNNEST($1::text[], $2::uuid[])
-                )
-            """
-            workspace_join_sql = """
-                LEFT JOIN workspace_map wm ON wm.stage_workspace_id = sr.workspace_id
-            """
-            workspace_join_ref = "wm.workspace_uuid"
-            
+            if req.doc_type == "legal":
+                query_parts.append("(sr.event_json->>'doc_type' = 'legal' OR sr.event_json->'metadata'->>'doc_type' = 'legal' OR sr.doc_id ~ '^[0-9]+$')")
+            elif req.doc_type == "general":
+                query_parts.append("((sr.event_json->>'doc_type' IS NULL OR sr.event_json->>'doc_type' != 'legal') AND (sr.event_json->'metadata'->>'doc_type' IS NULL OR sr.event_json->'metadata'->>'doc_type' != 'legal') AND sr.doc_id !~ '^[0-9]+$')")
+
             if req.stage:
                 params.append(req.stage)
                 query_parts.append(f"sr.stage = ${len(params)}")
@@ -4982,28 +5619,32 @@ def create_document_routes(
                 params.append(req.status)
                 query_parts.append(f"sr.status = ANY(${len(params)})")
                 
+            doc_search_join = ""
             if req.search:
                 params.append(f"%{req.search}%")
                 query_parts.append(
                     f"(COALESCE(d.document_name, ld.title) ILIKE ${len(params)} OR sr.doc_id ILIKE ${len(params)})"
                 )
+                doc_search_join = (
+                    "LEFT JOIN tbl_document d ON d.document_id = (CASE WHEN sr.doc_id ~ '^[0-9a-fA-F-]{36}$' THEN sr.doc_id::uuid ELSE NULL END) "
+                    "LEFT JOIN tbl_legal_document ld ON ld.id = (CASE WHEN sr.doc_id ~ '^[0-9]+$' THEN sr.doc_id::integer ELSE NULL END)"
+                )
                 
             where_clause = " AND ".join(query_parts) if query_parts else "1=1"
-            
-            # Count query
-            count_sql = f"""
-                {workspace_map_cte}
-                SELECT COUNT(*) as total
-                FROM lightrag_pipeline_stage_runs sr
-                {workspace_join_sql}
-                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
-                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
-                WHERE {where_clause}
-            """
-            count_row = await db.query(count_sql, params)
-            total = count_row["total"] if count_row else 0
-            
-            # Data query
+
+            # 4. Count query (skip if no extra filters, reuse doc_type_counts directly)
+            has_extra_filters = bool(req.stage or req.status or req.search)
+            count_task = None
+            if has_extra_filters:
+                count_sql = f"""
+                    SELECT COUNT(*) as total
+                    FROM lightrag_pipeline_stage_runs sr
+                    {doc_search_join}
+                    WHERE {where_clause}
+                """
+                count_task = db.query(count_sql, params)
+
+            # 5. Data query with Late Materialization (filter and paginate top rows first, join document names only for those rows)
             limit = req.page_size
             offset = (req.page - 1) * req.page_size
             
@@ -5014,32 +5655,110 @@ def create_document_routes(
             offset_idx = len(data_params)
             
             data_sql = f"""
-                {workspace_map_cte}
+                WITH paged_sr AS (
+                    SELECT 
+                        sr.run_id,
+                        sr.stage,
+                        sr.shard_index,
+                        sr.shard_count,
+                        sr.workspace_id,
+                        sr.doc_id,
+                        sr.status,
+                        sr.attempt,
+                        sr.error_json,
+                        sr.started_at,
+                        sr.completed_at,
+                        sr.updated_at,
+                        sr.event_json
+                    FROM lightrag_pipeline_stage_runs sr
+                    {doc_search_join}
+                    WHERE {where_clause}
+                    ORDER BY COALESCE(sr.started_at, sr.updated_at) DESC, sr.run_id DESC, sr.stage DESC, sr.shard_index DESC
+                    LIMIT ${limit_idx} OFFSET ${offset_idx}
+                )
                 SELECT 
-                    sr.run_id,
-                    sr.stage,
-                    sr.shard_index,
-                    sr.shard_count,
-                    sr.workspace_id,
-                    sr.doc_id,
-                    sr.status,
-                    sr.attempt,
-                    sr.error_json,
-                    sr.started_at,
-                    sr.completed_at,
-                    sr.updated_at,
-                    COALESCE(d.document_name, ld.title) as document_name
-                FROM lightrag_pipeline_stage_runs sr
-                {workspace_join_sql}
-                LEFT JOIN tbl_document d ON sr.doc_id = d.document_id::text AND d.workspace_id = {workspace_join_ref}
-                LEFT JOIN tbl_legal_document ld ON sr.doc_id = ld.id::text AND ld.workspace_id = {workspace_join_ref}
-                WHERE {where_clause}
-                ORDER BY COALESCE(sr.started_at, sr.updated_at) DESC, sr.run_id DESC, sr.stage DESC, sr.shard_index DESC
-                LIMIT ${limit_idx} OFFSET ${offset_idx}
+                    psr.run_id,
+                    psr.stage,
+                    psr.shard_index,
+                    psr.shard_count,
+                    psr.workspace_id,
+                    psr.doc_id,
+                    psr.status,
+                    psr.attempt,
+                    psr.error_json,
+                    psr.started_at,
+                    psr.completed_at,
+                    psr.updated_at,
+                    COALESCE(d.document_name, ld.title) as document_name,
+                    CASE 
+                        WHEN (ld.id IS NOT NULL OR psr.event_json->>'doc_type' = 'legal' OR psr.event_json->'metadata'->>'doc_type' = 'legal') THEN 'legal'
+                        ELSE 'general'
+                    END as doc_type
+                FROM paged_sr psr
+                LEFT JOIN tbl_document d ON d.document_id = (CASE WHEN psr.doc_id ~ '^[0-9a-fA-F-]{{36}}$' THEN psr.doc_id::uuid ELSE NULL END)
+                LEFT JOIN tbl_legal_document ld ON ld.id = (CASE WHEN psr.doc_id ~ '^[0-9]+$' THEN psr.doc_id::integer ELSE NULL END)
+                ORDER BY COALESCE(psr.started_at, psr.updated_at) DESC, psr.run_id DESC, psr.stage DESC, psr.shard_index DESC
             """
             
-            data_rows = await db.query(data_sql, data_params, multirows=True)
-            
+            # 6. Execute all independent queries concurrently via asyncio.gather
+            data_task = db.query(data_sql, data_params, multirows=True)
+            task_dict: dict[str, Any] = {}
+            if dt_task is not None:
+                task_dict["dtc"] = dt_task
+            if matrix_task is not None:
+                task_dict["matrix"] = matrix_task
+            task_dict["data"] = data_task
+            if count_task is not None:
+                task_dict["count"] = count_task
+
+            keys = list(task_dict.keys())
+            import time
+            t_gather_start = time.monotonic()
+            logger.info(f"[STAGE_RUNS_PERF] Running tasks: {keys}")
+            results = await asyncio.gather(*task_dict.values())
+            logger.info(f"[STAGE_RUNS_PERF] Tasks {keys} finished in {time.monotonic() - t_gather_start:.2f}s")
+            res_map = dict(zip(keys, results))
+
+            data_rows = res_map["data"]
+
+            if "dtc" in res_map:
+                dt_row = res_map["dtc"]
+                doc_type_counts = {
+                    "all": int(dt_row["all_cnt"]) if dt_row and dt_row.get("all_cnt") is not None else 0,
+                    "legal": int(dt_row["legal_cnt"]) if dt_row and dt_row.get("legal_cnt") is not None else 0,
+                    "general": int(dt_row["general_cnt"]) if dt_row and dt_row.get("general_cnt") is not None else 0,
+                }
+                _set_stage_metrics_cache("dtc:all", doc_type_counts)
+            else:
+                doc_type_counts = cached_dtc
+
+            if "matrix" in res_map:
+                matrix_rows = res_map["matrix"]
+                status_matrix = {}
+                for row in matrix_rows:
+                    stage = row["stage"]
+                    status = row["status"]
+                    count = row["cnt"]
+                    if stage not in status_matrix:
+                        status_matrix[stage] = {}
+                    status_matrix[stage][status] = count
+                _set_stage_metrics_cache(f"mat:all:{req.doc_type}", status_matrix)
+            else:
+                status_matrix = cached_mat
+
+            if count_task is not None:
+                count_row = res_map.get("count")
+                total = count_row["total"] if count_row else 0
+            else:
+                if req.doc_type == "legal":
+                    total = doc_type_counts["legal"]
+                elif req.doc_type == "general":
+                    total = doc_type_counts["general"]
+                else:
+                    total = doc_type_counts["all"]
+
+
+
             runs = []
             for row in data_rows:
                 err_json = row["error_json"]
@@ -5059,6 +5778,7 @@ def create_document_routes(
                         workspace_id=row["workspace_id"],
                         doc_id=row["doc_id"],
                         document_name=row["document_name"],
+                        doc_type=row.get("doc_type", "general"),
                         status=row["status"],
                         attempt=row["attempt"],
                         error_json=err_json,
@@ -5074,6 +5794,7 @@ def create_document_routes(
                 page=req.page,
                 page_size=req.page_size,
                 status_matrix=status_matrix,
+                doc_type_counts=doc_type_counts,
             )
             
         except Exception as e:
@@ -5171,6 +5892,7 @@ def create_document_routes(
         response_model=ApproveStageResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def approve_stage(
         request: Request,
         req: ApproveStageRequest,
@@ -5186,6 +5908,7 @@ def create_document_routes(
             resolved_workspace_id, _, _ = await resolve_request_context(
                 request, req.workspace_id
             )
+            await ensure_workspace_generation_writable(resolved_workspace_id)
 
             db = await ClientManager.get_client()
 
@@ -5234,10 +5957,292 @@ def create_document_routes(
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post(
+        "/replay_stage",
+        response_model=ReplayStageResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    @with_workspace_write_lease
+    async def replay_stage(
+        request: Request,
+        req: ReplayStageRequest,
+    ):
+        """Queue an audited retry for a failed pipeline stage shard."""
+        from lightrag.pipeline.coordinator import (
+            StageNotReplayableError,
+            StageRetryBudgetExhausted,
+            StageRunNotFoundError,
+            create_coordinator_from_env,
+        )
+        from lightrag.pipeline.models import StageName
+
+        try:
+            stage = StageName(req.stage)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown pipeline stage: {req.stage}",
+            ) from exc
+
+        resolved_workspace_id, _, _ = await resolve_request_context(
+            request, req.workspace_id
+        )
+        await ensure_workspace_generation_writable(resolved_workspace_id)
+        authorization = request.headers.get("authorization", "")
+        actor = "api_key" if request.headers.get("X-API-Key") else "anonymous"
+        if authorization.lower().startswith("bearer "):
+            from lightrag.api.auth import auth_handler
+
+            token_info = auth_handler.validate_token(authorization[7:].strip())
+            actor = str(token_info.get("username") or "authenticated_user")
+
+        coordinator = create_coordinator_from_env()
+        try:
+            replay = await coordinator.replay_failed_stage(
+                run_id=req.run_id,
+                stage=stage,
+                shard_index=req.shard_index,
+                workspace_id=resolved_workspace_id,
+                reason=req.reason,
+                requested_by=actor,
+            )
+        except StageRunNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (StageNotReplayableError, StageRetryBudgetExhausted) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "Failed to queue pipeline stage replay run_id=%s stage=%s shard=%s workspace_id=%s actor=%s",
+                req.run_id,
+                stage.value,
+                req.shard_index,
+                resolved_workspace_id,
+                actor,
+            )
+            raise HTTPException(status_code=500, detail="Failed to queue stage replay") from exc
+        finally:
+            try:
+                await coordinator.finalize()
+            except Exception:
+                logger.exception("Failed to release pipeline coordinator after stage replay")
+
+        logger.warning(
+            "[PipelineAudit] Stage replay queued actor=%s reason=%r event_id=%s "
+            "run_id=%s stage=%s shard=%s workspace_id=%s",
+            actor,
+            req.reason,
+            replay.event.event_id,
+            req.run_id,
+            stage.value,
+            req.shard_index,
+            resolved_workspace_id,
+        )
+        return ReplayStageResponse(
+            status=replay.status,
+            message="Failed stage replay queued for delivery.",
+            event_id=replay.event.event_id,
+            attempt=replay.event.attempt,
+        )
+
+    @router.post(
+        "/generations/start",
+        response_model=GenerationStatusResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def start_generation_rebuild(
+        request: Request,
+        req: GenerationStartRequest,
+    ):
+        """Start or resume a shadow workspace generation rebuild."""
+        from lightrag.pipeline.coordinator import (
+            WorkspaceGenerationConflictError,
+            WorkspaceGenerationTransitionError,
+            create_coordinator_from_env,
+        )
+        from lightrag.pipeline.generation_orchestrator import (
+            start_workspace_generation_rebuild,
+        )
+
+        resolved_workspace_id, _, _ = await resolve_request_context(
+            request, req.workspace_id
+        )
+        coordinator = create_coordinator_from_env()
+        try:
+            gen, manifest = await start_workspace_generation_rebuild(
+                coordinator,
+                resolved_workspace_id,
+                generation_id=req.generation_id,
+            )
+            logger.warning(
+                "[PipelineAudit] Generation rebuild started workspace_id=%s generation_id=%s reason=%r",
+                resolved_workspace_id,
+                gen.generation_id,
+                req.reason,
+            )
+            return GenerationStatusResponse(
+                workspace_id=gen.workspace_id,
+                generation_id=gen.generation_id,
+                storage_workspace_id=gen.storage_workspace_id,
+                status=gen.status.value,
+                snapshot_complete=manifest.snapshot_complete,
+                expected_documents=manifest.expected_documents,
+                pending_documents=manifest.pending_documents,
+                running_documents=manifest.running_documents,
+                completed_documents=manifest.completed_documents,
+                failed_documents=manifest.failed_documents,
+            )
+        except (WorkspaceGenerationConflictError, WorkspaceGenerationTransitionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            await coordinator.finalize()
+
+    @router.get(
+        "/generations/{generation_id}",
+        response_model=GenerationStatusResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_generation_status(
+        request: Request,
+        generation_id: str,
+        workspace_id: Optional[str] = None,
+    ):
+        """Inspect status and manifest progress of a workspace generation."""
+        from lightrag.pipeline.coordinator import (
+            WorkspaceGenerationNotFoundError,
+            create_coordinator_from_env,
+        )
+
+        resolved_workspace_id, _, _ = await resolve_request_context(
+            request, workspace_id
+        )
+        coordinator = create_coordinator_from_env()
+        try:
+            gen = await coordinator.get_workspace_generation(
+                resolved_workspace_id, generation_id
+            )
+            if gen is None:
+                raise HTTPException(status_code=404, detail="Generation not found")
+            manifest = await coordinator.get_workspace_generation_manifest_status(
+                resolved_workspace_id, generation_id
+            )
+            return GenerationStatusResponse(
+                workspace_id=gen.workspace_id,
+                generation_id=gen.generation_id,
+                storage_workspace_id=gen.storage_workspace_id,
+                status=gen.status.value,
+                snapshot_complete=manifest.snapshot_complete,
+                expected_documents=manifest.expected_documents,
+                pending_documents=manifest.pending_documents,
+                running_documents=manifest.running_documents,
+                completed_documents=manifest.completed_documents,
+                failed_documents=manifest.failed_documents,
+            )
+        except WorkspaceGenerationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finally:
+            await coordinator.finalize()
+
+    @router.post(
+        "/generations/{generation_id}/cutover",
+        response_model=GenerationStatusResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def cutover_generation(
+        request: Request,
+        generation_id: str,
+        req: GenerationActionRequest,
+    ):
+        """Atomically promote a completed shadow generation to active."""
+        from lightrag.pipeline.coordinator import (
+            WorkspaceGenerationConflictError,
+            WorkspaceGenerationNotFoundError,
+            WorkspaceGenerationTransitionError,
+            create_coordinator_from_env,
+        )
+        from lightrag.pipeline.generation_orchestrator import (
+            cutover_workspace_generation,
+        )
+
+        resolved_workspace_id, _, _ = await resolve_request_context(
+            request, req.workspace_id
+        )
+        coordinator = create_coordinator_from_env()
+        try:
+            gen = await cutover_workspace_generation(
+                coordinator, resolved_workspace_id, generation_id
+            )
+            logger.warning(
+                "[PipelineAudit] Generation cutover completed workspace_id=%s generation_id=%s reason=%r",
+                resolved_workspace_id,
+                generation_id,
+                req.reason,
+            )
+            return GenerationStatusResponse(
+                workspace_id=gen.workspace_id,
+                generation_id=gen.generation_id,
+                storage_workspace_id=gen.storage_workspace_id,
+                status=gen.status.value,
+            )
+        except WorkspaceGenerationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (WorkspaceGenerationConflictError, WorkspaceGenerationTransitionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            await coordinator.finalize()
+
+    @router.post(
+        "/generations/{generation_id}/rollback",
+        response_model=GenerationStatusResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def rollback_generation(
+        request: Request,
+        generation_id: str,
+        req: GenerationActionRequest,
+    ):
+        """Rollback active pointer to a retained generation within the 7-day window."""
+        from lightrag.pipeline.coordinator import (
+            WorkspaceGenerationConflictError,
+            WorkspaceGenerationNotFoundError,
+            WorkspaceGenerationTransitionError,
+            create_coordinator_from_env,
+        )
+        from lightrag.pipeline.generation_orchestrator import (
+            rollback_workspace_generation,
+        )
+
+        resolved_workspace_id, _, _ = await resolve_request_context(
+            request, req.workspace_id
+        )
+        coordinator = create_coordinator_from_env()
+        try:
+            gen = await rollback_workspace_generation(
+                coordinator, resolved_workspace_id, generation_id
+            )
+            logger.warning(
+                "[PipelineAudit] Generation rollback completed workspace_id=%s generation_id=%s reason=%r",
+                resolved_workspace_id,
+                generation_id,
+                req.reason,
+            )
+            return GenerationStatusResponse(
+                workspace_id=gen.workspace_id,
+                generation_id=gen.generation_id,
+                storage_workspace_id=gen.storage_workspace_id,
+                status=gen.status.value,
+            )
+        except WorkspaceGenerationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (WorkspaceGenerationConflictError, WorkspaceGenerationTransitionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            await coordinator.finalize()
+
+    @router.post(
         "/bulk_approve_stage",
         response_model=ApproveStageResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @with_workspace_write_lease
     async def bulk_approve_stage(
         request: Request,
         req: BulkApproveStageRequest,
@@ -5298,6 +6303,14 @@ def create_document_routes(
                         f"{workspace_desc}"
                     ),
                 )
+
+            target_workspaces = sorted(
+                {str(row["workspace_id"]) for row in rows}
+            )
+            await acquire_workspace_write_leases(target_workspaces)
+
+            for workspace_id in target_workspaces:
+                await ensure_workspace_generation_writable(workspace_id)
 
             events = []
             parse_failed_count = 0
@@ -5499,7 +6512,7 @@ def create_document_routes(
                 compose_file = os.path.join(os.path.dirname(env_path), "docker-compose.dev.yml")
                 if os.path.exists(compose_file):
                     try:
-                        result = subprocess.Popen(
+                        subprocess.Popen(
                             [
                                 "docker", "compose", "-f", compose_file,
                                 "--profile", "workers", "up", "-d", "--force-recreate",
@@ -5626,6 +6639,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         summary="Update legal metadata for a document",
     )
+    @with_workspace_write_lease
     async def update_legal_metadata(
         doc_id: str,
         legal_metadata: Dict[str, Optional[str]],
@@ -5691,6 +6705,7 @@ def create_document_routes(
             resolved_workspace_id, current_rag, _ = await resolve_request_context(
                 request, workspace_id
             )
+            await ensure_workspace_generation_writable(current_rag.workspace)
             
             # Get document by ID
             doc_data = await current_rag.doc_status.get_by_id(doc_id)

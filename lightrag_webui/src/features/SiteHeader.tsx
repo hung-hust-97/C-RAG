@@ -54,6 +54,9 @@ function TabsNavigation() {
         <NavigationTab value="monitor" currentTab={currentTab}>
           {t('header.monitor')}
         </NavigationTab>
+        <NavigationTab value="import-monitor" currentTab={currentTab}>
+          {t('header.importMonitor')}
+        </NavigationTab>
       </TabsList>
     </div>
   )

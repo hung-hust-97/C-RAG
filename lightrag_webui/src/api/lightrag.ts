@@ -219,6 +219,7 @@ export type DocumentsRequest = {
   sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'
   sort_direction: 'asc' | 'desc'
   workspace_id?: string
+  doc_type?: 'all' | 'legal' | 'general'
 }
 
 export type PaginationInfo = {
@@ -1282,5 +1283,41 @@ export const getPipelineConfig = async (): Promise<PipelineConfig> => {
 
 export const updatePipelineConfig = async (config: PipelineConfigUpdate): Promise<any> => {
   const response = await axiosInstance.post('/documents/pipeline_config', config)
+  return response.data
+}
+
+export interface SystemResourcesResponse {
+  cpu: {
+    percent: number
+    cores: number
+    load_avg: number[]
+  }
+  memory: {
+    total_gb: number
+    used_gb: number
+    free_gb: number
+    percent: number
+  }
+  disk: {
+    total_gb: number
+    used_gb: number
+    free_gb: number
+    percent: number
+  }
+  postgresql_pool: {
+    status?: string
+    size?: number
+    idle_size?: number
+    max_size?: number
+    utilization_percent?: number
+    [key: string]: any
+  }
+  system_status: 'HEALTHY' | 'WARNING' | 'CRITICAL'
+  message: string
+  timestamp: number
+}
+
+export const getSystemResources = async (): Promise<SystemResourcesResponse> => {
+  const response = await axiosInstance.get('/system/resources')
   return response.data
 }

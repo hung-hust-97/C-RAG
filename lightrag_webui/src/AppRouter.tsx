@@ -69,6 +69,10 @@ const AppContent = () => {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route
+        path="/import-monitor"
+        element={isAuthenticated ? <App initialTab="import-monitor" /> : null}
+      />
+      <Route
         path="/*"
         element={isAuthenticated ? <App /> : null}
       />

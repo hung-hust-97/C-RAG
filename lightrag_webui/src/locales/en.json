@@ -12,6 +12,7 @@
     "retrieval": "Retrieval",
     "api": "API",
     "monitor": "Monitor",
+    "importMonitor": "Import & System",
     "projectRepository": "Project Repository",
     "logout": "Logout",
     "frontendNeedsRebuild": "Frontend needs rebuild",

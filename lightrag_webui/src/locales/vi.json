@@ -12,6 +12,7 @@
     "retrieval": "Truy xuất",
     "api": "API",
     "monitor": "Giám sát",
+    "importMonitor": "Import & Tài nguyên",
     "projectRepository": "Kho dự án",
     "logout": "Đăng xuất",
     "frontendNeedsRebuild": "Giao diện cần được xây dựng lại",

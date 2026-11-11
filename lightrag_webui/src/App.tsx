@@ -16,10 +16,15 @@ import DocumentManager from '@/features/DocumentManager'
 import RetrievalTesting from '@/features/RetrievalTesting'
 import ApiSite from '@/features/ApiSite'
 import Monitor from '@/features/Monitor'
+import ImportMonitor from '@/features/ImportMonitor'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
 
-function App() {
+interface AppProps {
+  initialTab?: string
+}
+
+function App({ initialTab }: AppProps) {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
   const currentTab = useSettingsStore.use.currentTab()
@@ -27,6 +32,32 @@ function App() {
   const [initializing, setInitializing] = useState(true) // Add initializing state
   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
   const healthCheckInitializedRef = useRef(false); // Prevent duplicate health checks in Vite dev mode
+
+  useEffect(() => {
+    if (initialTab) {
+      useSettingsStore.getState().setCurrentTab(initialTab as any)
+      return
+    }
+    const syncTabFromHash = () => {
+      const hash = window.location.hash.toLowerCase().replace(/^[#/]+/, '')
+      if (hash.includes('import-monitor') || hash.includes('pipeline')) {
+        useSettingsStore.getState().setCurrentTab('import-monitor')
+      } else if (hash.includes('knowledge-graph') || hash.includes('graph')) {
+        useSettingsStore.getState().setCurrentTab('knowledge-graph')
+      } else if (hash.includes('retrieval')) {
+        useSettingsStore.getState().setCurrentTab('retrieval')
+      } else if (hash.includes('api')) {
+        useSettingsStore.getState().setCurrentTab('api')
+      } else if (hash.includes('monitor')) {
+        useSettingsStore.getState().setCurrentTab('monitor')
+      } else if (hash.includes('documents')) {
+        useSettingsStore.getState().setCurrentTab('documents')
+      }
+    }
+    syncTabFromHash()
+    window.addEventListener('hashchange', syncTabFromHash)
+    return () => window.removeEventListener('hashchange', syncTabFromHash)
+  }, [initialTab])
 
   const handleApiKeyAlertOpenChange = useCallback((open: boolean) => {
     setApiKeyAlertOpen(open)
@@ -150,10 +181,10 @@ function App() {
     checkVersion();
   }, []); // Empty dependency array ensures it only runs once on mount
 
-  const handleTabChange = useCallback(
-    (tab: string) => useSettingsStore.getState().setCurrentTab(tab as any),
-    []
-  )
+  const handleTabChange = useCallback((tab: string) => {
+    useSettingsStore.getState().setCurrentTab(tab as any)
+    window.location.hash = `#/${tab}`
+  }, [])
 
   useEffect(() => {
     if (message) {
@@ -199,7 +230,7 @@ function App() {
           // Main content after initialization
           <main className="flex h-screen w-screen overflow-hidden">
             <Tabs
-              defaultValue={currentTab}
+              value={currentTab}
               className="!m-0 flex grow flex-col !p-0 overflow-hidden"
               onValueChange={handleTabChange}
             >
@@ -219,6 +250,9 @@ function App() {
                 </TabsContent>
                 <TabsContent value="monitor" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <Monitor />
+                </TabsContent>
+                <TabsContent value="import-monitor" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
+                  <ImportMonitor />
                 </TabsContent>
               </div>
             </Tabs>

@@ -5059,7 +5059,23 @@ _LEGAL_STATUS_CONTEXT_KEYS = (
     "legal_status",
     "legal_status_code",
     "legal_status_priority",
+    "clause_status",
+    "is_expired",
+    "expiry_warning",
 )
+
+
+def _is_clause_expired_item(item: dict[str, Any]) -> bool:
+    for rec in _legal_status_records_from_item(item):
+        if rec.get("is_expired") is True:
+            return True
+        if str(rec.get("clause_status", "")).upper() == "EXPIRED":
+            return True
+        ctx = rec.get("context")
+        if isinstance(ctx, dict):
+            if ctx.get("is_expired") is True or str(ctx.get("clause_status", "")).upper() == "EXPIRED":
+                return True
+    return False
 
 
 def _as_metadata_dict(value: Any) -> dict[str, Any]:
@@ -5112,6 +5128,8 @@ def _legal_status_metadata_from_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _legal_status_priority_from_item(item: dict[str, Any]) -> int:
+    if _is_clause_expired_item(item):
+        return 5  # Demote priority for explicitly expired clauses
     status_metadata = _legal_status_metadata_from_item(item)
     if not status_metadata:
         return 0
@@ -5965,6 +5983,11 @@ def _track_chunk_citation(
         # Extract common fields
         file_path = chunk.get("file_path", metadata.get("file_path", ""))
         relevance_score = chunk.get("score", metadata.get("relevance_score", 0.0))
+        if _is_clause_expired_item(chunk):
+            try:
+                relevance_score = float(relevance_score) * 0.70
+            except (TypeError, ValueError):
+                pass
 
         # Extract hierarchy context based on document type
         hierarchy_path = []
@@ -6013,6 +6036,10 @@ def _track_chunk_citation(
                 "document_number": metadata.get("document_number", ""),
                 "issuing_authority": metadata.get("issuing_authority", ""),
                 "effective_date": metadata.get("effective_date", ""),
+                "clause_status": chunk.get("clause_status") or metadata.get("clause_status") or context.get("clause_status", ""),
+                "is_expired": chunk.get("is_expired") if chunk.get("is_expired") is not None else metadata.get("is_expired", context.get("is_expired", False)),
+                "expiry_warning": chunk.get("expiry_warning") or metadata.get("expiry_warning") or context.get("expiry_warning", ""),
+                "lien_quan_dan_chieu": chunk.get("lien_quan_dan_chieu") or metadata.get("lien_quan_dan_chieu") or context.get("lien_quan_dan_chieu", ""),
                 **status_metadata,
             }
         else:

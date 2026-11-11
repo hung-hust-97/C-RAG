@@ -108,6 +108,9 @@ def _build_base_kms_event(
     if error_info:
         kms_event.status = DocStatus.FAILED
         kms_event.message = error_info.get("message") or "Pipeline failed"
+    elif str(getattr(event, "status", "")).upper() == "DUPLICATED":
+        kms_event.status = DocStatus.DUPLICATED
+        kms_event.message = "Tài liệu trùng lặp về nội dung"
     else:
         kms_event.status = DocStatus.PROCESSED
         kms_event.message = ""
@@ -142,6 +145,10 @@ def _prepare_legal_kms_event(
     )
 
     parsed_legal_id = _safe_int(legal_document_id)
+    if parsed_legal_id is None and event.doc_id:
+        clean_doc_id = event.doc_id.removeprefix("legal-")
+        parsed_legal_id = _safe_int(clean_doc_id)
+
     if parsed_legal_id is not None:
         kms_event.legal_document_id = parsed_legal_id
 
@@ -229,7 +236,9 @@ async def _publish_kms_event(
         exclude_none=True,
     ).encode("utf-8")
 
-    await context.producer.send_and_wait(topic, payload)
+    doc_id = _get_doc_id_for_log(kms_event, event)
+    key = str(doc_id).encode("utf-8") if doc_id else None
+    await context.producer.send_and_wait(topic, payload, key=key)
 
     _log_kms_publish_result(
         event=event,

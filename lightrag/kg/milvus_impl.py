@@ -787,29 +787,58 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         raise RuntimeError(f"[{self.workspace}] {operation} failed unexpectedly")
 
     def _create_schema_for_namespace(self) -> CollectionSchema:
-        """Create schema based on the current instance's namespace"""
+        """Create schema based on the current instance's final_namespace (shared partitioned collections)."""
 
-        # Get vector dimension from embedding_func
         dimension = self.embedding_func.embedding_dim
+        coll_name = getattr(self, "final_namespace", "") or self.namespace
 
-        # Base fields (common to all collections)
         base_fields = [
             FieldSchema(
-                name="id", dtype=DataType.VARCHAR, max_length=64, is_primary=True
+                name="id", dtype=DataType.VARCHAR, max_length=512, is_primary=True
             ),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
-            FieldSchema(name="created_at", dtype=DataType.INT64),
             FieldSchema(
                 name="workspace_id",
                 dtype=DataType.VARCHAR,
-                max_length=256,
-                nullable=True,
+                max_length=64,
+                is_partition_key=True,
             ),
         ]
 
-        # Determine specific fields based on namespace
-        if self.namespace.endswith("entities"):
+        if coll_name == "legal_chunks":
             specific_fields = [
+                FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=512),
+                FieldSchema(
+                    name="status",
+                    dtype=DataType.VARCHAR,
+                    max_length=64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="effective_from",
+                    dtype=DataType.INT64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="effective_to",
+                    dtype=DataType.INT64,
+                    nullable=True,
+                ),
+            ]
+            description = "Clean deduplicated legal chunks collection"
+        elif coll_name == "general_chunks" or self.namespace.endswith("chunks"):
+            specific_fields = [
+                FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=512),
+            ]
+            description = "Clean collection for general document text chunks"
+        elif coll_name == "legal_entities":
+            specific_fields = [
+                FieldSchema(
+                    name="entity_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=512,
+                    nullable=True,
+                ),
                 FieldSchema(
                     name="entity_name",
                     dtype=DataType.VARCHAR,
@@ -817,15 +846,78 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     nullable=True,
                 ),
                 FieldSchema(
-                    name="file_path",
+                    name="entity_type",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=128,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="content",
+                    dtype=DataType.VARCHAR,
+                    max_length=65535,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="legal_status",
+                    dtype=DataType.VARCHAR,
+                    max_length=64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="effective_date",
+                    dtype=DataType.VARCHAR,
+                    max_length=64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="expiry_date",
+                    dtype=DataType.VARCHAR,
+                    max_length=64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="issuing_authority",
+                    dtype=DataType.VARCHAR,
+                    max_length=255,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="document_number",
+                    dtype=DataType.VARCHAR,
+                    max_length=255,
                     nullable=True,
                 ),
             ]
-            description = "LightRAG entities vector storage"
-
-        elif self.namespace.endswith("relationships"):
+            description = "Shared collection for legal entity vectors with workspace partition key"
+        elif coll_name == "general_entities" or self.namespace.endswith("entities"):
+            specific_fields = [
+                FieldSchema(
+                    name="entity_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=512,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="entity_name",
+                    dtype=DataType.VARCHAR,
+                    max_length=512,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="entity_type",
+                    dtype=DataType.VARCHAR,
+                    max_length=128,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="content",
+                    dtype=DataType.VARCHAR,
+                    max_length=65535,
+                    nullable=True,
+                ),
+            ]
+            description = "Shared collection for general entity vectors with workspace partition key"
+        elif coll_name in ("legal_relationships", "general_relationships") or self.namespace.endswith("relationships"):
             specific_fields = [
                 FieldSchema(
                     name="src_id", dtype=DataType.VARCHAR, max_length=512, nullable=True
@@ -834,33 +926,27 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     name="tgt_id", dtype=DataType.VARCHAR, max_length=512, nullable=True
                 ),
                 FieldSchema(
-                    name="file_path",
+                    name="keywords",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
-                    nullable=True,
-                ),
-            ]
-            description = "LightRAG relationships vector storage"
-
-        elif self.namespace.endswith("chunks"):
-            specific_fields = [
-                FieldSchema(
-                    name="full_doc_id",
-                    dtype=DataType.VARCHAR,
-                    max_length=64,
+                    max_length=512,
                     nullable=True,
                 ),
                 FieldSchema(
-                    name="file_path",
+                    name="weight", dtype=DataType.FLOAT, nullable=True
+                ),
+                FieldSchema(
+                    name="content",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=65535,
                     nullable=True,
                 ),
             ]
-            description = "LightRAG chunks vector storage"
-
+            description = (
+                "Shared collection for legal relationship vectors"
+                if coll_name == "legal_relationships"
+                else "Shared collection for general relationship vectors"
+            )
         else:
-            # Default generic schema (backward compatibility)
             specific_fields = [
                 FieldSchema(
                     name="file_path",
@@ -871,13 +957,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             ]
             description = "LightRAG generic vector storage"
 
-        # Merge all fields
         all_fields = base_fields + specific_fields
 
         return CollectionSchema(
             fields=all_fields,
             description=description,
-            enable_dynamic_field=True,  # Support dynamic fields
+            enable_dynamic_field=True,
         )
 
     def _mmap_enabled_for_namespace(self) -> bool:
@@ -903,14 +988,26 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         self, collection_name: str, schema: CollectionSchema
     ) -> None:
         """Create a collection and apply resource-saving properties when supported."""
-        ALLOWED_COLLECTIONS = ["legal_chunks", "legal_entities", "legal_relationships", "general_chunks", "general_entities", "general_relationships"]
+        ALLOWED_COLLECTIONS = [
+            "legal_chunks",
+            "legal_entities",
+            "legal_relationships",
+            "general_chunks",
+            "general_entities",
+            "general_relationships",
+        ]
         if collection_name not in ALLOWED_COLLECTIONS:
-            logger.error(f"[{self.workspace}] Attempted to create unauthorized collection: {collection_name}. Creation blocked!")
-            raise PermissionError(f"Collection '{collection_name}' is not in the allowed list.")
-            
+            logger.error(
+                f"[{self.workspace}] Attempted to create unauthorized collection: {collection_name}. Creation blocked!"
+            )
+            raise PermissionError(
+                f"Collection '{collection_name}' is not in the allowed list."
+            )
+
         create_kwargs: dict[str, Any] = {
             "collection_name": collection_name,
             "schema": schema,
+            "num_partitions": 16,
         }
 
         if self._mmap_enabled_for_namespace():
@@ -919,13 +1016,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             self._client.create_collection(**create_kwargs)
         except TypeError:
-            if "properties" not in create_kwargs:
-                raise
-
-            logger.warning(
-                f"[{self.workspace}] Milvus client does not support create_collection "
-                f"properties; creating {collection_name} without mmap properties"
-            )
             create_kwargs.pop("properties", None)
             self._client.create_collection(**create_kwargs)
 
@@ -987,153 +1077,113 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
 
     def _create_indexes_after_collection(self):
-        """Create indexes after collection is created"""
-        # Build vector index using index configuration
-        # Use compatibility helper to get IndexParams
-        index_params_for_vector = self._get_index_params()
+        """Create indexes after collection is created, matching the 6 shared partitioned collections."""
+        coll_name = getattr(self, "final_namespace", "") or self.namespace
 
-        vector_index_params = self.index_config.build_index_params(
-            index_params_for_vector, field_name="vector"
-        )
-
-        # Re-raise exceptions to surface vector index creation failures
-        if isinstance(vector_index_params, dict):
-            self._client.create_index(
-                collection_name=self.final_namespace,
-                field_name=vector_index_params["field_name"],
-                index_params={
-                    "index_type": vector_index_params["index_type"],
-                    "metric_type": vector_index_params["metric_type"],
-                    "params": vector_index_params["params"],
-                },
+        index_params = self._get_index_params()
+        if index_params is not None:
+            index_params.add_index(
+                field_name="vector",
+                index_type="IVF_RABITQ",
+                index_name="vector_index",
+                metric_type="COSINE",
+                params={"nlist": 1024},
             )
-        else:
-            self._client.create_index(
-                collection_name=self.final_namespace,
-                index_params=vector_index_params,
+            index_params.add_index(
+                field_name="workspace_id",
+                index_type="INVERTED",
+                index_name="idx_workspace_id",
             )
 
-        logger.debug(
-            f"[{self.workspace}] Created vector index with config: {self.index_config.to_dict()}"
-        )
-
-        # Create scalar indexes based on namespace
-        # Wrap scalar index creation in try-except to allow graceful degradation
-        try:
-            # Try to get IndexParams in a version-compatible way
-            scalar_index_params = self._get_index_params()
-
-            if scalar_index_params is not None:
-                # Create scalar indexes based on namespace
-                if self.namespace.endswith("entities"):
-                    # Create indexes for entity fields
-                    try:
-                        entity_name_index = self._get_index_params()
-                        entity_name_index.add_index(
-                            field_name="entity_name", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=entity_name_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for entity_name: {e}"
-                        )
-                        self._create_scalar_index_fallback("entity_name", "INVERTED")
-
-                elif self.namespace.endswith("relationships"):
-                    # Create indexes for relationship fields
-                    try:
-                        src_id_index = self._get_index_params()
-                        src_id_index.add_index(
-                            field_name="src_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=src_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for src_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("src_id", "INVERTED")
-
-                    try:
-                        tgt_id_index = self._get_index_params()
-                        tgt_id_index.add_index(
-                            field_name="tgt_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=tgt_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for tgt_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("tgt_id", "INVERTED")
-
-                elif self.namespace.endswith("chunks"):
-                    # Create indexes for chunk fields
-                    try:
-                        doc_id_index = self._get_index_params()
-                        doc_id_index.add_index(
-                            field_name="full_doc_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=doc_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for full_doc_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("full_doc_id", "INVERTED")
-
-                # Common index: workspace_id for multi-tenant filtering
-                try:
-                    ws_index = self._get_index_params()
-                    ws_index.add_index(
-                        field_name="workspace_id", index_type="INVERTED"
-                    )
-                    self._client.create_index(
-                        collection_name=self.final_namespace,
-                        index_params=ws_index,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        f"[{self.workspace}] IndexParams method failed for workspace_id: {e}"
-                    )
-                    self._create_scalar_index_fallback("workspace_id", "INVERTED")
-
-            else:
-                # Fallback to direct API calls if IndexParams is not available
-                logger.info(
-                    f"[{self.workspace}] IndexParams not available, using fallback methods for {self.namespace}"
+            if coll_name == "legal_chunks":
+                index_params.add_index(
+                    field_name="chunk_id",
+                    index_type="INVERTED",
+                    index_name="idx_chunk_id",
+                )
+                index_params.add_index(
+                    field_name="status",
+                    index_type="INVERTED",
+                    index_name="status",
+                )
+                index_params.add_index(
+                    field_name="effective_from",
+                    index_type="INVERTED",
+                    index_name="effective_from",
+                )
+                index_params.add_index(
+                    field_name="effective_to",
+                    index_type="INVERTED",
+                    index_name="effective_to",
+                )
+            elif coll_name == "general_chunks" or self.namespace.endswith("chunks"):
+                index_params.add_index(
+                    field_name="chunk_id",
+                    index_type="INVERTED",
+                    index_name="idx_chunk_id",
+                )
+            elif coll_name == "legal_entities":
+                index_params.add_index(
+                    field_name="entity_name",
+                    index_type="INVERTED",
+                    index_name="idx_entity_name",
+                )
+                index_params.add_index(
+                    field_name="entity_type",
+                    index_type="INVERTED",
+                    index_name="idx_entity_type",
+                )
+                index_params.add_index(
+                    field_name="legal_status",
+                    index_type="INVERTED",
+                    index_name="idx_legal_status",
+                )
+            elif coll_name == "general_entities" or self.namespace.endswith("entities"):
+                index_params.add_index(
+                    field_name="entity_name",
+                    index_type="INVERTED",
+                    index_name="idx_entity_name",
+                )
+                index_params.add_index(
+                    field_name="entity_type",
+                    index_type="INVERTED",
+                    index_name="idx_entity_type",
+                )
+            elif coll_name in ("legal_relationships", "general_relationships") or self.namespace.endswith("relationships"):
+                index_params.add_index(
+                    field_name="src_id",
+                    index_type="INVERTED",
+                    index_name="idx_src_id",
+                )
+                index_params.add_index(
+                    field_name="tgt_id",
+                    index_type="INVERTED",
+                    index_name="idx_tgt_id",
                 )
 
-                # Create scalar indexes using fallback
-                if self.namespace.endswith("entities"):
-                    self._create_scalar_index_fallback("entity_name", "INVERTED")
-                elif self.namespace.endswith("relationships"):
-                    self._create_scalar_index_fallback("src_id", "INVERTED")
-                    self._create_scalar_index_fallback("tgt_id", "INVERTED")
-                elif self.namespace.endswith("chunks"):
-                    self._create_scalar_index_fallback("full_doc_id", "INVERTED")
-
-                # Common fallback index: workspace_id
-                self._create_scalar_index_fallback("workspace_id", "INVERTED")
-
+            self._client.create_index(
+                collection_name=self.final_namespace,
+                index_params=index_params,
+            )
             logger.info(
-                f"[{self.workspace}] Created indexes for collection: {self.namespace}"
+                f"[{self.workspace}] Created vector and scalar indexes for collection: {self.final_namespace}"
             )
+            return
 
-        except Exception as e:
-            # Scalar index failures are logged as warnings (not critical)
-            logger.warning(
-                f"[{self.workspace}] Failed to create some scalar indexes for {self.namespace}: {e}"
-            )
+        # Fallback if IndexParams is not available
+        vector_index_params = self.index_config.build_index_params(
+            None, field_name="vector"
+        )
+        self._client.create_index(
+            collection_name=self.final_namespace,
+            field_name=vector_index_params["field_name"],
+            index_params={
+                "index_type": vector_index_params["index_type"],
+                "metric_type": vector_index_params["metric_type"],
+                "params": vector_index_params["params"],
+            },
+        )
+        self._create_scalar_index_fallback("workspace_id", "INVERTED")
 
     def _get_required_fields_for_namespace(self) -> dict:
         """Get required core field definitions for current namespace"""
@@ -1808,10 +1858,17 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "has_collection",
                 lambda client: client.has_collection(self.final_namespace),
             ):
-                logger.error(
-                    f"[{self.workspace}] Collection {self.namespace} does not exist"
-                )
-                raise ValueError(f"Collection {self.final_namespace} does not exist")
+                self._create_collection_if_not_exist()
+                if not self._milvus_call(
+                    "has_collection",
+                    lambda client: client.has_collection(self.final_namespace),
+                ):
+                    logger.error(
+                        f"[{self.workspace}] Collection {self.namespace} does not exist"
+                    )
+                    raise ValueError(
+                        f"Collection {self.final_namespace} does not exist"
+                    )
 
             # Verify index existence before loading
             indexes = self._milvus_call(
@@ -1845,9 +1902,42 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         logger.warning(f"[{self.workspace}] Drop operation is disabled by user constraint. Ignoring drop request for {self.final_namespace}.")
         return
     def _create_collection_if_not_exist(self):
-        """Create collection if not exists - Disabled by user constraint"""
-        logger.info(f"[{self.workspace}] Collection creation is disabled by user constraint. Skipping _create_collection_if_not_exist.")
-        return
+        """Create shared collection if it does not exist yet in the target Milvus database."""
+        ALLOWED_COLLECTIONS = {
+            "legal_chunks",
+            "legal_entities",
+            "legal_relationships",
+            "general_chunks",
+            "general_entities",
+            "general_relationships",
+        }
+        if self.final_namespace not in ALLOWED_COLLECTIONS:
+            logger.info(
+                f"[{self.workspace}] Skipping _create_collection_if_not_exist for non-shared collection '{self.final_namespace}'."
+            )
+            return
+
+        if self._milvus_call(
+            "has_collection",
+            lambda client: client.has_collection(self.final_namespace),
+        ):
+            return
+
+        logger.info(
+            f"[{self.workspace}] Creating missing shared collection '{self.final_namespace}' in Milvus..."
+        )
+        schema = self._create_schema_for_namespace()
+        self._create_collection_with_properties(self.final_namespace, schema)
+        self._create_indexes_after_collection()
+        self._milvus_call(
+            "load_collection",
+            lambda client: client.load_collection(self.final_namespace),
+        )
+        self._collection_loaded = True
+        self._register_collection_loaded()
+        logger.info(
+            f"[{self.workspace}] Created and loaded shared collection '{self.final_namespace}'."
+        )
 
     def __post_init__(self):
         self._validate_embedding_func()

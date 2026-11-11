@@ -45,10 +45,22 @@ async def is_terminal_status(doc_id: str, workspace_id: str, is_legal: bool) -> 
         db = await ClientManager.get_client()
         async with db.pool.acquire() as conn:
             if is_legal:
-                row = await conn.fetchrow(
-                    'SELECT process_status as status FROM tbl_legal_document WHERE id = $1 AND workspace_id = $2',
-                    int(doc_id), ws_uuid
+                clean_id = (
+                    doc_id.removeprefix("legal-")
+                    if isinstance(doc_id, str)
+                    else doc_id
                 )
+                row = None
+                if ws_uuid:
+                    row = await conn.fetchrow(
+                        'SELECT process_status as status FROM tbl_legal_document WHERE id = $1 AND workspace_id = $2',
+                        int(clean_id), ws_uuid
+                    )
+                if not row:
+                    row = await conn.fetchrow(
+                        'SELECT process_status as status FROM tbl_legal_document WHERE id = $1',
+                        int(clean_id)
+                    )
             else:
                 doc_uuid = to_uuid(doc_id)
                 row = await conn.fetchrow(
@@ -142,7 +154,9 @@ class IngressAdapter:
         doc_type = self._canonical_doc_type(mapped_doc_type, kms_event)
         out_topic = self.stage_topics[stage_name][doc_type]
         doc_id = kms_event.document_id
-        if not doc_id and kms_event.legal_document_id is not None:
+        if doc_type == "legal" and kms_event.legal_document_id is not None:
+            doc_id = str(kms_event.legal_document_id)
+        elif not doc_id and kms_event.legal_document_id is not None:
             doc_id = str(kms_event.legal_document_id)
             
         if not doc_id:
@@ -157,7 +171,7 @@ class IngressAdapter:
             
         logger.info(f"Ingress mapping: {topic} -> {out_topic} (doc_id={doc_id})")
         
-        metadata = kms_event.model_dump()
+        metadata = kms_event.model_dump(by_alias=False)
         metadata["doc_type"] = doc_type
         # Create pipeline event
         pipeline_event = PipelineStageEvent(

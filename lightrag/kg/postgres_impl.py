@@ -1769,28 +1769,53 @@ class PGDocStatusStorage(DocStatusStorage):
                     NULL::text AS content_hash,
                     NULL::text AS error_msg,
                     created_at AS create_time,
-                    updated_at AS update_time
+                    updated_at AS update_time,
+                    document_code,
+                    document_type,
+                    issuing_authority,
+                    status AS legal_status,
+                    issuance_date,
+                    effective_date
                 FROM "tbl_legal_document"
-                WHERE "workspace_id"=$1 AND "id"=$2
+                WHERE "id"=$1
             """
-            params = {"workspace": to_uuid(self.workspace), "id": int_id}
+            params = {"id": int_id}
         else:
-            sql = """
-                SELECT 
-                    workspace_id,
-                    document_id::text AS document_id,
-                    content_summary,
-                    content_length,
-                    status,
-                    document_name,
-                    content_hash,
-                    error_msg,
-                    create_time,
-                    update_time
-                FROM "tbl_document"
-                WHERE "workspace_id"=$1 AND "document_id"=$2
-            """
-            params = {"workspace": to_uuid(self.workspace), "id": to_uuid(id_str)}
+            is_all_ws = str(self.workspace).lower() in ["all", "*", "", "none"]
+            if is_all_ws:
+                sql = """
+                    SELECT 
+                        workspace_id,
+                        document_id::text AS document_id,
+                        content_summary,
+                        content_length,
+                        status,
+                        document_name,
+                        content_hash,
+                        error_msg,
+                        create_time,
+                        update_time
+                    FROM "tbl_document"
+                    WHERE "document_id"=$1
+                """
+                params = {"id": to_uuid(id_str)}
+            else:
+                sql = """
+                    SELECT 
+                        workspace_id,
+                        document_id::text AS document_id,
+                        content_summary,
+                        content_length,
+                        status,
+                        document_name,
+                        content_hash,
+                        error_msg,
+                        create_time,
+                        update_time
+                    FROM "tbl_document"
+                    WHERE "workspace_id"=$1 AND "document_id"=$2
+                """
+                params = {"workspace": to_uuid(self.workspace), "id": to_uuid(id_str)}
 
         result = await self.db.query(sql, list(params.values()), True)
         if result is None or result == []:
@@ -1800,6 +1825,16 @@ class PGDocStatusStorage(DocStatusStorage):
             created_at = self._format_datetime_with_timezone(result[0]["create_time"])
             updated_at = self._format_datetime_with_timezone(result[0]["update_time"])
 
+            doc_type = "legal" if is_int_id else "general"
+            metadata = {
+                "doc_type": doc_type,
+                "workspace_id": str(result[0]["workspace_id"]) if result[0].get("workspace_id") else None,
+            }
+            if is_int_id:
+                for k in ["document_code", "document_type", "issuing_authority", "legal_status", "issuance_date", "effective_date"]:
+                    if k in result[0] and result[0][k] is not None:
+                        metadata[k] = str(result[0][k])
+
             return dict(
                 id=str(result[0]["document_id"]),
                 content_length=result[0]["content_length"],
@@ -1808,7 +1843,8 @@ class PGDocStatusStorage(DocStatusStorage):
                 created_at=created_at,
                 updated_at=updated_at,
                 file_path=result[0]["document_name"],
-                metadata={},
+                workspace_id=str(result[0]["workspace_id"]) if result[0].get("workspace_id") else None,
+                metadata=metadata,
                 error_msg=result[0].get("error_msg"),
                 content_hash=result[0].get("content_hash"),
             )
@@ -1836,23 +1872,43 @@ class PGDocStatusStorage(DocStatusStorage):
 
         # 1. Query tbl_document
         if uuid_ids:
-            sql_doc = """
-                SELECT 
-                    workspace_id,
-                    document_id,
-                    content_summary,
-                    content_length,
-                    status,
-                    document_name,
-                    content_hash,
-                    error_msg,
-                    create_time,
-                    update_time
-                FROM "tbl_document"
-                WHERE "workspace_id"=$1 AND "document_id" = ANY($2)
-            """
-            params_doc = {"workspace": to_uuid(self.workspace), "ids": uuid_ids}
-            results_doc = await self.db.query(sql_doc, list(params_doc.values()), True)
+            is_all_ws = str(self.workspace).lower() in ["all", "*", "", "none"]
+            if is_all_ws:
+                sql_doc = """
+                    SELECT 
+                        workspace_id,
+                        document_id,
+                        content_summary,
+                        content_length,
+                        status,
+                        document_name,
+                        content_hash,
+                        error_msg,
+                        create_time,
+                        update_time
+                    FROM "tbl_document"
+                    WHERE "document_id" = ANY($1)
+                """
+                params_doc = [uuid_ids]
+            else:
+                sql_doc = """
+                    SELECT 
+                        workspace_id,
+                        document_id,
+                        content_summary,
+                        content_length,
+                        status,
+                        document_name,
+                        content_hash,
+                        error_msg,
+                        create_time,
+                        update_time
+                    FROM "tbl_document"
+                    WHERE "workspace_id"=$1 AND "document_id" = ANY($2)
+                """
+                params_doc = [to_uuid(self.workspace), uuid_ids]
+
+            results_doc = await self.db.query(sql_doc, params_doc, True)
             if results_doc:
                 for row in results_doc:
                     created_at = self._format_datetime_with_timezone(row["create_time"])
@@ -1866,7 +1922,11 @@ class PGDocStatusStorage(DocStatusStorage):
                         "created_at": created_at,
                         "updated_at": updated_at,
                         "file_path": row["document_name"],
-                        "metadata": {},
+                        "workspace_id": str(row["workspace_id"]) if row.get("workspace_id") else None,
+                        "metadata": {
+                            "doc_type": "general",
+                            "workspace_id": str(row["workspace_id"]) if row.get("workspace_id") else None,
+                        },
                         "error_msg": row.get("error_msg"),
                         "content_hash": row.get("content_hash"),
                     }
@@ -1884,12 +1944,17 @@ class PGDocStatusStorage(DocStatusStorage):
                     NULL::text AS content_hash,
                     NULL::text AS error_msg,
                     created_at AS create_time,
-                    updated_at AS update_time
+                    updated_at AS update_time,
+                    document_code,
+                    document_type,
+                    issuing_authority,
+                    status AS legal_status,
+                    issuance_date,
+                    effective_date
                 FROM "tbl_legal_document"
-                WHERE "workspace_id"=$1 AND "id" = ANY($2)
+                WHERE "id" = ANY($1)
             """
-            params_legal = {"workspace": to_uuid(self.workspace), "ids": int_ids}
-            results_legal = await self.db.query(sql_legal, list(params_legal.values()), True)
+            results_legal = await self.db.query(sql_legal, [int_ids], True)
             if results_legal:
                 for row in results_legal:
                     created_at = self._format_datetime_with_timezone(row["create_time"])
@@ -1903,7 +1968,17 @@ class PGDocStatusStorage(DocStatusStorage):
                         "created_at": created_at,
                         "updated_at": updated_at,
                         "file_path": row["document_name"],
-                        "metadata": {},
+                        "workspace_id": str(row["workspace_id"]) if row.get("workspace_id") else None,
+                        "metadata": {
+                            "doc_type": "legal",
+                            "workspace_id": str(row["workspace_id"]) if row.get("workspace_id") else None,
+                            "document_code": row.get("document_code"),
+                            "document_type": row.get("document_type"),
+                            "issuing_authority": row.get("issuing_authority"),
+                            "legal_status": row.get("legal_status"),
+                            "issuance_date": str(row["issuance_date"]) if row.get("issuance_date") else None,
+                            "effective_date": str(row["effective_date"]) if row.get("effective_date") else None,
+                        },
                         "error_msg": row.get("error_msg"),
                         "content_hash": row.get("content_hash"),
                     }
@@ -2074,6 +2149,7 @@ class PGDocStatusStorage(DocStatusStorage):
         page_size: int = 50,
         sort_field: str = "updated_at",
         sort_direction: str = "desc",
+        doc_type: str | None = None,
     ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
         """Get documents with pagination support from both tbl_document and tbl_legal_document
 
@@ -2083,6 +2159,7 @@ class PGDocStatusStorage(DocStatusStorage):
             page_size: Number of documents per page (10-200)
             sort_field: Field to sort by ('created_at', 'updated_at', 'id')
             sort_direction: Sort direction ('asc' or 'desc')
+            doc_type: Filter by document type ('all', 'legal', 'general')
 
         Returns:
             Tuple of (list of (doc_id, DocProcessingStatus) tuples, total_count)
@@ -2113,55 +2190,92 @@ class PGDocStatusStorage(DocStatusStorage):
         # Calculate offset
         offset = (page - 1) * page_size
 
-        # Build parameterized query components
-        params = {"workspace": to_uuid(self.workspace)}
-        param_count = 1
+        # Check if workspace filtering should be applied
+        is_all_workspaces = str(self.workspace).lower() in ["all", "*", "", "none"]
 
-        # Build WHERE clauses with parameterized queries pushed down into each table
-        if status_filter is not None:
+        # Build parameterized query components
+        params = {}
+        param_count = 0
+
+        if not is_all_workspaces:
             param_count += 1
-            doc_where = 'WHERE "workspace_id"=$1 AND status=$2'
-            legal_where = 'WHERE "workspace_id"=$1 AND COALESCE(process_status, \'EXTRACTED\')=$2'
-            params["status"] = status_filter.value
+            params["workspace"] = to_uuid(self.workspace)
+            if status_filter is not None:
+                param_count += 1
+                doc_where = 'WHERE "workspace_id"=$1 AND status=$2'
+                legal_where = 'WHERE "workspace_id"=$1 AND COALESCE(process_status, \'EXTRACTED\')=$2'
+                params["status"] = status_filter.value
+            else:
+                doc_where = 'WHERE "workspace_id"=$1'
+                legal_where = 'WHERE "workspace_id"=$1'
         else:
-            doc_where = 'WHERE "workspace_id"=$1'
-            legal_where = 'WHERE "workspace_id"=$1'
+            if status_filter is not None:
+                param_count += 1
+                doc_where = f'WHERE status=${param_count}'
+                legal_where = f'WHERE COALESCE(process_status, \'EXTRACTED\')=${param_count}'
+                params["status"] = status_filter.value
+            else:
+                doc_where = ''
+                legal_where = ''
 
         # Build ORDER BY clause using validated whitelist values
         order_clause = f"ORDER BY {db_sort_field} {sort_direction.upper()}"
 
-        # Unified document CTE with pushed-down filters to leverage workspace index
-        unified_sql_base = f"""
-            WITH all_docs AS (
-                SELECT 
-                    workspace_id,
-                    document_id::text AS document_id,
-                    content_summary,
-                    content_length,
-                    status,
-                    document_name,
-                    content_hash,
-                    error_msg,
-                    create_time,
-                    update_time
-                FROM "tbl_document"
-                {doc_where}
-                UNION ALL
-                SELECT 
-                    workspace_id,
-                    id::text AS document_id,
-                    summary AS content_summary,
-                    length(COALESCE(summary, '')) AS content_length,
-                    COALESCE(process_status, 'EXTRACTED') AS status,
-                    title AS document_name,
-                    NULL::text AS content_hash,
-                    NULL::text AS error_msg,
-                    created_at AS create_time,
-                    updated_at AS update_time
-                FROM "tbl_legal_document"
-                {legal_where}
-            )
+        # Determine CTE queries based on doc_type filter
+        selected_doc_type = (doc_type or "all").lower()
+
+        doc_cte = f"""
+            SELECT 
+                workspace_id,
+                document_id::text AS document_id,
+                content_summary,
+                content_length,
+                status,
+                document_name,
+                content_hash,
+                error_msg,
+                create_time,
+                update_time,
+                'general'::text AS doc_type,
+                NULL::text AS document_code,
+                NULL::text AS document_type,
+                NULL::text AS issuing_authority,
+                NULL::text AS legal_status,
+                NULL::text AS issuance_date,
+                NULL::text AS effective_date
+            FROM "tbl_document"
+            {doc_where}
         """
+
+        legal_cte = f"""
+            SELECT 
+                workspace_id,
+                id::text AS document_id,
+                summary AS content_summary,
+                length(COALESCE(summary, '')) AS content_length,
+                COALESCE(process_status, 'EXTRACTED') AS status,
+                title AS document_name,
+                NULL::text AS content_hash,
+                NULL::text AS error_msg,
+                created_at AS create_time,
+                updated_at AS update_time,
+                'legal'::text AS doc_type,
+                document_code::text AS document_code,
+                document_type::text AS document_type,
+                issuing_authority::text AS issuing_authority,
+                status::text AS legal_status,
+                issuance_date::text AS issuance_date,
+                effective_date::text AS effective_date
+            FROM "tbl_legal_document"
+            {legal_where}
+        """
+
+        if selected_doc_type == "general":
+            unified_sql_base = f"WITH all_docs AS ({doc_cte})"
+        elif selected_doc_type == "legal":
+            unified_sql_base = f"WITH all_docs AS ({legal_cte})"
+        else:
+            unified_sql_base = f"WITH all_docs AS ({doc_cte} UNION ALL {legal_cte})"
 
         # Query for total count
         count_sql = f"""
@@ -2199,7 +2313,16 @@ class PGDocStatusStorage(DocStatusStorage):
                 created_at=created_at,
                 updated_at=updated_at,
                 file_path=element["document_name"],
-                metadata={},
+                metadata={
+                    "doc_type": element["doc_type"],
+                    "document_code": element.get("document_code"),
+                    "document_type": element.get("document_type"),
+                    "issuing_authority": element.get("issuing_authority"),
+                    "legal_status": element.get("legal_status"),
+                    "issuance_date": element.get("issuance_date"),
+                    "effective_date": element.get("effective_date"),
+                    "workspace_id": str(element["workspace_id"]) if element.get("workspace_id") else None,
+                },
                 error_msg=element.get("error_msg"),
                 content_hash=element.get("content_hash"),
             )
@@ -2215,23 +2338,41 @@ class PGDocStatusStorage(DocStatusStorage):
         """
         try:
             logger.debug(f"[{self.workspace}] Getting status counts...")
-            sql = """
-                SELECT status, SUM(count) as count FROM (
-                    SELECT status, COUNT(*) as count
-                    FROM "tbl_document"
-                    WHERE "workspace_id"=$1
+            is_all_workspaces = str(self.workspace).lower() in ["all", "*", "", "none"]
+            if is_all_workspaces:
+                sql = """
+                    SELECT status, SUM(count) as count FROM (
+                        SELECT status, COUNT(*) as count
+                        FROM "tbl_document"
+                        GROUP BY status
+                        UNION ALL
+                        SELECT 
+                            COALESCE(process_status, 'EXTRACTED') AS status,
+                            COUNT(*) as count
+                        FROM "tbl_legal_document"
+                        GROUP BY COALESCE(process_status, 'EXTRACTED')
+                    ) t
                     GROUP BY status
-                    UNION ALL
-                    SELECT 
-                        COALESCE(process_status, 'EXTRACTED') AS status,
-                        COUNT(*) as count
-                    FROM "tbl_legal_document"
-                    WHERE "workspace_id"=$1
-                    GROUP BY COALESCE(process_status, 'EXTRACTED')
-                ) t
-                GROUP BY status
-            """
-            params = {"workspace": to_uuid(self.workspace)}
+                """
+                params = {}
+            else:
+                sql = """
+                    SELECT status, SUM(count) as count FROM (
+                        SELECT status, COUNT(*) as count
+                        FROM "tbl_document"
+                        WHERE "workspace_id"=$1
+                        GROUP BY status
+                        UNION ALL
+                        SELECT 
+                            COALESCE(process_status, 'EXTRACTED') AS status,
+                            COUNT(*) as count
+                        FROM "tbl_legal_document"
+                        WHERE "workspace_id"=$1
+                        GROUP BY COALESCE(process_status, 'EXTRACTED')
+                    ) t
+                    GROUP BY status
+                """
+                params = {"workspace": to_uuid(self.workspace)}
 
             # Add timeout to prevent hanging
             result = await asyncio.wait_for(

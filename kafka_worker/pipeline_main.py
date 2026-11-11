@@ -143,13 +143,13 @@ PARALLEL_MESSAGE_STAGES = {
 }
 
 DEFAULT_MAX_RECORDS_BY_STAGE = {
-    StageName.EXTRACTION: 1,
-    StageName.CHUNKING: 1,
-    StageName.CHUNK_EMBEDDING: 1,
-    StageName.ENTITY_EXTRACTION: 1,
-    StageName.KG_MERGE: 1,
-    StageName.KG_EMBEDDING: 8,
-    StageName.FINALIZE: 4,
+    StageName.EXTRACTION: 3,
+    StageName.CHUNKING: 4,
+    StageName.CHUNK_EMBEDDING: 4,
+    StageName.ENTITY_EXTRACTION: 4,
+    StageName.KG_MERGE: 2,
+    StageName.KG_EMBEDDING: 4,
+    StageName.FINALIZE: 8,
 }
 
 DEFAULT_CONSUMER_TIMEOUTS_BY_STAGE = {
@@ -432,16 +432,25 @@ async def _publish_kms_response(
         kms_event = KmsEvent.model_validate(pipeline_event.metadata)
         kms_event.status = status
         kms_event.message = message
-        payload = kms_event.model_dump_json(by_alias=True, exclude_none=True).encode(
-            "utf-8"
-        )
-        await producer.send_and_wait(topic, payload)
+        if not kms_event.content_path and "content_path" in pipeline_event.metadata:
+            kms_event.content_path = pipeline_event.metadata["content_path"]
+        if not kms_event.content_hash and "content_hash" in pipeline_event.metadata:
+            kms_event.content_hash = pipeline_event.metadata["content_hash"]
+        if not kms_event.content_length and "content_length" in pipeline_event.metadata:
+            kms_event.content_length = pipeline_event.metadata["content_length"]
+        if not kms_event.content_summary and "content_summary" in pipeline_event.metadata:
+            kms_event.content_summary = pipeline_event.metadata["content_summary"]
 
         doc_id_to_log = (
             kms_event.document_id
             or kms_event.legal_document_id
             or pipeline_event.doc_id
         )
+        payload = kms_event.model_dump_json(by_alias=True, exclude_none=True).encode(
+            "utf-8"
+        )
+        key = str(doc_id_to_log).encode("utf-8") if doc_id_to_log else None
+        await producer.send_and_wait(topic, payload, key=key)
         if status == DocStatus.FAILED:
             logger.error(
                 f"[Egress] Published {status.value} to {topic} for doc {doc_id_to_log} | Reason: {message}"
@@ -521,12 +530,17 @@ async def _handle_message(
         event = _normalize_event_doc_type(event)
         doc_type = _canonical_doc_type(event)
         if event.stage_name == StageName.EXTRACTION:
-            topic = (
-                KMS_EXTRACTED_LEGAL_TOPIC
-                if doc_type == "legal"
-                else KMS_EXTRACTED_TOPIC
-            )
-            await _publish_kms_response(producer, event, topic, DocStatus.EXTRACTED)
+            is_duplicate = any(
+                str(getattr(ne, "status", "")).upper() == "DUPLICATED"
+                for ne in (outcome.next_events or [])
+            ) or "duplicate" in str(getattr(outcome, "message", "")).lower()
+            if not is_duplicate:
+                topic = (
+                    KMS_EXTRACTED_LEGAL_TOPIC
+                    if doc_type == "legal"
+                    else KMS_EXTRACTED_TOPIC
+                )
+                await _publish_kms_response(producer, event, topic, DocStatus.EXTRACTED)
 
     return outcome.status in {
         "done",

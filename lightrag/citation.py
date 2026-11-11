@@ -120,6 +120,10 @@ def _legal_info_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "legal_statuses",
         "legal_status_codes",
         "legal_document_ids",
+        "clause_status",
+        "is_expired",
+        "expiry_warning",
+        "lien_quan_dan_chieu",
     ):
         if key in metadata and metadata[key] not in (None, ""):
             legal_info[key] = metadata[key]
@@ -140,6 +144,12 @@ def _legal_status_priority_for_citation(cit: CitationMetadata) -> int:
     try:
         from lightrag.legal_document.status import legal_status_sort_priority
 
+        if isinstance(cit.legal_info, dict):
+            if (
+                cit.legal_info.get("is_expired")
+                or str(cit.legal_info.get("clause_status", "")).upper() == "EXPIRED"
+            ):
+                return 5
         return legal_status_sort_priority(cit.legal_info)
     except Exception:
         if not isinstance(cit.legal_info, dict):
@@ -2283,10 +2293,22 @@ class CitationRenderer:
         
         # Add legal status in parentheses: "([Trạng thái])"
         legal_status = cit.legal_info.get("legal_status", "")
-        if legal_status:
-            # Join all parts first, then append status in parentheses
+        clause_status = cit.legal_info.get("clause_status", "")
+        is_expired = cit.legal_info.get("is_expired", False)
+        expiry_warning = cit.legal_info.get("expiry_warning", "")
+
+        if legal_status or is_expired or expiry_warning:
+            status_text = legal_status or "Không xác định"
+            if is_expired or str(clause_status).upper() == "EXPIRED":
+                if expiry_warning:
+                    status_text = f"⚠️ {status_text} - {expiry_warning}"
+                else:
+                    status_text = f"⚠️ {status_text} - Điều khoản đã hết hiệu lực"
+            elif expiry_warning:
+                status_text = f"{status_text} - {expiry_warning}"
+
             citation_base = " ".join(parts)
-            return f"{citation_base} ({legal_status})"
+            return f"{citation_base} ({status_text})" if citation_base else f"({status_text})"
         
         # Return citation without status if not available
         # If no parts were built, fall back to formatted_ref or file_path

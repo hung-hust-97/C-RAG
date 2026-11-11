@@ -794,6 +794,9 @@ class DocumentsRequest(BaseModel):
     workspace_id: Optional[str] = Field(
         default=None, description="Workspace identifier for this request"
     )
+    doc_type: Optional[Literal["all", "legal", "general"]] = Field(
+        default=None, description="Filter by document type ('all', 'legal', 'general')"
+    )
 
     @field_validator("status_filter", mode="before")
     @classmethod
@@ -824,6 +827,9 @@ class DocumentSearchByNameRequest(BaseModel):
 
     workspace_id: Optional[str] = Field(
         default=None, description="Workspace identifier for this request"
+    )
+    doc_type: Optional[Literal["all", "legal", "general"]] = Field(
+        default=None, description="Filter by document type ('all', 'legal', 'general')"
     )
     keyword: str = Field(
         ...,
@@ -4836,28 +4842,46 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving documents (500).
         """
         try:
-            resolved_workspace_id, current_rag, _ = await resolve_request_context(
-                http_request, request.workspace_id
-            )
+            is_all = request.workspace_id and request.workspace_id.lower() in ["all", "*"]
+            if is_all:
+                resolved_workspace_id = "all"
+                current_rag = (
+                    await get_rag_for_workspace("default")
+                    if get_rag_for_workspace is not None
+                    else rag
+                )
+                prev_ws = current_rag.doc_status.workspace
+                current_rag.doc_status.workspace = "all"
+            else:
+                resolved_workspace_id, current_rag, _ = await resolve_request_context(
+                    http_request, request.workspace_id
+                )
+                prev_ws = None
 
-            # Get paginated documents and status counts in parallel
-            docs_task = current_rag.doc_status.get_docs_paginated(
-                status_filter=request.status_filter,
-                page=request.page,
-                page_size=request.page_size,
-                sort_field=request.sort_field,
-                sort_direction=request.sort_direction,
-            )
-            status_counts_task = current_rag.doc_status.get_all_status_counts()
+            try:
+                # Get paginated documents and status counts in parallel
+                docs_task = current_rag.doc_status.get_docs_paginated(
+                    status_filter=request.status_filter,
+                    page=request.page,
+                    page_size=request.page_size,
+                    sort_field=request.sort_field,
+                    sort_direction=request.sort_direction,
+                    doc_type=request.doc_type,
+                )
+                status_counts_task = current_rag.doc_status.get_all_status_counts()
 
-            # Execute both queries in parallel
-            (documents_with_ids, total_count), status_counts = await asyncio.gather(
-                docs_task, status_counts_task
-            )
+                # Execute both queries in parallel
+                (documents_with_ids, total_count), status_counts = await asyncio.gather(
+                    docs_task, status_counts_task
+                )
+            finally:
+                if prev_ws is not None:
+                    current_rag.doc_status.workspace = prev_ws
 
             # Convert documents to response format
             doc_responses = []
             for doc_id, doc in documents_with_ids:
+                doc_ws = (doc.metadata.get("workspace_id") if doc.metadata else None) or current_rag.workspace
                 doc_responses.append(
                     DocStatusResponse(
                         id=doc_id,
@@ -4866,7 +4890,7 @@ def create_document_routes(
                         status=doc.status,
                         created_at=format_datetime(doc.created_at),
                         updated_at=format_datetime(doc.updated_at),
-                        workspace_id=current_rag.workspace,
+                        workspace_id=str(doc_ws),
                         chunks_count=doc.chunks_count,
                         error_msg=doc.error_msg,
                         metadata=doc.metadata,
@@ -6597,6 +6621,7 @@ def create_document_routes(
             # Convert to DocStatusResponse
             # Handle both dict and DocProcessingStatus object
             if isinstance(doc_data, dict):
+                doc_ws = doc_data.get("workspace_id") or (doc_data.get("metadata", {}) or {}).get("workspace_id") or resolved_workspace_id
                 return DocStatusResponse(
                     id=doc_id,
                     content_summary=doc_data.get("content_summary", ""),
@@ -6604,7 +6629,7 @@ def create_document_routes(
                     status=doc_data.get("status", DocStatus.FAILED),
                     created_at=format_datetime(doc_data.get("created_at")),
                     updated_at=format_datetime(doc_data.get("updated_at")),
-                    workspace_id=resolved_workspace_id,
+                    workspace_id=str(doc_ws),
                     chunks_count=doc_data.get("chunks_count"),
                     error_msg=doc_data.get("error_msg"),
                     metadata=doc_data.get("metadata"),
@@ -6612,6 +6637,8 @@ def create_document_routes(
                 )
             else:
                 # DocProcessingStatus object
+                meta = getattr(doc_data, "metadata", {}) or {}
+                doc_ws = meta.get("workspace_id") or resolved_workspace_id
                 return DocStatusResponse(
                     id=doc_id,
                     content_summary=getattr(doc_data, "content_summary", ""),
@@ -6619,10 +6646,10 @@ def create_document_routes(
                     status=getattr(doc_data, "status", DocStatus.FAILED),
                     created_at=format_datetime(getattr(doc_data, "created_at", None)),
                     updated_at=format_datetime(getattr(doc_data, "updated_at", None)),
-                    workspace_id=resolved_workspace_id,
+                    workspace_id=str(doc_ws),
                     chunks_count=getattr(doc_data, "chunks_count", None),
                     error_msg=getattr(doc_data, "error_msg", None),
-                    metadata=getattr(doc_data, "metadata", None),
+                    metadata=meta,
                     file_path=normalize_file_path(getattr(doc_data, "file_path", "")),
                 )
             

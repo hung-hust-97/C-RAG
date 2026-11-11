@@ -2,9 +2,10 @@
 LightRAG FastAPI Server
 """
 
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
@@ -1421,6 +1422,188 @@ def create_app(args):
         except Exception as e:
             logger.error(f"Error getting PostgreSQL pool stats: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    def collect_system_resources() -> dict:
+        """Helper to collect system hardware and PostgreSQL pool metrics without blocking."""
+        import psutil
+        import time
+
+        # CPU
+        cpu_percent = psutil.cpu_percent(interval=None)
+        cpu_cores = psutil.cpu_count(logical=True)
+        load_avg = list(psutil.getloadavg()) if hasattr(psutil, "getloadavg") else [0.0, 0.0, 0.0]
+
+        # Memory
+        mem = psutil.virtual_memory()
+        mem_total_gb = round(mem.total / (1024 ** 3), 2)
+        mem_used_gb = round(mem.used / (1024 ** 3), 2)
+        mem_free_gb = round(mem.available / (1024 ** 3), 2)
+        mem_percent = mem.percent
+
+        # Disk
+        disk = psutil.disk_usage("/")
+        disk_total_gb = round(disk.total / (1024 ** 3), 2)
+        disk_used_gb = round(disk.used / (1024 ** 3), 2)
+        disk_free_gb = round(disk.free / (1024 ** 3), 2)
+        disk_percent = disk.percent
+
+        # PostgreSQL pool
+        pool_stats = {}
+        try:
+            from lightrag.kg.postgres_impl import ClientManager
+            pool_stats = ClientManager.get_pool_stats()
+        except Exception as e:
+            pool_stats = {"status": "unavailable", "error": str(e)}
+
+        # Overall status evaluation
+        if cpu_percent > 90 or mem_percent > 92:
+            health_level = "CRITICAL"
+            health_msg = "Server under extreme load! Pipeline throttling recommended."
+        elif cpu_percent > 75 or mem_percent > 85:
+            health_level = "WARNING"
+            health_msg = "Elevated resource usage. Monitor pipeline concurrency closely."
+        else:
+            health_level = "HEALTHY"
+            health_msg = "System resources are optimal."
+
+        return {
+            "cpu": {
+                "percent": cpu_percent,
+                "cores": cpu_cores,
+                "load_avg": [round(x, 2) for x in load_avg],
+            },
+            "memory": {
+                "total_gb": mem_total_gb,
+                "used_gb": mem_used_gb,
+                "free_gb": mem_free_gb,
+                "percent": mem_percent,
+            },
+            "disk": {
+                "total_gb": disk_total_gb,
+                "used_gb": disk_used_gb,
+                "free_gb": disk_free_gb,
+                "percent": disk_percent,
+            },
+            "postgresql_pool": pool_stats,
+            "system_status": health_level,
+            "message": health_msg,
+            "timestamp": int(time.time()),
+        }
+
+    @app.get(
+        "/system/resources",
+        dependencies=[Depends(combined_auth)],
+        summary="Get system hardware and resource utilization metrics",
+        description="Returns CPU, RAM, Disk, System Load, and PostgreSQL Pool telemetry to monitor pipeline health",
+    )
+    async def get_system_resources():
+        """Get live system resources to monitor pipeline workload and prevent server overload."""
+        try:
+            return collect_system_resources()
+        except Exception as e:
+            logger.error(f"Error getting system resources: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/pipeline/stream",
+        dependencies=[Depends(combined_auth)],
+        summary="Server-Sent Events (SSE) stream for live pipeline & system telemetry",
+        description="Pushes live CPU/RAM/Disk metrics and document pipeline status without client polling",
+    )
+    async def pipeline_events_stream(
+        request: Request,
+        workspace_id: Optional[str] = Query(None),
+        interval: float = Query(2.0, ge=1.0, le=10.0),
+    ):
+        """Server-Sent Events endpoint pushing real-time hardware telemetry and pipeline progress."""
+        async def event_generator():
+            import time
+            heartbeat_tick = 0
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    # 1. PUSH System Telemetry
+                    telemetry = collect_system_resources()
+                    yield f"event: telemetry\ndata: {json.dumps(telemetry)}\n\n"
+
+                    # 2. PUSH Pipeline Summary (status counts & metrics)
+                    try:
+                        from lightrag.kg.postgres_impl import ClientManager
+                        db = await ClientManager.get_client()
+                        if db:
+                            if workspace_id and workspace_id != "all":
+                                count_query = """
+                                    SELECT status, SUM(count) as cnt FROM (
+                                        SELECT status, COUNT(*) as count
+                                        FROM tbl_document
+                                        WHERE workspace_id::text = $1
+                                        GROUP BY status
+                                        UNION ALL
+                                        SELECT 
+                                            COALESCE(process_status, 'EXTRACTED') AS status,
+                                            COUNT(*) as count
+                                        FROM tbl_legal_document
+                                        WHERE workspace_id::text = $1
+                                        GROUP BY COALESCE(process_status, 'EXTRACTED')
+                                    ) t
+                                    GROUP BY status
+                                """
+                                rows = await db.query(count_query, [workspace_id], multirows=True)
+                            else:
+                                count_query = """
+                                    SELECT status, SUM(count) as cnt FROM (
+                                        SELECT status, COUNT(*) as count
+                                        FROM tbl_document
+                                        GROUP BY status
+                                        UNION ALL
+                                        SELECT 
+                                            COALESCE(process_status, 'EXTRACTED') AS status,
+                                            COUNT(*) as count
+                                        FROM tbl_legal_document
+                                        GROUP BY COALESCE(process_status, 'EXTRACTED')
+                                    ) t
+                                    GROUP BY status
+                                """
+                                rows = await db.query(count_query, [], multirows=True)
+                            status_counts = {row["status"]: int(row["cnt"]) for row in rows} if rows and isinstance(rows, list) else {}
+
+                            # Active stage runs count
+                            stage_query = "SELECT stage, count(*) as cnt FROM lightrag_pipeline_stage_runs WHERE LOWER(status) = 'running' GROUP BY stage"
+                            stage_rows = await db.query(stage_query, [], multirows=True)
+                            active_stages = {row["stage"]: int(row["cnt"]) for row in stage_rows} if stage_rows and isinstance(stage_rows, list) else {}
+
+                            summary_payload = {
+                                "workspace_id": workspace_id or "all",
+                                "status_counts": status_counts,
+                                "active_stages": active_stages,
+                                "timestamp": int(time.time()),
+                            }
+                            yield f"event: pipeline\ndata: {json.dumps(summary_payload)}\n\n"
+                    except Exception as pe:
+                        logger.debug(f"Pipeline status summary query error: {pe}")
+
+                    heartbeat_tick += 1
+                    if heartbeat_tick % 5 == 0:
+                        yield f"event: ping\ndata: {{\"timestamp\": {int(time.time())}}}\n\n"
+
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.warning(f"Error in pipeline SSE stream: {e}")
+                    await asyncio.sleep(interval)
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8",
+            },
+        )
 
     @app.get(
         "/workspaces",

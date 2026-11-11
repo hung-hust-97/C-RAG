@@ -93,12 +93,15 @@ CLAUDE.md
 
 # Test
 test/
+tests/
 
 # Agent generated files
 TASK_*.md
 *WALKTHROUGH*.md
 *IMPLEMENTATION*.md
 test*
+tests/__pycache__/
+scratch/
 !.kiro/
 !.kiro/tests/
 !.kiro/tests/test_entity_extraction_strictness.py

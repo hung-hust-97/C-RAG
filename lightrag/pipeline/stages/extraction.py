@@ -224,16 +224,20 @@ async def _run_legal_extraction_stage(
             import uuid
 
             clean_id = str(workspace_id).split(":")[-1]
-            if len(clean_id).replace("-", "") == 32:
+            if len(clean_id.replace("-", "")) == 32:
                 workspace_uuid = uuid.UUID(clean_id)
             else:
                 workspace_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, str(workspace_id))
 
-            row = await rag.full_docs.db.query(
-                "SELECT name FROM tbl_workspace WHERE id = $1", [workspace_uuid]
+            db = getattr(getattr(rag, "doc_status", None), "db", None) or getattr(
+                getattr(rag, "full_docs", None), "db", None
             )
-            if row and isinstance(row, dict):
-                workspace_name = row.get("name")
+            if db is not None:
+                row = await db.query(
+                    "SELECT name FROM tbl_workspace WHERE id = $1", [workspace_uuid]
+                )
+                if row and isinstance(row, dict):
+                    workspace_name = row.get("name")
         except Exception as e:
             logger.warning(f"Failed to query workspace name from DB: {e}")
 

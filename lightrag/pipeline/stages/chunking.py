@@ -137,10 +137,21 @@ async def _legal_content_object_key(
     try:
         from lightrag.kg.postgres_impl import to_uuid
 
-        row = await db.query(
-            'SELECT content_path FROM "tbl_legal_document" WHERE workspace_id=$1 AND id=$2',
-            [to_uuid(event.workspace_id), int(legal_document_id)],
-        )
+        row = None
+        if event.workspace_id:
+            try:
+                row = await db.query(
+                    'SELECT content_path FROM "tbl_legal_document" WHERE workspace_id=$1 AND id=$2',
+                    [to_uuid(event.workspace_id), int(legal_document_id)],
+                )
+            except Exception:
+                row = None
+
+        if not row:
+            row = await db.query(
+                'SELECT content_path FROM "tbl_legal_document" WHERE id=$1',
+                [int(legal_document_id)],
+            )
     except Exception as exc:
         logger.warning(
             "[Pipeline] Failed to load legal content_path doc_id=%s workspace_id=%s: %s",
@@ -208,6 +219,7 @@ async def _run_chunking_func(
     rag: Any,
     content: str,
     doc_id: str,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Any:
     args = (
         rag.tokenizer,
@@ -217,7 +229,7 @@ async def _run_chunking_func(
         rag.chunk_overlap_token_size,
         rag.chunk_token_size,
     )
-    kwargs = {"doc_id": doc_id}
+    kwargs = {"doc_id": doc_id, **(extra_kwargs or {})}
 
     if inspect.iscoroutinefunction(chunking_func):
         result = await chunking_func(*args, **kwargs)
@@ -260,12 +272,55 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
     if not content.strip():
         raise ValueError(f"Document content is empty for doc_id={event.doc_id}")
 
+    extra_kwargs = {}
+    if doc_type == "legal" and legal_document_id is not None:
+        db = getattr(getattr(rag, "doc_status", None), "db", None)
+        if db is not None:
+            try:
+                from lightrag.kg.postgres_impl import to_uuid
+
+                legal_row = None
+                if event.workspace_id:
+                    try:
+                        legal_row = await db.query(
+                            'SELECT status, lien_quan_hieu_luc_tung_phan, lien_quan_dan_chieu, document_code, title FROM "tbl_legal_document" WHERE workspace_id=$1 AND id=$2',
+                            [to_uuid(event.workspace_id), int(legal_document_id)],
+                        )
+                    except Exception:
+                        legal_row = None
+
+                if not legal_row:
+                    legal_row = await db.query(
+                        'SELECT status, lien_quan_hieu_luc_tung_phan, lien_quan_dan_chieu, document_code, title FROM "tbl_legal_document" WHERE id=$1',
+                        [int(legal_document_id)],
+                    )
+
+                if legal_row:
+                    extra_kwargs["legal_status"] = legal_row.get("status")
+                    extra_kwargs["lien_quan_hieu_luc_tung_phan"] = legal_row.get(
+                        "lien_quan_hieu_luc_tung_phan"
+                    )
+                    extra_kwargs["lien_quan_dan_chieu"] = legal_row.get(
+                        "lien_quan_dan_chieu"
+                    )
+                    if legal_row.get("document_code"):
+                        extra_kwargs["document_number"] = legal_row.get("document_code")
+                    if legal_row.get("title"):
+                        extra_kwargs["document_title"] = legal_row.get("title")
+            except Exception as e:
+                logger.debug(
+                    "[Pipeline] Could not load partial expiry / reference metadata doc_id=%s: %s",
+                    event.doc_id,
+                    e,
+                )
+
     chunking_func = _select_chunking_func(event, rag, file_path)
     chunking_result = await _run_chunking_func(
         chunking_func,
         rag,
         content,
         event.doc_id,
+        extra_kwargs=extra_kwargs,
     )
     if not isinstance(chunking_result, (list, tuple)):
         raise TypeError(

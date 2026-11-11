@@ -61,7 +61,7 @@ async def run_entity_extraction_stage(
 
     original_llm_max_async = rag.llm_model_max_async
     original_addon_params = dict(rag.addon_params)
-    max_async_override = _env_int("PIPELINE_ENTITY_EXTRACTION_MAX_ASYNC", 4)
+    max_async_override = _env_int("PIPELINE_ENTITY_EXTRACTION_MAX_ASYNC", 54)
     if max_async_override > 0:
         rag.llm_model_max_async = min(rag.llm_model_max_async, max_async_override)
     if event.debug_sync or context.debug_sync:

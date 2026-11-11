@@ -299,7 +299,12 @@ async def _extract_with_docling(
         def convert_and_export():
             res = converter.convert(tmp_path)
             md = res.document.export_to_markdown()
-            pages = res.document.num_pages if hasattr(res.document, "num_pages") else 0
+            num_pages_attr = getattr(res.document, "num_pages", 0)
+            pages = (
+                num_pages_attr()
+                if callable(num_pages_attr)
+                else int(num_pages_attr or 0)
+            )
             return md, pages
 
         markdown_content, page_count = await asyncio.to_thread(convert_and_export)

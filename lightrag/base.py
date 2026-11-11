@@ -797,6 +797,7 @@ class DocStatus(str, Enum):
     EXTRACTING = "EXTRACTING"         # Đang extract full text (OCR/Docling)
     EXTRACTED = "EXTRACTED"           # Đã extract xong, chờ chunking + KG
     CHUNKING = "CHUNKING"             # Đang chunking + extract entities
+    PROCESSING = "PROCESSING"         # Đang xử lý
     PROCESSED = "PROCESSED"           # Hoàn thành tất cả
     FAILED = "FAILED"                 # Lỗi ở bất kỳ stage nào
     DUPLICATED = "DUPLICATED"         # Tài liệu trùng lặp về nội dung

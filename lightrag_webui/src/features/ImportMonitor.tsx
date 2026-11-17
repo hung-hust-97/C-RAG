@@ -50,7 +50,9 @@ import {
   ClockIcon,
   ActivityIcon,
   ShieldAlertIcon,
-  FileCode2Icon
+  ZapIcon,
+  Loader2Icon,
+  ArrowRightIcon
 } from 'lucide-react'
 
 // Core pipeline stages for progress tracking
@@ -73,11 +75,28 @@ const STATUS_CONFIGS: Record<string, { label: string; color: string; bg: string;
   FAILED: { label: 'Failed', color: 'text-rose-400', bg: 'bg-rose-500/10', border: 'border-rose-500/20' }
 }
 
+// Helper to format remaining ETA seconds
+const formatEta = (seconds: number): string => {
+  if (!seconds || seconds <= 0 || !isFinite(seconds)) return '-'
+  const d = Math.floor(seconds / 86400)
+  const h = Math.floor((seconds % 86400) / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  if (d > 0) return `${d}d ${h}h`
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m ${seconds % 60}s`
+}
+
 export default function ImportMonitor() {
   const selectedWorkspaceId = useSettingsStore.use.selectedWorkspaceId()
 
   // State: System Telemetry
   const [telemetry, setTelemetry] = useState<SystemResourcesResponse | null>(null)
+  const [throughput, setThroughput] = useState<{
+    done_last_5m: number
+    rate_per_sec: number
+    eta_seconds: number
+  } | null>(null)
+  const [activeStages, setActiveStages] = useState<Record<string, number>>({})
 
   // State: Workspaces
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([])
@@ -89,9 +108,11 @@ export default function ImportMonitor() {
   const [statusCounts, setStatusCounts] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(false)
   const [reprocessing, setReprocessing] = useState(false)
+  const [reprocessingDocId, setReprocessingDocId] = useState<string | null>(null)
 
-  // Filters
+  // Filters & Debounced Search
   const [searchQuery, setSearchQuery] = useState('')
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [docTypeFilter, setDocTypeFilter] = useState<'all' | 'legal' | 'general'>('all')
 
@@ -105,9 +126,20 @@ export default function ImportMonitor() {
   const [streamStatus, setStreamStatus] = useState<'connected' | 'connecting' | 'paused' | 'error'>('connecting')
   const prevStatusCountsRef = useRef<Record<string, number>>({})
 
-  // Detail Modal
+  // Detail Modal & Single Document Stage Runs
   const [selectedDoc, setSelectedDoc] = useState<DocStatusResponse | null>(null)
+  const [selectedDocStageRuns, setSelectedDocStageRuns] = useState<PipelineStageRunResponse[]>([])
+  const [loadingDocStageRuns, setLoadingDocStageRuns] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
+
+  // Debounce search query (350ms)
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery)
+      setCurrentPage(1)
+    }, 350)
+    return () => clearTimeout(handler)
+  }, [searchQuery])
 
   // Load Workspaces
   useEffect(() => {
@@ -129,13 +161,13 @@ export default function ImportMonitor() {
     }
   }, [])
 
-  // Fetch Documents & Active Stage Runs
+  // Fetch Documents & Active Stage Runs (Server-side Paginated & Filtered)
   const fetchDocuments = useCallback(async () => {
     try {
       setLoading(true)
       const targetWorkspace = filterWorkspace === 'all' ? 'all' : filterWorkspace
 
-      // 1. Fetch paginated documents
+      // 1. Fetch paginated documents with search_query
       const docsPromise = getDocumentsPaginated({
         status_filter: statusFilter === 'all' ? undefined : (statusFilter as any),
         page: currentPage,
@@ -144,6 +176,7 @@ export default function ImportMonitor() {
         sort_direction: 'desc',
         workspace_id: targetWorkspace,
         doc_type: docTypeFilter === 'all' ? undefined : docTypeFilter,
+        search_query: debouncedSearchQuery.trim() || undefined
       })
 
       // 2. Fetch stage runs for active stage tracking
@@ -167,7 +200,7 @@ export default function ImportMonitor() {
     } finally {
       setLoading(false)
     }
-  }, [filterWorkspace, statusFilter, currentPage, pageSize, docTypeFilter])
+  }, [filterWorkspace, statusFilter, currentPage, pageSize, docTypeFilter, debouncedSearchQuery])
 
   // Silent document reload when stage progress updates (avoids table flashing)
   const fetchDocumentsSilently = useCallback(async () => {
@@ -181,6 +214,7 @@ export default function ImportMonitor() {
         sort_direction: 'desc',
         workspace_id: targetWorkspace,
         doc_type: docTypeFilter === 'all' ? undefined : docTypeFilter,
+        search_query: debouncedSearchQuery.trim() || undefined
       })
       if (docsRes?.documents) {
         setDocuments(docsRes.documents)
@@ -189,7 +223,7 @@ export default function ImportMonitor() {
     } catch {
       // silent catch for background live refresh
     }
-  }, [filterWorkspace, statusFilter, currentPage, pageSize, docTypeFilter])
+  }, [filterWorkspace, statusFilter, currentPage, pageSize, docTypeFilter, debouncedSearchQuery])
 
   // Server-Sent Events (SSE) Live Push Stream - ZERO CLIENT POLLING
   useEffect(() => {
@@ -265,6 +299,14 @@ export default function ImportMonitor() {
                 const newCounts = payload.status_counts || {}
                 setStatusCounts(newCounts)
 
+                if (payload.active_stages) {
+                  setActiveStages(payload.active_stages)
+                }
+
+                if (payload.throughput) {
+                  setThroughput(payload.throughput)
+                }
+
                 // If documents in flight changed or active documents exist, update document table silently
                 const prevCounts = prevStatusCountsRef.current
                 const countsChanged = JSON.stringify(prevCounts) !== JSON.stringify(newCounts)
@@ -313,7 +355,38 @@ export default function ImportMonitor() {
     }
   }, [streamActive, filterWorkspace, fetchTelemetry, fetchDocuments, fetchDocumentsSilently])
 
-  // Reprocess failed documents action
+  // Fetch document stage runs when modal is opened for a specific document
+  useEffect(() => {
+    if (!selectedDoc) {
+      setSelectedDocStageRuns([])
+      return
+    }
+
+    const fetchDocRuns = async () => {
+      try {
+        setLoadingDocStageRuns(true)
+        const cleanId = selectedDoc.id.replace(/^legal-/, '')
+        const res = await getAllWorkspacesPipelineStageRuns({
+          page: 1,
+          page_size: 20,
+          search: cleanId
+        })
+        if (res && res.runs) {
+          setSelectedDocStageRuns(
+            res.runs.filter((r) => r.doc_id === selectedDoc.id || r.doc_id === cleanId || r.run_id === selectedDoc.id)
+          )
+        }
+      } catch (e) {
+        console.warn('Failed to fetch doc stage runs:', e)
+      } finally {
+        setLoadingDocStageRuns(false)
+      }
+    }
+
+    fetchDocRuns()
+  }, [selectedDoc])
+
+  // Bulk reprocess failed documents action
   const handleReprocessFailed = async () => {
     try {
       setReprocessing(true)
@@ -327,6 +400,25 @@ export default function ImportMonitor() {
       toast.error(`Reprocess error: ${err.message || err}`)
     } finally {
       setReprocessing(false)
+    }
+  }
+
+  // Single document reprocess action
+  const handleReprocessSingle = async (docId: string, docType?: any) => {
+    try {
+      setReprocessingDocId(docId)
+      const isLegal = checkIsLegal({ id: docId, metadata: { doc_type: docType } })
+      const targetType = isLegal ? 'legal' : 'general'
+      const res = await reprocessFailedDocuments([docId], targetType)
+      toast.success(res.message || `Reprocessing triggered for ${docId}`)
+      fetchDocuments()
+      if (selectedDoc?.id === docId) {
+        setSelectedDoc((prev) => (prev ? { ...prev, status: 'CHUNKING' } : null))
+      }
+    } catch (err: any) {
+      toast.error(`Reprocess failed: ${err.message || err}`)
+    } finally {
+      setReprocessingDocId(null)
     }
   }
 
@@ -351,23 +443,6 @@ export default function ImportMonitor() {
     return false
   }
 
-  // Filtered documents by search query and docType
-  const filteredDocuments = useMemo(() => {
-    return documents.filter((doc) => {
-      // Doc type filter
-      const isLegal = checkIsLegal(doc)
-      if (docTypeFilter === 'legal' && !isLegal) return false
-      if (docTypeFilter === 'general' && isLegal) return false
-
-      // Search query
-      if (!searchQuery.trim()) return true
-      const q = searchQuery.toLowerCase()
-      const name = (doc.file_path || doc.id || '').toLowerCase()
-      const errorMsg = (doc.error_msg || '').toLowerCase()
-      return name.includes(q) || doc.id.toLowerCase().includes(q) || errorMsg.includes(q)
-    })
-  }, [documents, searchQuery, docTypeFilter])
-
   // Compute status totals
   const totalDocs = useMemo(() => {
     return Object.values(statusCounts).reduce((acc, curr) => acc + curr, 0)
@@ -381,6 +456,11 @@ export default function ImportMonitor() {
       (statusCounts.CHUNKING || 0)
     )
   }, [statusCounts])
+
+  // Total active pipeline tasks count
+  const totalActiveTasks = useMemo(() => {
+    return Object.values(activeStages).reduce((a, b) => a + b, 0)
+  }, [activeStages])
 
   // Find active stage run for a doc_id
   const getDocStageInfo = (docId: string) => {
@@ -403,7 +483,7 @@ export default function ImportMonitor() {
             </Badge>
           </div>
           <p className="text-xs md:text-sm text-muted-foreground mt-0.5">
-            Real-time pipeline monitoring, ingestion lifecycle status, and system overload protection.
+            Real-time multi-stage ingestion monitor, server load protection, and throughput analytics.
           </p>
         </div>
 
@@ -472,7 +552,7 @@ export default function ImportMonitor() {
               className="h-8 gap-1.5 text-xs shadow-sm shadow-rose-950 transition-all active:scale-[0.98]"
             >
               <RotateCcwIcon className={cn('size-3.5', reprocessing && 'animate-spin')} />
-              Reprocess Failed ({statusCounts.FAILED})
+              Reprocess Failed ({(statusCounts.FAILED || 0).toLocaleString()})
             </Button>
           )}
         </div>
@@ -503,14 +583,14 @@ export default function ImportMonitor() {
             </div>
           )}
 
-          {/* Hardware Gauge Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {/* Hardware & Speed Gauge Grid (5 Cards) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
             {/* CPU Card */}
-            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden">
+            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden transition-all duration-200 hover:border-cyan-500/30">
               <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
                 <span className="flex items-center gap-1.5 font-medium">
                   <CpuIcon className="size-3.5 text-cyan-400" />
-                  CPU Utilization
+                  CPU Usage
                 </span>
                 <span className="font-mono text-muted-foreground">{telemetry.cpu.cores} Cores</span>
               </div>
@@ -527,7 +607,6 @@ export default function ImportMonitor() {
                   Load: {telemetry.cpu.load_avg.join(', ')}
                 </span>
               </div>
-              {/* Progress bar */}
               <div className="w-full bg-secondary/60 h-1.5 rounded-full overflow-hidden mt-2">
                 <div
                   className={cn(
@@ -540,7 +619,7 @@ export default function ImportMonitor() {
             </Card>
 
             {/* RAM Memory Card */}
-            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden">
+            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden transition-all duration-200 hover:border-violet-500/30">
               <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
                 <span className="flex items-center gap-1.5 font-medium">
                   <HardDriveIcon className="size-3.5 text-violet-400" />
@@ -573,7 +652,7 @@ export default function ImportMonitor() {
             </Card>
 
             {/* PostgreSQL Shared Pool Card */}
-            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden">
+            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden transition-all duration-200 hover:border-blue-500/30">
               <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
                 <span className="flex items-center gap-1.5 font-medium">
                   <DatabaseIcon className="size-3.5 text-blue-400" />
@@ -607,8 +686,35 @@ export default function ImportMonitor() {
               </div>
             </Card>
 
-            {/* System Status & Pipeline Health */}
-            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden">
+            {/* Speed & Throughput ETA Card */}
+            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden transition-all duration-200 hover:border-emerald-500/30">
+              <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+                <span className="flex items-center gap-1.5 font-medium">
+                  <ZapIcon className="size-3.5 text-amber-400 fill-amber-400/20" />
+                  Speed & ETA
+                </span>
+                <span className="font-mono text-[10px] text-emerald-400 flex items-center gap-1">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
+                  5m Rolling
+                </span>
+              </div>
+              <div className="flex items-baseline justify-between">
+                <span className="text-2xl font-bold font-mono tracking-tight text-emerald-400">
+                  {throughput?.rate_per_sec ?? 0}
+                  <span className="text-xs text-muted-foreground font-normal ml-1">docs/s</span>
+                </span>
+                <span className="text-[11px] font-mono text-foreground font-semibold">
+                  ETA: {throughput?.eta_seconds ? formatEta(throughput.eta_seconds) : '-'}
+                </span>
+              </div>
+              <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground font-mono">
+                <span>{(throughput?.done_last_5m ?? 0).toLocaleString()} completed (5m)</span>
+                <span className="text-emerald-400/80">~{Math.round((throughput?.rate_per_sec ?? 0) * 60)}/min</span>
+              </div>
+            </Card>
+
+            {/* System Status & Server Health */}
+            <Card className="bg-card/90 border-border/60 p-3.5 relative overflow-hidden transition-all duration-200 hover:border-emerald-500/30">
               <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
                 <span className="flex items-center gap-1.5 font-medium">
                   <ActivityIcon className="size-3.5 text-emerald-400" />
@@ -632,7 +738,7 @@ export default function ImportMonitor() {
                   {telemetry.system_status}
                 </span>
                 <span className="text-xs text-muted-foreground truncate">
-                  {telemetry.system_status === 'HEALTHY' ? 'Normal Operating Range' : 'High Resource Load'}
+                  {telemetry.system_status === 'HEALTHY' ? 'Normal' : 'High Load'}
                 </span>
               </div>
               <p className="text-[11px] text-muted-foreground font-mono mt-2 truncate">
@@ -752,26 +858,87 @@ export default function ImportMonitor() {
         </div>
       </div>
 
-      {/* 4. Filter Toolbar: Search, Doc Type, Workspace */}
+      {/* 4. Live Pipeline Stage Concurrency Flow Bar */}
+      <div className="bg-card/70 border border-border/60 rounded-xl p-3 shadow-sm backdrop-blur-sm">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <ActivityIcon className="size-3.5 text-cyan-400" />
+            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Live Pipeline Stage Concurrency
+            </span>
+          </div>
+          <div className="text-[11px] font-mono text-muted-foreground">
+            <span className="text-cyan-400 font-bold">{totalActiveTasks}</span> active tasks in pipeline
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+          {PIPELINE_STAGES.map((stg, idx) => {
+            const activeCount = activeStages[stg.id] || 0
+            const isRunning = activeCount > 0
+
+            return (
+              <div
+                key={stg.id}
+                className={cn(
+                  'flex flex-col justify-between p-2 rounded-lg border transition-all duration-200',
+                  isRunning
+                    ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-200 shadow-sm'
+                    : 'bg-secondary/30 border-border/40 text-muted-foreground hover:bg-secondary/50'
+                )}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-medium truncate">{stg.label}</span>
+                  {isRunning ? (
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-muted-foreground/40 font-mono">#{idx + 1}</span>
+                  )}
+                </div>
+                <div className="mt-1.5 flex items-baseline justify-between">
+                  <span
+                    className={cn(
+                      'text-lg font-bold font-mono tracking-tight',
+                      isRunning ? 'text-cyan-400' : 'text-foreground/70'
+                    )}
+                  >
+                    {activeCount}
+                  </span>
+                  <span className="text-[10px] font-mono text-muted-foreground">running</span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* 5. Filter Toolbar: Server-Side Search, Doc Type, Workspace */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-card border border-border/60 rounded-xl p-3 shadow-sm">
-        {/* Search input with quick clear */}
+        {/* Search input with debounced server-side query */}
         <div className="relative flex-1 min-w-[200px]">
           <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
           <input
             type="text"
-            placeholder="Search by filename, document ID, or error message..."
+            placeholder="Search across all 580k+ documents by title, ID, or legal code..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full bg-background border border-border/60 rounded-lg pl-9 pr-8 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 text-foreground placeholder:text-muted-foreground"
           />
-          {searchQuery && (
+          {loading && searchQuery ? (
+            <div className="absolute right-2.5 top-1/2 -translate-y-1/2">
+              <Loader2Icon className="size-3.5 animate-spin text-emerald-400" />
+            </div>
+          ) : searchQuery ? (
             <button
               onClick={() => setSearchQuery('')}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground p-0.5"
             >
               <XIcon className="size-3.5" />
             </button>
-          )}
+          ) : null}
         </div>
 
         {/* Document Type Dropdown */}
@@ -779,7 +946,10 @@ export default function ImportMonitor() {
           <label className="text-xs text-muted-foreground whitespace-nowrap">Doc Type:</label>
           <select
             value={docTypeFilter}
-            onChange={(e) => setDocTypeFilter(e.target.value as any)}
+            onChange={(e) => {
+              setDocTypeFilter(e.target.value as any)
+              setCurrentPage(1)
+            }}
             className="bg-background border border-border/60 rounded-lg px-2.5 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
           >
             <option value="all">All Types</option>
@@ -809,22 +979,22 @@ export default function ImportMonitor() {
         </div>
       </div>
 
-      {/* 5. Document List Table */}
+      {/* 6. Document List Table */}
       <Card className="bg-card border-border/60 overflow-hidden shadow-sm flex-1 flex flex-col">
         <div className="overflow-x-auto">
           <Table>
             <TableHeader className="bg-secondary/40">
               <TableRow className="border-border/60 hover:bg-transparent">
-                <TableHead className="w-[40%] text-xs font-semibold">Document / Title</TableHead>
+                <TableHead className="w-[38%] text-xs font-semibold">Document / Title</TableHead>
                 <TableHead className="w-[12%] text-xs font-semibold">Type</TableHead>
-                <TableHead className="w-[15%] text-xs font-semibold">Status & Stage</TableHead>
-                <TableHead className="w-[15%] text-xs font-semibold">Workspace</TableHead>
+                <TableHead className="w-[16%] text-xs font-semibold">Status & Stage</TableHead>
+                <TableHead className="w-[14%] text-xs font-semibold">Workspace</TableHead>
                 <TableHead className="w-[10%] text-xs font-semibold">Updated At</TableHead>
-                <TableHead className="w-[8%] text-xs font-semibold text-right">Actions</TableHead>
+                <TableHead className="w-[10%] text-xs font-semibold text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {loading && filteredDocuments.length === 0 ? (
+              {loading && documents.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6} className="h-48 text-center text-muted-foreground">
                     <div className="flex flex-col items-center justify-center gap-2">
@@ -833,7 +1003,7 @@ export default function ImportMonitor() {
                     </div>
                   </TableCell>
                 </TableRow>
-              ) : filteredDocuments.length === 0 ? (
+              ) : documents.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6} className="h-48 text-center">
                     <div className="flex flex-col items-center justify-center gap-1.5 text-muted-foreground">
@@ -857,7 +1027,7 @@ export default function ImportMonitor() {
                   </TableCell>
                 </TableRow>
               ) : (
-                filteredDocuments.map((doc) => {
+                documents.map((doc) => {
                   const isLegal = checkIsLegal(doc)
                   const statusConf = STATUS_CONFIGS[doc.status] || {
                     label: doc.status,
@@ -964,17 +1134,39 @@ export default function ImportMonitor() {
 
                       {/* Actions */}
                       <TableCell className="py-2.5 text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setSelectedDoc(doc)
-                          }}
-                          className="h-7 text-xs text-muted-foreground hover:text-emerald-400 px-2"
-                        >
-                          View
-                        </Button>
+                        <div className="flex items-center justify-end gap-1">
+                          {doc.status === 'FAILED' && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              disabled={reprocessingDocId === doc.id}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleReprocessSingle(doc.id, (doc as any).metadata?.doc_type)
+                              }}
+                              className="h-7 text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2 gap-1"
+                              title="Reprocess failed document"
+                            >
+                              {reprocessingDocId === doc.id ? (
+                                <Loader2Icon className="size-3 animate-spin" />
+                              ) : (
+                                <RotateCcwIcon className="size-3" />
+                              )}
+                              Retry
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setSelectedDoc(doc)
+                            }}
+                            className="h-7 text-xs text-muted-foreground hover:text-emerald-400 px-2"
+                          >
+                            View
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   )
@@ -987,7 +1179,7 @@ export default function ImportMonitor() {
         {/* Pagination bar */}
         <div className="p-3 border-t border-border/40 flex items-center justify-between bg-card">
           <span className="text-xs text-muted-foreground font-mono">
-            Showing {filteredDocuments.length} of {totalCount.toLocaleString()} items
+            Showing {documents.length} of {totalCount.toLocaleString()} items
           </span>
           <PaginationControls
             currentPage={currentPage}
@@ -1003,30 +1195,41 @@ export default function ImportMonitor() {
         </div>
       </Card>
 
-      {/* 6. Document Inspection Modal */}
+      {/* 7. Document Inspection Modal with Live Stage Progression */}
       {selectedDoc && (
-        <Dialog open={!!selectedDoc} onOpenChange={(open) => !open && setSelectedDoc(null)}>
-          <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto bg-card border-border/80">
+        <Dialog open={!!selectedDoc} onOpenChange={() => setSelectedDoc(null)}>
+          <DialogContent className="max-w-2xl bg-card border-border text-foreground max-h-[88vh] overflow-y-auto">
             <DialogHeader className="border-b border-border/40 pb-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <DialogTitle className="text-base font-bold flex items-center gap-2">
-                  <FileCode2Icon className="size-4 text-emerald-400" />
-                  Document Detail Inspector
+                  <FileTextIcon className="size-4 text-emerald-400" />
+                  Document Inspection: {selectedDoc.file_path ? selectedDoc.file_path.split('/').pop() : selectedDoc.id}
                 </DialogTitle>
                 <Badge
                   variant="outline"
                   className={cn(
                     'text-xs font-mono',
-                    STATUS_CONFIGS[selectedDoc.status]?.color,
                     STATUS_CONFIGS[selectedDoc.status]?.bg,
+                    STATUS_CONFIGS[selectedDoc.status]?.color,
                     STATUS_CONFIGS[selectedDoc.status]?.border
                   )}
                 >
                   {selectedDoc.status}
                 </Badge>
               </div>
-              <DialogDescription className="text-xs text-muted-foreground font-mono truncate">
-                ID: {selectedDoc.id}
+              <DialogDescription className="text-xs font-mono text-muted-foreground mt-1 flex items-center gap-2">
+                <span>ID: {selectedDoc.id}</span>
+                <button
+                  onClick={() => handleCopy(selectedDoc.id, 'modal_doc_id')}
+                  className="hover:text-foreground"
+                  title="Copy Document ID"
+                >
+                  {copiedId === 'modal_doc_id' ? (
+                    <CheckIcon className="size-3 text-emerald-400" />
+                  ) : (
+                    <CopyIcon className="size-3" />
+                  )}
+                </button>
               </DialogDescription>
             </DialogHeader>
 
@@ -1045,31 +1248,59 @@ export default function ImportMonitor() {
                 </div>
               </div>
 
-              {/* Pipeline Stage Progression Sequence */}
+              {/* Real Pipeline Stage Execution Progression Sequence */}
               <div className="p-3 bg-secondary/30 rounded-lg border border-border/40">
-                <span className="font-semibold block mb-2 text-[11px] text-muted-foreground uppercase tracking-wider">
-                  Pipeline Stage Sequence:
-                </span>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {PIPELINE_STAGES.map((stg, idx) => (
-                    <div key={stg.id} className="flex items-center gap-1.5">
-                      <span
+                <div className="flex items-center justify-between mb-2">
+                  <span className="font-semibold text-[11px] text-muted-foreground uppercase tracking-wider">
+                    Pipeline Stage Sequence & Execution:
+                  </span>
+                  {loadingDocStageRuns && (
+                    <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                      <Loader2Icon className="size-3 animate-spin text-emerald-400" />
+                      Loading telemetry...
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-1.5">
+                  {PIPELINE_STAGES.map((stg, idx) => {
+                    const run = selectedDocStageRuns.find((r) => r.stage === stg.id)
+                    const isDone = run?.status === 'done' || selectedDoc.status === 'PROCESSED'
+                    const isRunning = run?.status === 'running'
+                    const isFailed = run?.status === 'failed' || (selectedDoc.status === 'FAILED' && !run && idx === 0)
+
+                    return (
+                      <div
+                        key={stg.id}
                         className={cn(
-                          'text-[10px] font-mono px-2 py-0.5 rounded border',
-                          selectedDoc.status === 'PROCESSED'
-                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                            : selectedDoc.status === 'FAILED'
-                            ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
-                            : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
+                          'flex flex-col p-2 rounded border transition-all text-[11px]',
+                          isDone
+                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                            : isRunning
+                            ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40 shadow-sm animate-pulse'
+                            : isFailed
+                            ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+                            : 'bg-secondary/40 text-muted-foreground border-border/40'
                         )}
                       >
-                        {stg.label}
-                      </span>
-                      {idx < PIPELINE_STAGES.length - 1 && (
-                        <span className="text-muted-foreground/60 text-[10px]">→</span>
-                      )}
-                    </div>
-                  ))}
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="font-semibold truncate">{stg.label}</span>
+                          {isDone && <CheckCircle2Icon className="size-3 shrink-0 text-emerald-400" />}
+                          {isRunning && <Loader2Icon className="size-3 shrink-0 animate-spin text-cyan-400" />}
+                          {isFailed && <AlertTriangleIcon className="size-3 shrink-0 text-rose-400" />}
+                          {!isDone && !isRunning && !isFailed && <ClockIcon className="size-3 shrink-0 text-muted-foreground/50" />}
+                        </div>
+                        <span className="text-[10px] font-mono mt-1 opacity-80 uppercase">
+                          {isRunning ? 'RUNNING' : isDone ? 'COMPLETED' : isFailed ? 'FAILED' : 'PENDING'}
+                        </span>
+                        {run?.updated_at && (
+                          <span className="text-[9px] font-mono opacity-60 truncate">
+                            {new Date(run.updated_at).toLocaleTimeString()}
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
 
@@ -1158,7 +1389,23 @@ export default function ImportMonitor() {
               </div>
             </div>
 
-            <div className="border-t border-border/40 pt-3 flex justify-end">
+            <div className="border-t border-border/40 pt-3 flex justify-between items-center">
+              {selectedDoc.status === 'FAILED' ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={reprocessingDocId === selectedDoc.id}
+                  onClick={() => handleReprocessSingle(selectedDoc.id, (selectedDoc as any).metadata?.doc_type)}
+                  className="text-xs text-rose-400 border-rose-500/30 hover:bg-rose-500/10 gap-1.5"
+                >
+                  {reprocessingDocId === selectedDoc.id ? (
+                    <Loader2Icon className="size-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcwIcon className="size-3.5" />
+                  )}
+                  Reprocess This Document
+                </Button>
+              ) : <div />}
               <Button variant="outline" size="sm" onClick={() => setSelectedDoc(null)} className="text-xs">
                 Close
               </Button>

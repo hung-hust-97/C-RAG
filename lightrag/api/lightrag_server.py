@@ -1573,10 +1573,54 @@ def create_app(args):
                             stage_rows = await db.query(stage_query, [], multirows=True)
                             active_stages = {row["stage"]: int(row["cnt"]) for row in stage_rows} if stage_rows and isinstance(stage_rows, list) else {}
 
+                            # Throughput & ETA metrics (completed documents in the last 5 minutes)
+                            try:
+                                if workspace_id and workspace_id != "all":
+                                    tp_query = """
+                                        SELECT SUM(cnt) as cnt FROM (
+                                            SELECT count(*) as cnt FROM tbl_document WHERE status = 'PROCESSED' AND workspace_id::text = $1 AND update_time >= NOW() - INTERVAL '5 minutes'
+                                            UNION ALL
+                                            SELECT count(*) as cnt FROM tbl_legal_document WHERE process_status = 'PROCESSED' AND workspace_id::text = $1 AND updated_at >= NOW() - INTERVAL '5 minutes'
+                                        ) t
+                                    """
+                                    tp_res = await db.query(tp_query, [workspace_id])
+                                else:
+                                    tp_query = """
+                                        SELECT SUM(cnt) as cnt FROM (
+                                            SELECT count(*) as cnt FROM tbl_document WHERE status = 'PROCESSED' AND update_time >= NOW() - INTERVAL '5 minutes'
+                                            UNION ALL
+                                            SELECT count(*) as cnt FROM tbl_legal_document WHERE process_status = 'PROCESSED' AND updated_at >= NOW() - INTERVAL '5 minutes'
+                                        ) t
+                                    """
+                                    tp_res = await db.query(tp_query, [])
+
+                                done_5m = int(tp_res["cnt"] or 0) if tp_res else 0
+                                rate_per_sec = round(done_5m / 300.0, 2)
+                                pending_docs = (
+                                    status_counts.get("UPLOADING", 0)
+                                    + status_counts.get("EXTRACTING", 0)
+                                    + status_counts.get("EXTRACTED", 0)
+                                    + status_counts.get("CHUNKING", 0)
+                                )
+                                eta_seconds = int(pending_docs / rate_per_sec) if rate_per_sec > 0 and pending_docs > 0 else 0
+                                throughput_data = {
+                                    "done_last_5m": done_5m,
+                                    "rate_per_sec": rate_per_sec,
+                                    "eta_seconds": eta_seconds,
+                                }
+                            except Exception as te:
+                                logger.debug(f"Throughput calculation error: {te}")
+                                throughput_data = {
+                                    "done_last_5m": 0,
+                                    "rate_per_sec": 0.0,
+                                    "eta_seconds": 0,
+                                }
+
                             summary_payload = {
                                 "workspace_id": workspace_id or "all",
                                 "status_counts": status_counts,
                                 "active_stages": active_stages,
+                                "throughput": throughput_data,
                                 "timestamp": int(time.time()),
                             }
                             yield f"event: pipeline\ndata: {json.dumps(summary_payload)}\n\n"

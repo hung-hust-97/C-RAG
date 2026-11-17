@@ -121,6 +121,16 @@ def _shard_rows(rows: list[dict[str, Any]], shard_size: int) -> list[list[dict[s
     return [rows[i : i + shard_size] for i in range(0, len(rows), shard_size)]
 
 
+def _has_extracted_items(results: list[Any]) -> bool:
+    for item in results:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        maybe_nodes, maybe_edges = item[0], item[1]
+        if maybe_nodes or maybe_edges:
+            return True
+    return False
+
+
 async def run_kg_merge_stage(event: PipelineStageEvent, context: Any) -> StageResult:
     stage_started = time.perf_counter()
     rag = await get_rag_for_event(
@@ -138,7 +148,7 @@ async def run_kg_merge_stage(event: PipelineStageEvent, context: Any) -> StageRe
     if max_async_override > 0:
         rag.llm_model_max_async = min(rag.llm_model_max_async, max_async_override)
     try:
-        if extraction_results:
+        if extraction_results and _has_extracted_items(extraction_results):
             merge_started = time.perf_counter()
             merge_result = await merge_nodes_and_edges(
                 chunk_results=extraction_results,
@@ -165,7 +175,7 @@ async def run_kg_merge_stage(event: PipelineStageEvent, context: Any) -> StageRe
             merge_result = None
             merge_seconds = 0.0
             logger.info(
-                "[Pipeline] KG merge has no extraction results for doc_id=%s; "
+                "[Pipeline] KG merge has no extracted entities/relations for doc_id=%s; "
                 "emitting empty KG vector payload",
                 event.doc_id,
             )

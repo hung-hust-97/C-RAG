@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .models import ArtifactRef, StageName, utc_now_iso
+from .s3_throttle import read_body
 
 
 def _json_dumps(data: Any) -> str:
@@ -248,7 +249,7 @@ class S3PipelineArtifactStore(PipelineArtifactStore):
                 async with await self._client() as s3:
                     response = await s3.get_object(Bucket=bucket, Key=key)
                     async with response["Body"] as stream:
-                        return await stream.read()
+                        return await read_body(stream)
             except ClientError as exc:
                 error_code = exc.response.get("Error", {}).get("Code", "")
                 # NoSuchKey is not retryable

@@ -869,6 +869,13 @@ class LightRAG:
                 "legal_status",
                 "legal_status_code",
                 "legal_status_priority",
+                "status",
+                "effective_from",
+                "effective_to",
+                "clause_status",
+                "effective_date",
+                "status_date",
+                "issuance_date",
             },
         )
 

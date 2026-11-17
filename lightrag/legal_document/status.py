@@ -170,7 +170,7 @@ async def load_legal_document_statuses(
                 return
             rows = await connection.fetch(
                 """
-                SELECT id, status::text AS status
+                SELECT id, status::text AS status, document_type::text AS document_type
                 FROM tbl_legal_document
                 WHERE id = ANY($1::bigint[])
                 """,
@@ -180,6 +180,7 @@ async def load_legal_document_statuses(
                 metadata = normalize_legal_document_status(row["status"])
                 if metadata:
                     metadata["legal_document_id"] = str(row["id"])
+                    metadata["document_type"] = row["document_type"] if "document_type" in row and row["document_type"] else ""
                     result[str(row["id"])] = metadata
 
         await db._run_with_retry(_query_db)

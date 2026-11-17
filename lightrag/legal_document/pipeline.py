@@ -47,6 +47,7 @@ def _apply_legal_status_to_chunks(
                         "legal_status",
                         "legal_status_code",
                         "legal_status_priority",
+                        "document_type",
                     )
                     if key in metadata
                 }
@@ -157,7 +158,8 @@ async def extract_legal_entities(
     legal_config.setdefault("addon_params", {})["entity_types"] = (
         DEFAULT_LEGAL_ENTITY_TYPES
     )
-    legal_config.setdefault("addon_params", {})["conditional_gleaning"] = True
+    conditional_gleaning = _env_bool("LEGAL_EXTRACTION_CONDITIONAL_GLEANING", False)
+    legal_config.setdefault("addon_params", {})["conditional_gleaning"] = conditional_gleaning
     doc_id = next(
         (
             chunk.get("full_doc_id")
@@ -233,7 +235,7 @@ async def extract_legal_entities(
                 prompt_prefix="legal_entity_extraction",
                 structured_response_format=LegalExtractionResult,
                 force_directed_relations=True,
-                conditional_gleaning=True,
+                conditional_gleaning=conditional_gleaning,
             )
         except Exception as exc:
             error_count += 1

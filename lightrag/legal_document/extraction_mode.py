@@ -195,13 +195,62 @@ def _looks_like_table_or_appendix(text: str) -> bool:
     return pipe_count >= 12 and pipe_count / line_count >= 2
 
 
+DEFAULT_LLM_LEGAL_DOC_TYPES = {
+    "LUAT",
+    "BO_LUAT",
+    "HIEN_PHAP",
+    "NGHI_DINH",
+    "THONG_TU",
+    "THONG_TU_LIEN_TICH",
+    "PHAP_LENH",
+    "VAN_BAN_HOP_NHAT",
+    "SAC_LENH",
+    "SAC_LUAT",
+    "LENH",
+}
+
+NORMALIZE_DOC_TYPE_MAP = {
+    "LUẬT": "LUAT",
+    "BỘ LUẬT": "BO_LUAT",
+    "HIẾN PHÁP": "HIEN_PHAP",
+    "NGHỊ ĐỊNH": "NGHI_DINH",
+    "THÔNG TƯ": "THONG_TU",
+    "THÔNG TƯ LIÊN TỊCH": "THONG_TU_LIEN_TICH",
+    "PHÁP LỆNH": "PHAP_LENH",
+    "VĂN BẢN HỢP NHẤT": "VAN_BAN_HOP_NHAT",
+    "SẮC LỆNH": "SAC_LENH",
+    "SẮC LUẬT": "SAC_LUAT",
+    "LỆNH": "LENH",
+    "QUYẾT ĐỊNH": "QUYET_DINH",
+    "CÔNG VĂN": "CONG_VAN",
+    "KẾ HOẠCH": "KE_HOACH",
+    "THÔNG BÁO": "THONG_BAO",
+    "CHỈ THỊ": "CHI_THI",
+    "NGHỊ QUYẾT": "NGHI_QUYET",
+}
+
+
+def normalize_legal_document_type(raw_type: Any) -> str:
+    if not raw_type:
+        return ""
+    cleaned = str(raw_type).strip().upper()
+    return NORMALIZE_DOC_TYPE_MAP.get(cleaned, cleaned)
+
+
+def get_llm_legal_doc_types() -> set[str]:
+    raw = os.getenv("LEGAL_LLM_DOC_TYPES")
+    if raw:
+        return {normalize_legal_document_type(item) for item in raw.split(",") if item.strip()}
+    return DEFAULT_LLM_LEGAL_DOC_TYPES
+
+
 def classify_extraction_mode(
     doc_meta: dict[str, Any] | None,
     chunk_text: str,
 ) -> ExtractionMode:
     metadata = legal_extraction_metadata(None, doc_meta)
     text = (chunk_text or "").casefold()
-    min_chars = _env_int("LEGAL_EXTRACTION_MIN_LLM_CHARS", 300)
+    min_chars = _env_int("LEGAL_EXTRACTION_MIN_LLM_CHARS", 500)
 
     if _skip_kg_by_metadata(metadata):
         return ExtractionMode.VECTOR_ONLY
@@ -219,6 +268,23 @@ def classify_extraction_mode(
         return ExtractionMode.VECTOR_ONLY
 
     if _looks_like_table_or_appendix(text):
+        return ExtractionMode.VECTOR_ONLY
+
+    # Stratified Legal Extraction:
+    # Core normative legal acts (Luật, Nghị định, Thông tư...) undergo full KG LLM extraction.
+    # Routine administrative documents (Công văn, Quyết định, Kế hoạch, Thông báo...)
+    # are routed to high-speed rule-based KG (Điều, Khoản, Cơ quan, Số hiệu on CPU) or VECTOR_ONLY.
+    raw_doc_type = _metadata_value(
+        metadata,
+        "document_type",
+        "doc_type_code",
+        "legal_document_type",
+        "doc_type",
+    )
+    doc_type_code = normalize_legal_document_type(raw_doc_type)
+    if doc_type_code and doc_type_code not in get_llm_legal_doc_types():
+        if RULE_SIGNAL_RE.search(text):
+            return ExtractionMode.KG_RULE_ONLY
         return ExtractionMode.VECTOR_ONLY
 
     if any(word in text for word in LEGAL_SIGNAL_WORDS):

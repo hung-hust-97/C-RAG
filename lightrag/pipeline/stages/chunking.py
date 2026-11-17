@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dt_time, timezone
 from functools import partial
 from typing import Any
 
@@ -12,6 +12,7 @@ from lightrag.operate import select_chunking_function
 from lightrag.utils import compute_mdhash_id, logger
 
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
+from lightrag.pipeline.s3_throttle import read_body
 
 from .common import chunks_to_rows, get_rag_for_event
 
@@ -37,6 +38,29 @@ def _is_terminal_success_status(status: Any) -> bool:
     return _normalize_status(status) in TERMINAL_SUCCESS_STATUSES
 
 
+def _to_unix_timestamp(val: Any) -> int:
+    if not val:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, datetime):
+        return int(val.replace(tzinfo=timezone.utc).timestamp())
+    if isinstance(val, date):
+        return int(datetime.combine(val, dt_time.min, tzinfo=timezone.utc).timestamp())
+    if isinstance(val, str):
+        val = val.strip()
+        if not val or val == "None" or val == "0":
+            return 0
+        if val.isdigit():
+            return int(val)
+        try:
+            dt = datetime.fromisoformat(val)
+            return int(dt.replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            return 0
+    return 0
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -48,6 +72,36 @@ def _env_int(name: str, default: int) -> int:
             default,
         )
         return default
+
+
+def _extract_legal_document_id(event: PipelineStageEvent) -> int | None:
+    val = event.metadata.get("legal_document_id")
+    if val is not None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+
+    for candidate in (event.doc_id, event.run_id):
+        if not candidate:
+            continue
+        c_str = str(candidate).strip()
+        if c_str.isdigit():
+            return int(c_str)
+        if c_str.startswith("legal-"):
+            suffix = c_str.removeprefix("legal-")
+            if suffix.isdigit():
+                return int(suffix)
+
+    for path_key in ("content_path", "file_path", "document_name"):
+        path_val = event.metadata.get(path_key)
+        if path_val and isinstance(path_val, str):
+            import re
+            m = re.search(r"/(\d+)(?:/\1)?\.(?:html|htm|md|txt)$", path_val)
+            if m:
+                return int(m.group(1))
+
+    return None
 
 
 def _ensure_event_doc_id(event: PipelineStageEvent) -> None:
@@ -101,7 +155,7 @@ async def _read_s3_text(object_key: str) -> str:
         try:
             response = await s3.get_object(Bucket=bucket, Key=object_key)
             async with response["Body"] as stream:
-                return (await stream.read()).decode("utf-8")
+                return (await read_body(stream)).decode("utf-8")
         except ClientError as exc:
             raise FileNotFoundError(
                 f"Document artifact not found: s3://{bucket}/{object_key}"
@@ -182,8 +236,11 @@ async def _load_content(event: PipelineStageEvent, context: Any, rag: Any) -> st
         "file_path"
     )
     workspace_name = event.metadata.get("workspace_name") or event.workspace_id
-    doc_type = event.metadata.get("doc_type", "general")
-    legal_document_id = event.metadata.get("legal_document_id")
+    doc_type = event.metadata.get("doc_type") or event.doc_type or ("legal" if os.environ.get("PIPELINE_DOC_TYPE") == "legal" else "general")
+    legal_document_id = _extract_legal_document_id(event)
+    if legal_document_id is not None:
+        doc_type = "legal"
+        event.metadata["legal_document_id"] = legal_document_id
 
     if doc_type == "legal":
         if legal_document_id is None:
@@ -266,8 +323,12 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
         or event.metadata.get("object_key")
         or event.doc_id
     )
-    doc_type = event.metadata.get("doc_type", "general")
-    legal_document_id = event.metadata.get("legal_document_id")
+    doc_type = event.metadata.get("doc_type") or event.doc_type or ("legal" if os.environ.get("PIPELINE_DOC_TYPE") == "legal" else "general")
+    legal_document_id = _extract_legal_document_id(event)
+    if legal_document_id is not None:
+        doc_type = "legal"
+        event.metadata["legal_document_id"] = legal_document_id
+
     content = await _load_content(event, context, rag)
     if not content.strip():
         raise ValueError(f"Document content is empty for doc_id={event.doc_id}")
@@ -275,15 +336,23 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
     extra_kwargs = {}
     if doc_type == "legal" and legal_document_id is not None:
         db = getattr(getattr(rag, "doc_status", None), "db", None)
+        if db is None:
+            try:
+                from lightrag.kg.postgres_impl import ClientManager
+                db = await ClientManager.get_client()
+            except Exception:
+                db = None
+
         if db is not None:
             try:
                 from lightrag.kg.postgres_impl import to_uuid
+                from lightrag.legal_document.status import normalize_legal_document_status
 
                 legal_row = None
                 if event.workspace_id:
                     try:
                         legal_row = await db.query(
-                            'SELECT status, lien_quan_hieu_luc_tung_phan, lien_quan_dan_chieu, document_code, title FROM "tbl_legal_document" WHERE workspace_id=$1 AND id=$2',
+                            'SELECT status, lien_quan_hieu_luc_tung_phan, lien_quan_dan_chieu, document_code, title, document_type, effective_date, status_date, issuance_date FROM "tbl_legal_document" WHERE workspace_id=$1 AND id=$2',
                             [to_uuid(event.workspace_id), int(legal_document_id)],
                         )
                     except Exception:
@@ -291,12 +360,20 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
 
                 if not legal_row:
                     legal_row = await db.query(
-                        'SELECT status, lien_quan_hieu_luc_tung_phan, lien_quan_dan_chieu, document_code, title FROM "tbl_legal_document" WHERE id=$1',
+                        'SELECT status, lien_quan_hieu_luc_tung_phan, lien_quan_dan_chieu, document_code, title, document_type, effective_date, status_date, issuance_date FROM "tbl_legal_document" WHERE id=$1',
                         [int(legal_document_id)],
                     )
 
                 if legal_row:
-                    extra_kwargs["legal_status"] = legal_row.get("status")
+                    raw_status = legal_row.get("status")
+                    norm_status = normalize_legal_document_status(raw_status)
+                    doc_status_code = norm_status.get("legal_status_code") or (
+                        str(raw_status).upper() if raw_status else "UNKNOWN"
+                    )
+
+                    extra_kwargs["legal_status"] = norm_status.get("legal_status") or raw_status
+                    extra_kwargs["legal_status_code"] = doc_status_code
+                    extra_kwargs["legal_status_priority"] = norm_status.get("legal_status_priority", 40)
                     extra_kwargs["lien_quan_hieu_luc_tung_phan"] = legal_row.get(
                         "lien_quan_hieu_luc_tung_phan"
                     )
@@ -307,6 +384,28 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
                         extra_kwargs["document_number"] = legal_row.get("document_code")
                     if legal_row.get("title"):
                         extra_kwargs["document_title"] = legal_row.get("title")
+                    if legal_row.get("document_type"):
+                        extra_kwargs["document_type"] = legal_row.get("document_type")
+
+                    eff_date = legal_row.get("effective_date")
+                    iss_date = legal_row.get("issuance_date")
+                    stat_date = legal_row.get("status_date")
+                    extra_kwargs["effective_date"] = eff_date
+                    extra_kwargs["issuance_date"] = iss_date
+                    extra_kwargs["status_date"] = stat_date
+
+                    effective_from = _to_unix_timestamp(eff_date or iss_date)
+                    effective_to = 0
+                    if doc_status_code in (
+                        "EXPIRED",
+                        "EXPIRED_TOTALLY",
+                        "HET_HIEU_LUC",
+                        "CEASED_EFFECT",
+                        "NO_LONGER_SUITABLE",
+                    ):
+                        effective_to = _to_unix_timestamp(stat_date)
+                    extra_kwargs["effective_from"] = effective_from
+                    extra_kwargs["effective_to"] = effective_to
             except Exception as e:
                 logger.debug(
                     "[Pipeline] Could not load partial expiry / reference metadata doc_id=%s: %s",
@@ -328,10 +427,26 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
         )
 
     chunks: dict[str, dict[str, Any]] = {}
+    from lightrag.legal_document.status import normalize_legal_document_status
+
     for index, chunk in enumerate(chunking_result):
         if "chunk_order_index" not in chunk:
             chunk["chunk_order_index"] = index
         chunk_id = _compute_chunk_id(chunk["content"], event)
+
+        chunk_status = (
+            chunk.get("clause_status")
+            or extra_kwargs.get("legal_status_code")
+            or extra_kwargs.get("legal_status")
+            or "UNKNOWN"
+        )
+        if chunk_status and isinstance(chunk_status, str):
+            norm = normalize_legal_document_status(chunk_status)
+            chunk_status = norm.get("legal_status_code") or chunk_status
+
+        chunk_eff_from = chunk.get("effective_from") or extra_kwargs.get("effective_from", 0)
+        chunk_eff_to = chunk.get("effective_to") or extra_kwargs.get("effective_to", 0)
+
         chunks[chunk_id] = {
             **chunk,
             "full_doc_id": event.doc_id,
@@ -339,6 +454,15 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
             "doc_type": doc_type,
             "llm_cache_list": [],
             "legal_document_id": legal_document_id,
+            "document_type": chunk.get("document_type") or extra_kwargs.get("document_type") or "",
+            "status": chunk_status,
+            "legal_status_code": chunk_status,
+            "legal_status": extra_kwargs.get("legal_status") or chunk_status,
+            "effective_from": _to_unix_timestamp(chunk_eff_from),
+            "effective_to": _to_unix_timestamp(chunk_eff_to),
+            "effective_date": str(extra_kwargs.get("effective_date") or ""),
+            "status_date": str(extra_kwargs.get("status_date") or ""),
+            "issuance_date": str(extra_kwargs.get("issuance_date") or ""),
         }
 
     if not chunks:

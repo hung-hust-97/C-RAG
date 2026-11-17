@@ -2150,6 +2150,7 @@ class PGDocStatusStorage(DocStatusStorage):
         sort_field: str = "updated_at",
         sort_direction: str = "desc",
         doc_type: str | None = None,
+        search_query: str | None = None,
     ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
         """Get documents with pagination support from both tbl_document and tbl_legal_document
 
@@ -2277,10 +2278,20 @@ class PGDocStatusStorage(DocStatusStorage):
         else:
             unified_sql_base = f"WITH all_docs AS ({doc_cte} UNION ALL {legal_cte})"
 
+        # Optional search filter across document_id, document_name, and document_code
+        search_filter_clause = ""
+        if search_query and search_query.strip():
+            param_count += 1
+            params["search_query"] = f"%{search_query.strip()}%"
+            search_filter_clause = (
+                f"WHERE (document_id ILIKE ${param_count} OR document_name ILIKE ${param_count} OR COALESCE(document_code, '') ILIKE ${param_count})"
+            )
+
         # Query for total count
         count_sql = f"""
             {unified_sql_base}
             SELECT COUNT(*) as total FROM all_docs
+            {search_filter_clause}
         """
         count_result = await self.db.query(count_sql, list(params.values()))
         total_count = count_result["total"] if count_result else 0
@@ -2289,6 +2300,7 @@ class PGDocStatusStorage(DocStatusStorage):
         data_sql = f"""
             {unified_sql_base}
             SELECT * FROM all_docs
+            {search_filter_clause}
             {order_clause}
             LIMIT ${param_count + 1} OFFSET ${param_count + 2}
         """

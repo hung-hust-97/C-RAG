@@ -220,6 +220,7 @@ export type DocumentsRequest = {
   sort_direction: 'asc' | 'desc'
   workspace_id?: string
   doc_type?: 'all' | 'legal' | 'general'
+  search_query?: string
 }
 
 export type PaginationInfo = {

@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+from datetime import date, datetime, time as dt_time, timezone
 from contextlib import contextmanager
 from typing import Any, final, Optional, Dict, Callable, ClassVar, Iterator
 from dataclasses import dataclass, fields
@@ -11,6 +12,7 @@ from lightrag.utils import logger, compute_mdhash_id
 from ..base import BaseVectorStorage
 from ..constants import DEFAULT_MAX_FILE_PATH_LENGTH
 from ..kg.shared_storage import get_data_init_lock
+from ..legal_document.status import normalize_legal_document_status
 import pipmaster as pm
 
 if not pm.is_installed("pymilvus"):
@@ -51,6 +53,29 @@ SUPPORTED_REFINE_TYPES = {"SQ6", "SQ8", "BF16", "FP16", "FP32"}
 INDEX_VERSION_REQUIREMENTS = {
     "HNSW_SQ": "2.6.8",  # HNSW_SQ requires Milvus 2.6.8+ (supports sq_types such as SQ4U, SQ6, SQ8, BF16, FP16)
 }
+
+
+def _to_unix_timestamp(val: Any) -> int:
+    if not val:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, datetime):
+        return int(val.replace(tzinfo=timezone.utc).timestamp())
+    if isinstance(val, date):
+        return int(datetime.combine(val, dt_time.min, tzinfo=timezone.utc).timestamp())
+    if isinstance(val, str):
+        val = val.strip()
+        if not val or val == "None" or val == "0":
+            return 0
+        if val.isdigit():
+            return int(val)
+        try:
+            dt = datetime.fromisoformat(val)
+            return int(dt.replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            return 0
+    return 0
 
 
 def _get_env_bool(key: str, default: bool = False) -> bool:
@@ -2000,7 +2025,27 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
         self.cosine_better_than_threshold = cosine_threshold
 
-        # Ensure created_at and workspace_id are in meta_fields
+        # Ensure schema fields and chunk metadata are always in meta_fields
+        chunk_schema_fields = {
+            "status",
+            "effective_from",
+            "effective_to",
+            "legal_status",
+            "legal_status_code",
+            "clause_status",
+            "effective_date",
+            "status_date",
+            "issuance_date",
+            "chunk_id",
+            "entity_id",
+            "entity_name",
+            "entity_type",
+            "src_id",
+            "tgt_id",
+            "keywords",
+            "weight",
+        }
+        self.meta_fields.update(chunk_schema_fields)
         if "created_at" not in self.meta_fields:
             self.meta_fields.add("created_at")
         if "workspace_id" not in self.meta_fields:
@@ -2095,7 +2140,23 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "created_at": current_time,
                 "workspace_id": self.workspace,
             }
-            meta_dict = {k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields or k1 in ["entity_id", "chunk_id"]}
+            meta_dict = {
+                k1: v1 for k1, v1 in v.items()
+                if k1 in self.meta_fields
+                or k1 in [
+                    "entity_id",
+                    "chunk_id",
+                    "status",
+                    "effective_from",
+                    "effective_to",
+                    "legal_status",
+                    "legal_status_code",
+                    "clause_status",
+                    "effective_date",
+                    "status_date",
+                    "issuance_date",
+                ]
+            }
             
             # Enforce dynamic field size limit (~65536 bytes)
             # 1. Truncate specific known fields first
@@ -2187,12 +2248,24 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     del d["doc_id"]
                 d["chunk_id"] = d.get("id")
                 
-                if "status" not in d or d["status"] is None:
-                    d["status"] = d.get("legal_status_code") or "UNKNOWN"
-                if "effective_from" not in d or d["effective_from"] is None:
-                    d["effective_from"] = 0
-                if "effective_to" not in d or d["effective_to"] is None:
-                    d["effective_to"] = 0
+                chunk_status = (
+                    d.get("status")
+                    or d.get("clause_status")
+                    or d.get("legal_status_code")
+                    or d.get("legal_status")
+                )
+                if not chunk_status:
+                    chunk_status = "UNKNOWN"
+                elif isinstance(chunk_status, str) and chunk_status.strip():
+                    norm = normalize_legal_document_status(chunk_status)
+                    chunk_status = norm.get("legal_status_code") or chunk_status
+                d["status"] = chunk_status
+                d["effective_from"] = _to_unix_timestamp(
+                    d.get("effective_from") or d.get("effective_date")
+                )
+                d["effective_to"] = _to_unix_timestamp(
+                    d.get("effective_to") or d.get("status_date")
+                )
             elif self.namespace.endswith("entities"):
                 col_name = "legal_entities" if is_legal else "general_entities"
                 d["entity_id"] = d.get("id")
@@ -2268,7 +2341,23 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "workspace_id": self.workspace,
             }
             
-            meta_dict = {k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields}
+            meta_dict = {
+                k1: v1 for k1, v1 in v.items()
+                if k1 in self.meta_fields
+                or k1 in [
+                    "entity_id",
+                    "chunk_id",
+                    "status",
+                    "effective_from",
+                    "effective_to",
+                    "legal_status",
+                    "legal_status_code",
+                    "clause_status",
+                    "effective_date",
+                    "status_date",
+                    "issuance_date",
+                ]
+            }
             
             for field in ["entity_name", "src_id", "tgt_id"]:
                 if field in meta_dict and isinstance(meta_dict[field], str):
@@ -2348,12 +2437,24 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     del d["doc_id"]
                 d["chunk_id"] = d.get("id")
                 
-                if "status" not in d or d["status"] is None:
-                    d["status"] = d.get("legal_status_code") or "UNKNOWN"
-                if "effective_from" not in d or d["effective_from"] is None:
-                    d["effective_from"] = 0
-                if "effective_to" not in d or d["effective_to"] is None:
-                    d["effective_to"] = 0
+                chunk_status = (
+                    d.get("status")
+                    or d.get("clause_status")
+                    or d.get("legal_status_code")
+                    or d.get("legal_status")
+                )
+                if not chunk_status:
+                    chunk_status = "UNKNOWN"
+                elif isinstance(chunk_status, str) and chunk_status.strip():
+                    norm = normalize_legal_document_status(chunk_status)
+                    chunk_status = norm.get("legal_status_code") or chunk_status
+                d["status"] = chunk_status
+                d["effective_from"] = _to_unix_timestamp(
+                    d.get("effective_from") or d.get("effective_date")
+                )
+                d["effective_to"] = _to_unix_timestamp(
+                    d.get("effective_to") or d.get("status_date")
+                )
             elif self.namespace.endswith("entities"):
                 col_name = "legal_entities" if is_legal else "general_entities"
                 d["entity_id"] = d.get("id")

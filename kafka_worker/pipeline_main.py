@@ -138,6 +138,7 @@ PARALLEL_MESSAGE_STAGES = {
     StageName.CHUNKING,
     StageName.CHUNK_EMBEDDING,
     StageName.ENTITY_EXTRACTION,
+    StageName.KG_MERGE,
     StageName.KG_EMBEDDING,
     StageName.FINALIZE,
 }
@@ -147,7 +148,7 @@ DEFAULT_MAX_RECORDS_BY_STAGE = {
     StageName.CHUNKING: 4,
     StageName.CHUNK_EMBEDDING: 4,
     StageName.ENTITY_EXTRACTION: 4,
-    StageName.KG_MERGE: 2,
+    StageName.KG_MERGE: 4,
     StageName.KG_EMBEDDING: 4,
     StageName.FINALIZE: 8,
 }
@@ -729,6 +730,106 @@ def _apply_legal_pause(
     return set()
 
 
+class _IdleSleepController:
+    """Adaptive idle sleep & cache eviction when a worker's Kafka queue is empty."""
+
+    def __init__(
+        self,
+        *,
+        stage_name: str,
+        sleep_after_seconds: float,
+        sleep_interval_seconds: float,
+        idle_poll_timeout_ms: int,
+        release_cache_after_seconds: float,
+    ) -> None:
+        self.stage_name = stage_name
+        self.sleep_after_seconds = max(0.0, sleep_after_seconds)
+        self.sleep_interval_seconds = max(0.0, sleep_interval_seconds)
+        self.idle_poll_timeout_ms = max(1000, idle_poll_timeout_ms)
+        self.release_cache_after_seconds = max(0.0, release_cache_after_seconds)
+        self._idle_since: float | None = None
+        self.sleeping = False
+        self.cache_released = False
+
+    def poll_timeout_ms(self, default_ms: int = 1000) -> int:
+        return self.idle_poll_timeout_ms if self.sleeping else default_ms
+
+    def observe_active(self, now: float | None = None) -> None:
+        if self.sleeping:
+            idle_dur = (
+                (now if now is not None else time.monotonic()) - self._idle_since
+                if self._idle_since is not None
+                else 0.0
+            )
+            logger.info(
+                "[Pipeline] Worker waking up from idle sleep stage=%s idle_seconds=%.1f",
+                self.stage_name,
+                idle_dur,
+            )
+        self._idle_since = None
+        self.sleeping = False
+        self.cache_released = False
+
+    async def observe_idle(
+        self,
+        shutdown_event: asyncio.Event,
+        *,
+        release_cache_fn=None,
+        now: float | None = None,
+    ) -> None:
+        ts = now if now is not None else time.monotonic()
+        if self._idle_since is None:
+            self._idle_since = ts
+            return
+        idle_dur = ts - self._idle_since
+        if self.sleep_after_seconds > 0 and not self.sleeping and idle_dur >= self.sleep_after_seconds:
+            self.sleeping = True
+            logger.info(
+                "[Pipeline] Worker entering idle sleep mode stage=%s idle_seconds=%.1f poll_timeout_ms=%s sleep_seconds=%.1f",
+                self.stage_name,
+                idle_dur,
+                self.idle_poll_timeout_ms,
+                self.sleep_interval_seconds,
+            )
+        if (
+            self.release_cache_after_seconds > 0
+            and not self.cache_released
+            and idle_dur >= self.release_cache_after_seconds
+            and release_cache_fn is not None
+        ):
+            self.cache_released = True
+            logger.info(
+                "[Pipeline] Releasing cached RAG instances after idle stage=%s idle_seconds=%.1f",
+                self.stage_name,
+                idle_dur,
+            )
+            await release_cache_fn()
+        if self.sleeping and self.sleep_interval_seconds > 0 and not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), timeout=self.sleep_interval_seconds
+                )
+            except asyncio.TimeoutError:
+                pass
+
+
+def _create_idle_controller(stage: StageName, max_poll_interval_ms: int) -> _IdleSleepController:
+    sleep_after = float(os.getenv("PIPELINE_IDLE_SLEEP_AFTER_SECONDS", "60"))
+    sleep_interval = float(os.getenv("PIPELINE_IDLE_SLEEP_SECONDS", "10"))
+    idle_poll_ms = int(os.getenv("PIPELINE_IDLE_POLL_TIMEOUT_MS", "10000"))
+    # Keep poll + sleep safely below max_poll_interval_ms to avoid consumer rebalance
+    safe_cap_ms = max(1000, max_poll_interval_ms // 4)
+    idle_poll_ms = min(idle_poll_ms, safe_cap_ms)
+    release_after = float(os.getenv("PIPELINE_IDLE_RELEASE_CACHE_AFTER_SECONDS", "300"))
+    return _IdleSleepController(
+        stage_name=stage.value,
+        sleep_after_seconds=sleep_after,
+        sleep_interval_seconds=sleep_interval,
+        idle_poll_timeout_ms=idle_poll_ms,
+        release_cache_after_seconds=release_after,
+    )
+
+
 async def _consume_loop(
     consumer: AIOKafkaConsumer,
     stage: StageName,
@@ -754,6 +855,7 @@ async def _consume_loop(
         timeout_config["request_timeout_ms"],
     )
     gate = _create_priority_gate(stage)
+    idle_ctrl = _create_idle_controller(stage, timeout_config["max_poll_interval_ms"])
     legal_topic = STAGE_TOPICS[stage]["legal"]
     legal_paused: set = set()
     while not shutdown_event.is_set():
@@ -762,7 +864,9 @@ async def _consume_loop(
                 legal_paused = _apply_legal_pause(
                     consumer, legal_topic, legal_paused, gate.should_pause_legal()
                 )
-            result = await consumer.getmany(timeout_ms=1000, max_records=max_records)
+            result = await consumer.getmany(
+                timeout_ms=idle_ctrl.poll_timeout_ms(1000), max_records=max_records
+            )
             if gate is not None:
                 gate.observe(
                     has_general=any(
@@ -770,8 +874,13 @@ async def _consume_loop(
                         for tp, messages in result.items()
                     )
                 )
-            if not result:
+            has_messages = any(bool(messages) for messages in result.values())
+            if not has_messages:
+                await idle_ctrl.observe_idle(
+                    shutdown_event, release_cache_fn=close_cached_rag_instances
+                )
                 continue
+            idle_ctrl.observe_active()
 
             for tp, messages in _general_first(result, legal_topic):
                 if parallel_messages:

@@ -797,6 +797,9 @@ class DocumentsRequest(BaseModel):
     doc_type: Optional[Literal["all", "legal", "general"]] = Field(
         default=None, description="Filter by document type ('all', 'legal', 'general')"
     )
+    search_query: Optional[str] = Field(
+        default=None, description="Search term matching title, document_id, or document_code"
+    )
 
     @field_validator("status_filter", mode="before")
     @classmethod
@@ -4867,6 +4870,7 @@ def create_document_routes(
                     sort_field=request.sort_field,
                     sort_direction=request.sort_direction,
                     doc_type=request.doc_type,
+                    search_query=request.search_query,
                 )
                 status_counts_task = current_rag.doc_status.get_all_status_counts()
 

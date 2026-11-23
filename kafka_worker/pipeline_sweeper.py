@@ -632,8 +632,11 @@ async def sweep_orphaned_documents(table_name: str = "lightrag_pipeline_stage_ru
     Kafka delivery failure, or pending records stuck in DB).
     """
     db = await _get_db()
+    # Must exceed the worst-case Kafka queue latency: a pending record whose event
+    # is still waiting in the topic is not orphaned, and republishing it every few
+    # minutes floods the topic with duplicates.
     stuck_pending_seconds = int(
-        os.getenv("PIPELINE_SWEEPER_PENDING_STUCK_THRESHOLD_SECONDS", "300")
+        os.getenv("PIPELINE_SWEEPER_PENDING_STUCK_THRESHOLD_SECONDS", "21600")
     )
     batch_size = int(os.getenv("PIPELINE_SWEEPER_ORPHANED_BATCH_SIZE", "1000"))
     
@@ -806,8 +809,11 @@ async def sweep_orphaned_kg_embedding_documents(
     kg_embedding event was lost or dropped.
     """
     db = await _get_db()
+    # Must exceed the worst-case Kafka queue latency: a pending record whose event
+    # is still waiting in the topic is not orphaned, and republishing it every few
+    # minutes floods the topic with duplicates.
     stuck_pending_seconds = int(
-        os.getenv("PIPELINE_SWEEPER_PENDING_STUCK_THRESHOLD_SECONDS", "300")
+        os.getenv("PIPELINE_SWEEPER_PENDING_STUCK_THRESHOLD_SECONDS", "21600")
     )
     batch_size = int(os.getenv("PIPELINE_SWEEPER_ORPHANED_BATCH_SIZE", "1000"))
 
@@ -865,13 +871,14 @@ async def sweep_orphaned_kg_embedding_documents(
             except Exception:
                 art_list = []
 
-        payload_uri = None
-        for item in art_list:
-            if isinstance(item, dict) and item.get("kind") == "kg_vector_payload" and item.get("uri"):
-                payload_uri = item["uri"]
-                break
-
-        if not payload_uri:
+        payload_artifacts = [
+            item
+            for item in art_list
+            if isinstance(item, dict)
+            and item.get("kind") == "kg_vector_payload"
+            and item.get("uri")
+        ]
+        if not payload_artifacts:
             continue
 
         raw_doc_type = str(row.get("doc_type") or "").lower()
@@ -884,33 +891,50 @@ async def sweep_orphaned_kg_embedding_documents(
         )
         canonical_doc_type = "legal" if is_legal else "general"
 
-        meta = {
-            "kg_vector_payload_artifact_uri": payload_uri,
-            "doc_type": canonical_doc_type,
-        }
-        if legal_doc_id is not None:
-            meta["legal_document_id"] = legal_doc_id
-        if row.get("document_name"):
-            meta["document_name"] = row.get("document_name")
-        if row.get("file_path"):
-            meta["file_path"] = row.get("file_path")
+        # kg_merge may split the vector payload into several shards; recover all of
+        # them, otherwise shards 2..N are never embedded.
+        for position, artifact in enumerate(payload_artifacts):
+            art_meta = artifact.get("metadata") or {}
+            shard_index = int(art_meta.get("shard_index", position))
+            shard_count = int(art_meta.get("shard_count", len(payload_artifacts)))
+            payload_uri = artifact["uri"]
 
-        event = PipelineStageEvent(
-            run_id=run_id,
-            stage=StageName.KG_EMBEDDING,
-            shard_index=0,
-            shard_count=1,
-            workspace_id=workspace_id,
-            doc_id=doc_id,
-            doc_type=canonical_doc_type,
-            attempt=1,
-            artifact_uri=payload_uri,
-            metadata=meta,
-        )
-        events.append(event)
-        event_rows.append((run_id, workspace_id, doc_id, event.model_dump_json()))
+            meta = {
+                "kg_vector_payload_artifact_uri": payload_uri,
+                "doc_type": canonical_doc_type,
+            }
+            if legal_doc_id is not None:
+                meta["legal_document_id"] = legal_doc_id
+            if row.get("document_name"):
+                meta["document_name"] = row.get("document_name")
+            if row.get("file_path"):
+                meta["file_path"] = row.get("file_path")
 
-    for run_id, workspace_id, doc_id, event_json_str in event_rows:
+            event = PipelineStageEvent(
+                run_id=run_id,
+                stage=StageName.KG_EMBEDDING,
+                shard_index=shard_index,
+                shard_count=shard_count,
+                workspace_id=workspace_id,
+                doc_id=doc_id,
+                doc_type=canonical_doc_type,
+                attempt=1,
+                artifact_uri=payload_uri,
+                metadata=meta,
+            )
+            events.append(event)
+            event_rows.append(
+                (
+                    run_id,
+                    workspace_id,
+                    doc_id,
+                    shard_index,
+                    shard_count,
+                    event.model_dump_json(),
+                )
+            )
+
+    for run_id, workspace_id, doc_id, shard_index, shard_count, event_json_str in event_rows:
         try:
             await db.execute(
                 f"""
@@ -919,19 +943,20 @@ async def sweep_orphaned_kg_embedding_documents(
                      status, attempt, started_at, updated_at,
                      error_json, artifacts_json, event_json)
                 VALUES
-                    ($1, 'kg_embedding', 0, 1,
+                    ($1, 'kg_embedding', $4, $5,
                      $2, $3,
                      'pending', 1, NOW(), NOW(),
                      '{{}}'::jsonb,
                      '[]'::jsonb,
-                     $4::jsonb)
+                     $6::jsonb)
                 ON CONFLICT (run_id, stage, shard_index) DO UPDATE
                     SET status = 'pending',
                         updated_at = NOW(),
                         attempt = EXCLUDED.attempt,
+                        shard_count = EXCLUDED.shard_count,
                         event_json = EXCLUDED.event_json
                 """,
-                [run_id, workspace_id, doc_id, event_json_str],
+                [run_id, workspace_id, doc_id, shard_index, shard_count, event_json_str],
             )
         except Exception as exc:
             logger.error("Sweeper: failed to insert/update pending kg_embedding record for %s: %s", run_id, exc)

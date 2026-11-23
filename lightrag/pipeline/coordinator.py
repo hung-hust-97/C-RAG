@@ -2619,6 +2619,44 @@ class PostgresPipelineCoordinator(PipelineCoordinator):
                             or age_seconds < running_stale_seconds
                         ):
                             return ClaimResult(ClaimStatus.ALREADY_RUNNING)
+                        # A run that keeps going stale is usually killed mid-stage
+                        # (e.g. OOM). Reclaiming it forever crash-loops the worker.
+                        recorded_attempt = int(row["attempt"])
+                        max_attempts = max_stage_retry_attempts()
+                        if recorded_attempt >= max_attempts:
+                            message = (
+                                f"stale running stage abandoned after attempt={recorded_attempt} "
+                                f"(max {max_attempts}); worker likely crashed while processing it"
+                            )
+                            await conn.execute(
+                                f"""
+                                UPDATE {self.table_name}
+                                SET status='failed',
+                                    error_json=$4::jsonb,
+                                    updated_at=NOW()
+                                WHERE run_id=$1 AND stage=$2 AND shard_index=$3
+                                """,
+                                event.run_id,
+                                event.stage_name.value,
+                                event.shard_index,
+                                json.dumps(
+                                    {
+                                        "error_type": "StaleRunningRetryExhausted",
+                                        "message": message,
+                                    }
+                                ),
+                            )
+                            logger.error(
+                                "[Pipeline] Marking stale running stage failed run_id=%s stage=%s shard=%s attempt=%s/%s",
+                                event.run_id,
+                                event.stage_name.value,
+                                event.shard_index,
+                                recorded_attempt,
+                                max_attempts,
+                            )
+                            return ClaimResult(
+                                ClaimStatus.FAILED_ATTEMPT_RECORDED, message
+                            )
                         logger.warning(
                             "[Pipeline] Reclaiming stale running stage run_id=%s stage=%s shard=%s age_seconds=%.1f stale_seconds=%s",
                             event.run_id,

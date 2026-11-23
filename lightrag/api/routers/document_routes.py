@@ -5839,6 +5839,8 @@ def create_document_routes(
             _canonical_doc_type,
             _normalize_event_doc_type,
         )
+        from kafka_worker.partitioned_publish import workspace_partition
+        from lightrag.pipeline.models import StageName
 
         if not events:
             return 0, 0
@@ -5866,9 +5868,14 @@ def create_document_routes(
                         partition_count = len(partitions)
                         partition_counts[topic] = partition_count
 
-                    partition = await partition_allocator.allocate(
-                        topic, partition_count
-                    )
+                    if normalized_event.stage_name == StageName.KG_MERGE:
+                        partition = workspace_partition(
+                            normalized_event.workspace_id, partition_count
+                        )
+                    else:
+                        partition = await partition_allocator.allocate(
+                            topic, partition_count
+                        )
                     await producer.send_and_wait(
                         topic,
                         normalized_event.model_dump_json(by_alias=True).encode(

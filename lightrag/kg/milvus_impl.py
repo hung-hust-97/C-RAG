@@ -2230,14 +2230,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         col_groups: dict[str, list[dict[str, Any]]] = {}
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i]
-            
-            is_legal = False
-            if "doc_type" in d and d["doc_type"] == "legal":
+
+            doc_type_val = str(d.get("doc_type") or "").strip().lower()
+            if doc_type_val:
+                is_legal = doc_type_val == "legal"
+            elif d.get("legal_document_id") is not None:
                 is_legal = True
-            elif d.get("legal_status") is not None or d.get("legal_document_id") is not None:
+            elif (
+                d.get("legal_status") is not None
+                and str(d.get("legal_status")).strip().upper()
+                not in ("", "UNKNOWN")
+            ):
                 is_legal = True
             elif os.environ.get("PIPELINE_DOC_TYPE") == "legal":
                 is_legal = True
+            else:
+                is_legal = False
 
             if "workspace_id" not in d or not d["workspace_id"]:
                 d["workspace_id"] = self.workspace
@@ -2419,14 +2427,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         col_groups: dict[str, list[dict[str, Any]]] = {}
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i].tolist()
-            
-            is_legal = False
-            if "doc_type" in d and d["doc_type"] == "legal":
+
+            doc_type_val = str(d.get("doc_type") or "").strip().lower()
+            if doc_type_val:
+                is_legal = doc_type_val == "legal"
+            elif d.get("legal_document_id") is not None:
                 is_legal = True
-            elif d.get("legal_status") is not None or d.get("legal_document_id") is not None:
+            elif (
+                d.get("legal_status") is not None
+                and str(d.get("legal_status")).strip().upper()
+                not in ("", "UNKNOWN")
+            ):
                 is_legal = True
             elif os.environ.get("PIPELINE_DOC_TYPE") == "legal":
                 is_legal = True
+            else:
+                is_legal = False
 
             if "workspace_id" not in d or not d["workspace_id"]:
                 d["workspace_id"] = self.workspace
@@ -2543,6 +2559,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     try:
                         await asyncio.to_thread(self._connect_bulk_insert_alias, poll_alias)
                         
+                        state_obj = None
                         final_state_str = ""
                         while True:
                             try:
@@ -2579,17 +2596,28 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         else:
                             # Tắt cơ chế xoá file khi bulk-insert thất bại (User requested)
                             logger.info(f"Bulk insert incomplete or failed (state={final_state_str}). File retained in MinIO: {bucket_name}/{obj_key}")
+                        return "completed" in final_state_str or getattr(state_obj, "state", -1) == 6
                     finally:
                         try:
                             await asyncio.to_thread(connections.disconnect, poll_alias)
                         except Exception:
                             pass
                             
-                asyncio.create_task(
-                    _poll_and_cleanup(
-                        task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
+                wait_seconds = _get_env_int("MILVUS_BULK_INSERT_WAIT_SECONDS", 1800)
+                try:
+                    imported = await asyncio.wait_for(
+                        _poll_and_cleanup(
+                            task_id, session, endpoint_url, access_key, secret_key, bucket, object_key
+                        ),
+                        timeout=wait_seconds,
                     )
-                )
+                except asyncio.TimeoutError:
+                    imported = False
+                if not imported:
+                    raise RuntimeError(
+                        f"Milvus bulk insert task {task_id} into {col_name} did not complete "
+                        f"within {wait_seconds}s; falling back to gRPC upsert"
+                    )
             finally:
                 connections.disconnect(conn_alias)
                 

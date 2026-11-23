@@ -17,6 +17,8 @@ dataCoord:
   segment:
     maxSize: 1024
     sealProportion: 0.25
+    maxIdleTime: 300
+    maxLife: 1800
 
 dataNode:
   slot:
@@ -52,7 +54,7 @@ queryNode:
     vectorIndex: false
     scalarField: false
     scalarIndex: false
-    growingMmapEnabled: false
+    growingMmapEnabled: true
     mmapDirPath: /var/lib/milvus/mmap
   cache:
     warmup: async
@@ -107,4 +109,5 @@ log:
 mq:
   type: kafka
 kafka:
-  brokerList: 10.1.6.75:30210,10.1.6.200:30210,10.1.6.110:30210
+  # brokerList: 10.1.6.75:30210,10.1.6.200:30210,10.1.6.110:30210
+  brokerList: 10.1.6.127:30210,10.1.6.128:30210,10.1.6.129:30210

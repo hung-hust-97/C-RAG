@@ -145,7 +145,7 @@ services:
   milvus-datanode-1: &datanode-common
     image: milvusdb/milvus:v2.6.21
     container_name: crag-remote-datanode-1
-    restart: "on-failure:5"
+    restart: unless-stopped
     logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
     command: [ "milvus", "run", "datanode" ]
     environment: *milvus-env
@@ -153,8 +153,8 @@ services:
       - ../../data/volumes/milvus-dn1:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
-    mem_limit: 4g
-    cpus: 4
+    mem_limit: 16g
+    cpus: 16
     networks: [ milvus_net ]
 
   milvus-datanode-2:
@@ -188,7 +188,7 @@ services:
   milvus-streamingnode:
     image: milvusdb/milvus:v2.6.21
     container_name: crag-remote-streamingnode
-    restart: "on-failure:5"
+    restart: unless-stopped
     logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
     command: [ "milvus", "run", "streamingnode" ]
     environment: *milvus-env
@@ -196,7 +196,7 @@ services:
       - ../../data/volumes/milvus-sn:/var/lib/milvus
       - ./milvus-user.yaml:/milvus/configs/user.yaml
     depends_on: [ etcd1, etcd2, etcd3, milvus-mixcoord-1 ]
-    mem_limit: 4g
+    mem_limit: 16g
     networks: [ milvus_net ]
 
   attu:

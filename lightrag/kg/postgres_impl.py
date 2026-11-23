@@ -1260,10 +1260,11 @@ class PGKVStorage(BaseKVStorage):
             if is_legal:
                 upsert_sql = """
                     INSERT INTO tbl_lightrag_document_chunk 
-                    (legal_document_id, id, tokens, order_index, content, create_time, update_time)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (legal_document_id, id, tokens, order_index, content, parent_section, create_time, update_time)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (id) DO UPDATE SET 
                         content = EXCLUDED.content,
+                        parent_section = COALESCE(EXCLUDED.parent_section, tbl_lightrag_document_chunk.parent_section),
                         update_time = EXCLUDED.update_time,
                         tokens = EXCLUDED.tokens,
                         order_index = EXCLUDED.order_index
@@ -1274,8 +1275,14 @@ class PGKVStorage(BaseKVStorage):
             # Get current UTC time and convert to naive datetime for database storage
             current_time = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
             for k, v in data.items():
+                raw_parent_section = v.get("parent_section")
+                parent_section = (
+                    str(raw_parent_section).strip() or None
+                    if raw_parent_section is not None
+                    else None
+                )
                 if is_legal:
-                    # Tuple order: (document_id (int), id (uuid), tokens, order_index, content, create_time, update_time)
+                    # Tuple order: (legal_document_id (int), id (uuid), tokens, order_index, content, parent_section, create_time, update_time)
                     batch_values.append(
                         (
                             int(v["legal_document_id"]),
@@ -1283,12 +1290,13 @@ class PGKVStorage(BaseKVStorage):
                             v["tokens"],
                             v["chunk_order_index"],
                             v["content"],
+                            parent_section,
                             current_time,
                             current_time,
                         )
                     )
                 else:
-                    # Tuple order: (document_id (uuid), id (uuid), tokens, order_index, content, create_time, update_time)
+                    # Tuple order: (document_id (uuid), id (uuid), tokens, order_index, content, parent_section, create_time, update_time)
                     batch_values.append(
                         (
                             to_uuid(v["full_doc_id"]),
@@ -1296,6 +1304,7 @@ class PGKVStorage(BaseKVStorage):
                             v["tokens"],
                             v["chunk_order_index"],
                             v["content"],
+                            parent_section,
                             current_time,
                             current_time,
                         )
@@ -2922,6 +2931,7 @@ SQL_TEMPLATES = {
                             """,
     "get_by_id_text_chunks": """SELECT c.id, c.tokens, COALESCE(c.content, '') AS content,
                                 c.order_index AS chunk_order_index, 
+                                c.parent_section,
                                 COALESCE(c.document_id::text, c.legal_document_id::text) AS full_doc_id, 
                                 c.legal_document_id,
                                 ld.status::text AS legal_status,
@@ -2960,6 +2970,7 @@ SQL_TEMPLATES = {
                              """,
     "get_by_ids_text_chunks": """SELECT c.id, c.tokens, COALESCE(c.content, '') AS content,
                                  c.order_index AS chunk_order_index, 
+                                 c.parent_section,
                                  COALESCE(c.document_id::text, c.legal_document_id::text) AS full_doc_id, 
                                  c.legal_document_id,
                                  ld.status::text AS legal_status,
@@ -2984,12 +2995,13 @@ SQL_TEMPLATES = {
                                    WHERE e.workspace_id=$1 AND e.name = ANY($2)
                                    GROUP BY e.name
                                 """,
-    "upsert_text_chunk": """INSERT INTO tbl_lightrag_document_chunk (document_id, id, tokens, order_index, content, create_time, update_time)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+    "upsert_text_chunk": """INSERT INTO tbl_lightrag_document_chunk (document_id, id, tokens, order_index, content, parent_section, create_time, update_time)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                             ON CONFLICT (id) DO UPDATE SET
                             tokens = EXCLUDED.tokens,
                             order_index = EXCLUDED.order_index,
                             content = EXCLUDED.content,
+                            parent_section = COALESCE(EXCLUDED.parent_section, tbl_lightrag_document_chunk.parent_section),
                             update_time = EXCLUDED.update_time
                          """,
     "upsert_doc_full": """UPDATE tbl_document SET

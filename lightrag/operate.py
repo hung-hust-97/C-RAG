@@ -321,6 +321,7 @@ def general_semantic_chunking_markdown(
             return
 
         # Build breadcrumb prefix
+        breadcrumb_path = ""
         breadcrumb_prefix = ""
         if breadcrumb:
             breadcrumb_path = " > ".join([h[1] for h in breadcrumb])
@@ -332,6 +333,7 @@ def general_semantic_chunking_markdown(
                 "tokens": len(tokenizer.encode(chunk_content)),
                 "content": chunk_content.strip(),
                 "chunk_order_index": chunk_index,
+                "parent_section": breadcrumb_path or None,
                 "context": {
                     "breadcrumb": [h[1] for h in breadcrumb],
                 },

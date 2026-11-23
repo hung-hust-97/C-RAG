@@ -1,4 +1,7 @@
 from lightrag.legal_document.chunking import (
+    build_html_structure_index,
+    build_parent_section,
+    extract_html_structure_marker,
     legal_chunking_html,
     legal_chunking_markdown,
 )
@@ -41,10 +44,13 @@ __all__ = [
     "ExtractionMode",
     "append_legal_hierarchy_results",
     "best_legal_status_metadata",
+    "build_html_structure_index",
+    "build_parent_section",
     "build_structured_legal_continue_prompt",
     "build_structured_legal_extraction_prompts",
     "classify_chunk_extraction_mode",
     "classify_extraction_mode",
+    "extract_html_structure_marker",
     "extract_legal_entities",
     "extract_legal_cross_chunk_relations",
     "extract_legal_rule_entities",

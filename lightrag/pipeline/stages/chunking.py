@@ -8,6 +8,7 @@ from functools import partial
 from typing import Any
 
 from lightrag.base import DocStatus
+from lightrag.legal_document.chunking import looks_like_html
 from lightrag.operate import select_chunking_function
 from lightrag.utils import compute_mdhash_id, logger
 
@@ -265,9 +266,15 @@ async def _load_content(event: PipelineStageEvent, context: Any, rag: Any) -> st
     return await _read_s3_text(object_key)
 
 
-def _select_chunking_func(event: PipelineStageEvent, rag: Any, file_path: str):
+def _select_chunking_func(
+    event: PipelineStageEvent, rag: Any, file_path: str, content: str = ""
+):
     doc_type = event.metadata.get("doc_type", "general")
     doc_extension = os.path.splitext(file_path or "")[1].lower().lstrip(".")
+    # Legal content is read from legal_docs/.../<id>.html but file_path is the
+    # document title (no extension), so detect HTML from the content itself.
+    if doc_type == "legal" and looks_like_html(content):
+        doc_extension = "html"
     return select_chunking_function(doc_type, doc_extension)
 
 
@@ -413,7 +420,7 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
                     e,
                 )
 
-    chunking_func = _select_chunking_func(event, rag, file_path)
+    chunking_func = _select_chunking_func(event, rag, file_path, content)
     chunking_result = await _run_chunking_func(
         chunking_func,
         rag,
@@ -427,22 +434,56 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
         )
 
     chunks: dict[str, dict[str, Any]] = {}
+    from lightrag.legal_document.chunking import build_parent_section
     from lightrag.legal_document.status import normalize_legal_document_status
+
+    def _resolve_parent_section(chunk_data: dict[str, Any]) -> str | None:
+        direct = chunk_data.get("parent_section")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        ctx = chunk_data.get("context")
+        if isinstance(ctx, dict):
+            ctx_ps = ctx.get("parent_section")
+            if isinstance(ctx_ps, str) and ctx_ps.strip():
+                return ctx_ps.strip()
+            built = build_parent_section(
+                part=str(ctx.get("part") or ""),
+                chapter=str(ctx.get("chapter") or ""),
+                section=str(ctx.get("section") or ""),
+                article=str(ctx.get("article") or ""),
+            )
+            if built:
+                return built
+            breadcrumb = ctx.get("breadcrumb")
+            if isinstance(breadcrumb, list) and breadcrumb:
+                joined = " > ".join(str(b).strip() for b in breadcrumb if str(b).strip())
+                if joined:
+                    return joined
+        return None
 
     for index, chunk in enumerate(chunking_result):
         if "chunk_order_index" not in chunk:
             chunk["chunk_order_index"] = index
         chunk_id = _compute_chunk_id(chunk["content"], event)
+        parent_section = _resolve_parent_section(chunk)
 
-        chunk_status = (
-            chunk.get("clause_status")
-            or extra_kwargs.get("legal_status_code")
-            or extra_kwargs.get("legal_status")
-            or "UNKNOWN"
-        )
-        if chunk_status and isinstance(chunk_status, str):
-            norm = normalize_legal_document_status(chunk_status)
-            chunk_status = norm.get("legal_status_code") or chunk_status
+        is_legal_doc = str(doc_type).strip().lower() == "legal"
+        if is_legal_doc:
+            chunk_status = (
+                chunk.get("clause_status")
+                or extra_kwargs.get("legal_status_code")
+                or extra_kwargs.get("legal_status")
+                or "UNKNOWN"
+            )
+            if chunk_status and isinstance(chunk_status, str):
+                norm = normalize_legal_document_status(chunk_status)
+                chunk_status = norm.get("legal_status_code") or chunk_status
+            legal_status_val = extra_kwargs.get("legal_status") or chunk_status
+            legal_status_code_val = chunk_status
+        else:
+            chunk_status = None
+            legal_status_val = None
+            legal_status_code_val = None
 
         chunk_eff_from = chunk.get("effective_from") or extra_kwargs.get("effective_from", 0)
         chunk_eff_to = chunk.get("effective_to") or extra_kwargs.get("effective_to", 0)
@@ -452,12 +493,13 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
             "full_doc_id": event.doc_id,
             "file_path": file_path,
             "doc_type": doc_type,
+            "parent_section": parent_section,
             "llm_cache_list": [],
             "legal_document_id": legal_document_id,
             "document_type": chunk.get("document_type") or extra_kwargs.get("document_type") or "",
             "status": chunk_status,
-            "legal_status_code": chunk_status,
-            "legal_status": extra_kwargs.get("legal_status") or chunk_status,
+            "legal_status_code": legal_status_code_val,
+            "legal_status": legal_status_val,
             "effective_from": _to_unix_timestamp(chunk_eff_from),
             "effective_to": _to_unix_timestamp(chunk_eff_to),
             "effective_date": str(extra_kwargs.get("effective_date") or ""),

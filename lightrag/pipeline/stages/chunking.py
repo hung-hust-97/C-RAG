@@ -12,6 +12,7 @@ from lightrag.legal_document.chunking import looks_like_html
 from lightrag.operate import select_chunking_function
 from lightrag.utils import compute_mdhash_id, logger
 
+from lightrag.pipeline.legal_kg import legal_kg_enabled
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 from lightrag.pipeline.s3_throttle import read_body
 
@@ -581,31 +582,33 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
             )
         )
 
-    shard_size = _env_int("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", 32)
-    legal_single_shard = False
-    if legal_single_shard or event.debug_sync or context.debug_sync:
-        shard_size = len(chunk_ids)
-    shard_size = max(1, shard_size)
-    shard_count = (len(chunk_ids) + shard_size - 1) // shard_size
+    shard_count = 0
+    if legal_kg_enabled(event):
+        shard_size = _env_int("PIPELINE_EXTRACT_CHUNK_SHARD_SIZE", 32)
+        legal_single_shard = False
+        if legal_single_shard or event.debug_sync or context.debug_sync:
+            shard_size = len(chunk_ids)
+        shard_size = max(1, shard_size)
+        shard_count = (len(chunk_ids) + shard_size - 1) // shard_size
 
-    for shard_index in range(shard_count):
-        start = shard_index * shard_size
-        end = start + shard_size
-        shard_chunk_ids = chunk_ids[start:end]
-        next_events.append(
-            event.next_event(
-                StageName.ENTITY_EXTRACTION,
-                artifact_uri=chunks_artifact.uri,
-                shard_index=shard_index,
-                shard_count=shard_count,
-                counts={"chunks": len(shard_chunk_ids)},
-                metadata={
-                    "chunks_artifact_uri": chunks_artifact.uri,
-                    "chunk_ids": shard_chunk_ids,
-                    "legal_single_shard": legal_single_shard,
-                },
+        for shard_index in range(shard_count):
+            start = shard_index * shard_size
+            end = start + shard_size
+            shard_chunk_ids = chunk_ids[start:end]
+            next_events.append(
+                event.next_event(
+                    StageName.ENTITY_EXTRACTION,
+                    artifact_uri=chunks_artifact.uri,
+                    shard_index=shard_index,
+                    shard_count=shard_count,
+                    counts={"chunks": len(shard_chunk_ids)},
+                    metadata={
+                        "chunks_artifact_uri": chunks_artifact.uri,
+                        "chunk_ids": shard_chunk_ids,
+                        "legal_single_shard": legal_single_shard,
+                    },
+                )
             )
-        )
 
     logger.info(
         "[Pipeline] Chunking produced %s chunks for doc_id=%s doc_type=%s chunk_embedding_shards=%s extraction_shards=%s",

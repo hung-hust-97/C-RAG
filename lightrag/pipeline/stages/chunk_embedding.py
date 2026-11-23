@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any
 
+from lightrag.pipeline.legal_kg import legal_kg_enabled
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 from lightrag.utils import logger
 
@@ -154,6 +155,10 @@ async def run_chunk_embedding_stage(
     return StageResult(
         counts={"chunks": len(chunks)},
         finalize_event=finalize_event,
-        finalize_after_stages=[StageName.CHUNK_EMBEDDING, StageName.KG_EMBEDDING],
+        finalize_after_stages=(
+            [StageName.CHUNK_EMBEDDING, StageName.KG_EMBEDDING]
+            if legal_kg_enabled(event)
+            else [StageName.CHUNK_EMBEDDING]
+        ),
         message=f"embedded {len(chunks)} chunks",
     )

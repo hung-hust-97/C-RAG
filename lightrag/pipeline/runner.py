@@ -565,6 +565,20 @@ class StageRunner:
             error_type=type(exc).__name__,
             traceback=traceback.format_exc() if not isinstance(exc, FileNotFoundError) else "",
         )
+        if isinstance(exc, FileNotFoundError) and event.stage_name != StageName.FINALIZE:
+            try:
+                finalized = await self.context.coordinator.are_stages_complete(
+                    event.run_id, [StageName.FINALIZE]
+                )
+            except Exception:
+                finalized = False
+            if finalized:
+                logger.warning(
+                    "[Pipeline] Ignoring late redelivery after finalize (artifact already cleaned) %s",
+                    event.log_context(),
+                )
+                await self.context.coordinator.fail(event, pipeline_error)
+                return StageRunOutcome(event, "failed", [], str(exc))
         await self.context.coordinator.fail(event, pipeline_error)
         await self._mark_document_failed(event, pipeline_error)
 

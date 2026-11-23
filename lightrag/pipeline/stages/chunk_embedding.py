@@ -57,6 +57,7 @@ def _is_transient_vector_upsert_error(exc: BaseException) -> bool:
             "memory quota",
             "force deny",
             "message size too large",
+            "fail connecting to server",
         )
     )
 

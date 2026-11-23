@@ -132,6 +132,46 @@ def _compute_chunk_id(content: str, event: PipelineStageEvent) -> str:
     return compute_mdhash_id(content, prefix="chunk-", workspace=workspace)
 
 
+async def _detach_stale_legal_chunks(
+    rag: Any, legal_document_id: int, keep_chunk_ids: list[str]
+) -> int:
+    """Detach chunks of a legal document that a re-chunk no longer produces.
+
+    Chunk ids are content hashes, so re-chunking a document with different content
+    leaves the previous chunks behind. Their Milvus vectors are deleted so search stops
+    returning them, but the tbl_lightrag_document_chunk rows are kept with
+    legal_document_id = NULL: KMS joins on legal_document_id (so they drop out of
+    search) while tbl_chunk_entity / tbl_chunk_relation links survive. Deleting the rows
+    would let KMS deleteOrphanedEntities wipe the workspace KG on the next delete.
+    Milvus ids are ``chunk-<uuid>`` and the table stores the same uuid.
+    """
+    db = getattr(rag.text_chunks, "db", None)
+    if db is None:
+        return 0
+    rows = await db.query(
+        "SELECT id FROM tbl_lightrag_document_chunk WHERE legal_document_id = $1",
+        [int(legal_document_id)],
+        multirows=True,
+    )
+    keep = {chunk_id.removeprefix("chunk-") for chunk_id in keep_chunk_ids}
+    stale_ids = [str(row["id"]) for row in rows or [] if str(row["id"]) not in keep]
+    if not stale_ids:
+        return 0
+    await db.execute(
+        "UPDATE tbl_lightrag_document_chunk SET legal_document_id = NULL, update_time = NOW() "
+        "WHERE legal_document_id = $1 AND id = ANY($2::uuid[])",
+        [int(legal_document_id), stale_ids],
+    )
+    await rag.chunks_vdb.delete([f"chunk-{chunk_id}" for chunk_id in stale_ids])
+    logger.info(
+        "[Pipeline] Detached stale legal chunks legal_document_id=%s stale=%s kept=%s",
+        legal_document_id,
+        len(stale_ids),
+        len(keep),
+    )
+    return len(stale_ids)
+
+
 async def _read_s3_text(object_key: str) -> str:
     import aioboto3
     from botocore.exceptions import ClientError
@@ -313,7 +353,9 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
     rag = await get_rag_for_event(context, event, profile=event.stage)
     status_doc = await rag.doc_status.get_by_id(event.doc_id)
     current_status = _status_get(status_doc, "status")
-    if _is_terminal_success_status(current_status):
+    if _is_terminal_success_status(current_status) and not event.metadata.get(
+        "force_rechunk"
+    ):
         logger.warning(
             "[Pipeline] Skipping chunking for terminal document doc_id=%s workspace_id=%s status=%s run_id=%s",
             event.doc_id,
@@ -513,6 +555,12 @@ async def run_chunking_stage(event: PipelineStageEvent, context: Any) -> StageRe
 
     chunk_ids = list(chunks.keys())
     await rag.text_chunks.upsert(chunks)
+    if (
+        str(doc_type).strip().lower() == "legal"
+        and legal_document_id
+        and event.generation_id is None
+    ):
+        await _detach_stale_legal_chunks(rag, legal_document_id, chunk_ids)
     metadata = {}
     if status_doc is not None:
         metadata = _status_get(status_doc, "metadata", {})

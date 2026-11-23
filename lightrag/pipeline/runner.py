@@ -668,6 +668,10 @@ class StageRunner:
     async def _document_already_terminal(self, event: PipelineStageEvent) -> bool:
         if event.stage_name == StageName.FINALIZE or not event.doc_id:
             return False
+        # A deliberate re-chunk of a processed document (scripts/rechunk_legal_documents.py)
+        # runs under a fresh run_id; chunking resets doc status, so only that stage needs this.
+        if event.stage_name == StageName.CHUNKING and event.metadata.get("force_rechunk"):
+            return False
 
         try:
             if await self.context.coordinator.are_stages_complete(

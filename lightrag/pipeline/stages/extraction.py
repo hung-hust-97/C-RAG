@@ -1,7 +1,19 @@
+import asyncio
 import hashlib
+import os
 import traceback
 from datetime import datetime, timezone
 from typing import Any
+
+import fitz
+
+try:
+    import pymupdf4llm
+
+    if hasattr(pymupdf4llm, "use_layout"):
+        pymupdf4llm.use_layout(False)
+except ImportError:
+    pymupdf4llm = None
 
 from lightrag.pipeline.models import PipelineStageEvent, StageName, StageResult
 from lightrag.pipeline.stages.common import (
@@ -91,14 +103,7 @@ async def _run_general_extraction_stage(
     try:
         # Step 2: OCR / Extract
         if document_name.lower().endswith(".pdf"):
-            content = await _extract_pdf_content_by_batches(
-                file_bytes,
-                document_name,
-                pages_per_batch=5,
-                dpi=130,
-                jpeg_quality=30,
-                max_page_width_px=1400,
-            )
+            content = await _extract_pdf_content(file_bytes, document_name)
         else:
             content, _ = await extract_content(file_bytes, document_name)
     except Exception as e:
@@ -199,14 +204,7 @@ async def _run_legal_extraction_stage(
 
     try:
         if pdf_name.lower().endswith(".pdf"):
-            markdown_content = await _extract_pdf_content_by_batches(
-                file_bytes,
-                pdf_name,
-                pages_per_batch=5,
-                dpi=130,
-                jpeg_quality=30,
-                max_page_width_px=1400,
-            )
+            markdown_content = await _extract_pdf_content(file_bytes, pdf_name)
         else:
             markdown_content, _ = await extract_content(file_bytes, pdf_name)
     except Exception as e:
@@ -276,6 +274,99 @@ async def _run_legal_extraction_stage(
     return StageResult(
         next_events=next_events,
         message="Legal extraction completed successfully; reported EXTRACTED to KMS",
+    )
+
+
+_TEXT_LAYER_MIN_PAGE_CHARS = 100
+_TEXT_LAYER_MIN_PAGE_SHARE = 0.9
+# Characters that legacy Vietnamese font encodings (TCVN3/VNI) leave in a text layer.
+_LEGACY_FONT_MARKERS = set("¸µ¶·¹¨®©ª«¬¯°±²³´½¾¿ÆÇÐÑØÞßæçðñøþ")
+
+
+def _text_layer_is_usable(page_texts: list[str]) -> tuple[bool, str]:
+    """Return (usable, reason) for a PDF text layer."""
+    if not page_texts:
+        return False, "no pages"
+    pages_with_text = sum(
+        1 for t in page_texts if len(t.strip()) >= _TEXT_LAYER_MIN_PAGE_CHARS
+    )
+    if pages_with_text < _TEXT_LAYER_MIN_PAGE_SHARE * len(page_texts):
+        return False, f"only {pages_with_text}/{len(page_texts)} pages have text"
+    full = "".join(page_texts)
+    letters = sum(1 for ch in full if ch.isalpha()) or 1
+    legacy = sum(1 for ch in full if ch in _LEGACY_FONT_MARKERS)
+    if legacy / letters > 0.01:
+        return False, f"legacy font encoding suspected ({legacy} marker chars)"
+    broken = sum(1 for ch in full if ch == "\ufffd" or "\ue000" <= ch <= "\uf8ff")
+    if broken / max(len(full), 1) > 0.005:
+        return False, f"unmapped glyphs ({broken})"
+    return True, f"{pages_with_text}/{len(page_texts)} pages have text"
+
+
+def _extract_pdf_text_layer(file_bytes: bytes, pdf_name: str) -> str | None:
+    """Markdown from the PDF's own text layer, or None when OCR is needed."""
+    with fitz.open("pdf", file_bytes) as doc:
+        page_texts = [page.get_text("text") for page in doc]
+        usable, reason = _text_layer_is_usable(page_texts)
+        if not usable:
+            logger.info(
+                "[Extract Stage] PDF text layer not usable for %s: %s",
+                pdf_name,
+                reason,
+            )
+            return None
+        markdown = ""
+        if pymupdf4llm is not None:
+            try:
+                markdown = pymupdf4llm.to_markdown(doc)
+            except Exception as exc:
+                logger.warning(
+                    "[Extract Stage] pymupdf4llm failed for %s, using plain text: %s",
+                    pdf_name,
+                    exc,
+                )
+                markdown = ""
+        content = (
+            markdown
+            if markdown and markdown.strip()
+            else "\n\n".join(t.strip() for t in page_texts)
+        )
+        logger.info(
+            "[Extract Stage] Using PDF text layer for %s: %s, chars=%s",
+            pdf_name,
+            reason,
+            len(content),
+        )
+        return content
+
+
+async def _extract_pdf_content(file_bytes: bytes, pdf_name: str) -> str:
+    if os.getenv("PIPELINE_PDF_TEXT_LAYER", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        try:
+            content = await asyncio.to_thread(
+                _extract_pdf_text_layer, file_bytes, pdf_name
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Extract Stage] PDF text layer check failed for %s: %s",
+                pdf_name,
+                exc,
+            )
+            content = None
+        if content and content.strip():
+            return content
+    return await _extract_pdf_content_by_batches(
+        file_bytes,
+        pdf_name,
+        pages_per_batch=5,
+        dpi=200,
+        jpeg_quality=75,
+        max_page_width_px=1400,
     )
 
 

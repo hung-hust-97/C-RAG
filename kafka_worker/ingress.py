@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+import time
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from kafka_worker.config import (
     KAFKA_BOOTSTRAP_SERVERS,
@@ -163,19 +164,24 @@ class IngressAdapter:
             logger.error(f"Missing doc_id for event: {kms_event}")
             return
             
-        # Check if already terminal to prevent rolling back completed/failed docs
         is_legal = (doc_type == "legal")
-        if await is_terminal_status(doc_id, kms_event.workspace_id, is_legal):
+        terminal = await is_terminal_status(doc_id, kms_event.workspace_id, is_legal)
+        force_rechunk = bool(kms_event.force_rechunk) and is_legal and stage_name == StageName.CHUNKING
+        if terminal and not force_rechunk:
             logger.info(f"Skipping event for {doc_id} as it is already terminal")
             return
-            
+        # A changed document that C-RAG already finished needs a fresh run: run_id == doc_id would hit the
+        # completed stage rows; scripts/rechunk_legal_documents.py uses the same convention.
+        run_id = f"{doc_id}-rechunk-{int(time.time())}" if terminal else doc_id
+
         logger.info(f"Ingress mapping: {topic} -> {out_topic} (doc_id={doc_id})")
-        
+
         metadata = kms_event.model_dump(by_alias=False)
         metadata["doc_type"] = doc_type
+        metadata["force_rechunk"] = bool(terminal and force_rechunk)
         # Create pipeline event
         pipeline_event = PipelineStageEvent(
-            run_id=doc_id,
+            run_id=run_id,
             workspace_id=kms_event.workspace_id,
             doc_id=doc_id,
             doc_type=doc_type,

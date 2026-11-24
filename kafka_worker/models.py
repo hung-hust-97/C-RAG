@@ -19,3 +19,4 @@ class KmsEvent(BaseModel):
     content_hash: str | None = Field(alias="contentHash", default=None)
     content_length: int | None = Field(alias="contentLength", default=None)
     content_summary: str | None = Field(alias="contentSummary", default=None)
+    force_rechunk: bool = Field(alias="forceRechunk", default=False)

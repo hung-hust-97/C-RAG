@@ -61,6 +61,7 @@ services:
     logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
     command: [ "milvus", "run", "mixcoord" ]
     environment: &milvus-env
+      OPENBLAS_NUM_THREADS: "1"
       ETCD_ENDPOINTS: etcd1:2379,etcd2:2379,etcd3:2379
       MINIO_ADDRESS: 10.1.6.134:19000
       MINIO_ACCESS_KEY_ID: minioadmin
@@ -114,7 +115,7 @@ services:
   milvus-querynode-1: &querynode-common
     image: milvusdb/milvus:v2.6.21
     container_name: crag-remote-querynode-1
-    restart: "on-failure:5"
+    restart: unless-stopped
     logging: { driver: "json-file", options: { max-size: "50m", max-file: "3" } }
     command: [ "milvus", "run", "querynode" ]
     environment: *milvus-env

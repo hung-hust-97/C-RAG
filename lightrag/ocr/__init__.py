@@ -7,7 +7,7 @@ It includes:
 
 - OCRConfig: Configuration dataclass for OCR settings
 - DeepSeekOCRExtractor: Client for DeepSeek OCR API
-- MinerUOCRExtractor: Client for MinerU /file_parse API
+- MinerUOCRExtractor: Async client for MinerU v4 /v1/tasks API
 - OCREngineSelector: Intelligent OCR engine selection
 - MarkdownPreprocessor: Markdown preprocessing for entity extraction
 - Custom exceptions for OCR error handling
@@ -234,13 +234,10 @@ async def _extract_with_mineru(
     extractor = MinerUOCRExtractor(
         api_url=config.mineru_api_url,
         timeout=config.timeout,
-        backend=config.mineru_backend,
-        lang_list=config.mineru_lang_list,
-        parse_method=config.mineru_parse_method,
-        return_middle_json=config.mineru_return_middle_json,
-        return_images=config.mineru_return_images,
-        formula_enable=config.mineru_formula_enable,
-        table_enable=config.mineru_table_enable,
+        tier=config.mineru_tier,
+        ocr_mode=config.mineru_ocr_mode,
+        api_key=config.mineru_api_key,
+        poll_interval=config.mineru_poll_interval,
     )
 
     try:

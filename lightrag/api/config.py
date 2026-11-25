@@ -127,6 +127,36 @@ def _validate_ocr_config(args: argparse.Namespace) -> None:
                 f"MinerU OCR functionality may not work correctly."
             )
 
+    valid_mineru_tiers = {"", "flash", "basic", "standard", "advanced"}
+    mineru_tier = (getattr(args, "mineru_tier", "standard") or "").strip().lower()
+    if mineru_tier not in valid_mineru_tiers:
+        logging.warning(
+            f"Invalid MINERU_TIER value '{args.mineru_tier}'. "
+            "Must be one of: flash, basic, standard, advanced, or empty. "
+            "Defaulting to 'standard'."
+        )
+        args.mineru_tier = "standard"
+    else:
+        args.mineru_tier = mineru_tier
+
+    valid_mineru_ocr_modes = {"auto", "txt", "ocr"}
+    mineru_ocr_mode = (getattr(args, "mineru_ocr_mode", "auto") or "auto").strip().lower()
+    if mineru_ocr_mode not in valid_mineru_ocr_modes:
+        logging.warning(
+            f"Invalid MINERU_OCR_MODE value '{args.mineru_ocr_mode}'. "
+            "Must be one of: auto, txt, ocr. Defaulting to 'auto'."
+        )
+        args.mineru_ocr_mode = "auto"
+    else:
+        args.mineru_ocr_mode = mineru_ocr_mode
+
+    if getattr(args, "mineru_poll_interval", 2.0) <= 0:
+        logging.warning(
+            f"Invalid MINERU_POLL_INTERVAL value '{args.mineru_poll_interval}'. "
+            "Defaulting to 2.0 seconds."
+        )
+        args.mineru_poll_interval = 2.0
+
     # Validate timeout is positive integer
     if args.deepseek_ocr_timeout <= 0:
         logging.warning(
@@ -527,11 +557,17 @@ def parse_args() -> argparse.Namespace:
         "DEEPSEEK_API_URL", "http://10.1.6.52:8006/ocr/pdf"
     )
     args.mineru_api_url = get_env_value(
-        "MINERU_API_URL", "http://10.1.6.52:8009/file_parse"
+        "MINERU_API_URL", "http://10.1.6.4:8000"
     )
+    args.mineru_api_key = get_env_value("MINERU_API_KEY", "") or None
+    args.mineru_tier = get_env_value("MINERU_TIER", "standard")
+    args.mineru_parse_method = get_env_value("MINERU_PARSE_METHOD", "auto")
+    args.mineru_ocr_mode = get_env_value(
+        "MINERU_OCR_MODE", args.mineru_parse_method
+    )
+    args.mineru_poll_interval = get_env_value("MINERU_POLL_INTERVAL", 2.0, float)
     args.mineru_backend = get_env_value("MINERU_BACKEND", "vlm-auto-engine")
     args.mineru_lang_list = get_env_value("MINERU_LANG_LIST", "en,vn")
-    args.mineru_parse_method = get_env_value("MINERU_PARSE_METHOD", "auto")
     args.mineru_return_middle_json = get_env_value(
         "MINERU_RETURN_MIDDLE_JSON", False, bool
     )

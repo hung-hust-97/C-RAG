@@ -38,6 +38,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline_sweeper")
 
+
+_KG_STAGES_SQL = "('entity_extraction', 'kg_merge', 'kg_embedding')"
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def _legal_kg_disabled() -> bool:
+    return os.getenv("PIPELINE_LEGAL_KG_ENABLED", "true").strip().lower() in _FALSE_VALUES
+
+
+def _skip_legal_kg_sql(alias: str = "") -> str:
+    """SQL fragment excluding legal KG stage rows while legal KG is disabled."""
+    if not _legal_kg_disabled():
+        return ""
+    prefix = f"{alias}." if alias else ""
+    return (
+        f" AND NOT ({prefix}stage IN {_KG_STAGES_SQL}"
+        f" AND COALESCE({prefix}event_json->>'doc_type', {prefix}event_json->'metadata'->>'doc_type', '') = 'legal')"
+    )
+
 # Documents stuck longer than this threshold are eligible for recovery
 STUCK_THRESHOLD_SECONDS = int(
     os.getenv(
@@ -438,7 +457,7 @@ async def sweep_stale_running(table_name: str = "lightrag_pipeline_stage_runs") 
                attempt, event_json,
                EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) AS age_seconds
         FROM {table_name}
-        WHERE status = 'running'
+        WHERE status = 'running'{_skip_legal_kg_sql()}
           AND EXTRACT(EPOCH FROM (NOW() - COALESCE(updated_at, started_at, NOW()))) >
               CASE
                   WHEN stage = 'chunk_embedding' THEN $4::double precision
@@ -561,6 +580,7 @@ async def sweep_failed_stage_records(
                   error_json::text LIKE '%Artifact not found%'
                   OR error_json->>'error_type' = 'FileNotFoundError'
                   OR error_json::text LIKE '%received no chunks%'
+                  OR error_json->>'error_type' = 'LegalKgDisabled'
               )
             """,
             [max_attempts],
@@ -585,6 +605,7 @@ async def sweep_failed_stage_records(
                   OR error_json::text LIKE '%received no chunks%'
               )
           )
+          AND COALESCE(error_json->>'error_type', '') <> 'LegalKgDisabled'{_skip_legal_kg_sql()}
         ORDER BY COALESCE(updated_at, started_at, NOW()) ASC
         LIMIT $3::int
         """,
@@ -678,6 +699,7 @@ async def sweep_orphaned_documents(table_name: str = "lightrag_pipeline_stage_ru
                 )
           )
           AND EXTRACT(EPOCH FROM (NOW() - ee.oldest_update)) > $1::double precision
+          {"AND COALESCE(ee.doc_type, ee.meta_doc_type, '') <> 'legal'" if _legal_kg_disabled() else ""}
         LIMIT $3::int
         """,
         [STUCK_THRESHOLD_SECONDS, stuck_pending_seconds, batch_size],
@@ -841,7 +863,7 @@ async def sweep_orphaned_kg_embedding_documents(
                     OR (ke.status = 'pending' AND EXTRACT(EPOCH FROM (NOW() - COALESCE(ke.updated_at, ke.started_at, NOW()))) < $2::double precision)
                 )
           )
-          AND EXTRACT(EPOCH FROM (NOW() - km.updated_at)) > $1::double precision
+          AND EXTRACT(EPOCH FROM (NOW() - km.updated_at)) > $1::double precision{_skip_legal_kg_sql("km")}
         ORDER BY km.updated_at ASC
         LIMIT $3::int
         """,

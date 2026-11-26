@@ -359,34 +359,28 @@ def _enrich_chunks_with_partial_expiry(
     chunks: list[dict[str, Any]],
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    """Enrich chunks with partial expiry evaluation if metadata is available."""
-    partial_expiry_info = kwargs.get("partial_expiry_info")
-    if partial_expiry_info is None and kwargs.get("lien_quan_hieu_luc_tung_phan"):
-        from lightrag.legal_document.partial_expiry_parser import parse_partial_expiry_info
-        partial_expiry_info = parse_partial_expiry_info(
-            kwargs.get("lien_quan_hieu_luc_tung_phan"),
-            kwargs.get("relations"),
-        )
-
+    """Enrich chunks with document-level legal status and optional cross-reference metadata."""
     doc_status_code = kwargs.get("legal_status_code") or ""
     if not doc_status_code and kwargs.get("legal_status"):
         from lightrag.legal_document.status import normalize_legal_document_status
+
         doc_status_code = normalize_legal_document_status(
             kwargs.get("legal_status")
         ).get("legal_status_code", "")
 
-    if partial_expiry_info or doc_status_code:
-        from lightrag.legal_document.partial_expiry_parser import evaluate_chunk_partial_expiry
+    if doc_status_code:
+        clause_status = (
+            "VALID" if doc_status_code == "EXPIRED_PARTIALLY" else doc_status_code
+        )
+        is_expired = doc_status_code in {
+            "EXPIRED",
+            "EXPIRED_TOTALLY",
+            "CEASED_EFFECT",
+            "NO_LONGER_SUITABLE",
+        }
         for chunk in chunks:
-            is_expired, clause_status, expiry_warning = evaluate_chunk_partial_expiry(
-                chunk.get("context", {}),
-                partial_expiry_info,
-                doc_status_code=doc_status_code,
-            )
-            chunk["is_expired"] = is_expired
             chunk["clause_status"] = clause_status
-            if expiry_warning:
-                chunk["expiry_warning"] = expiry_warning
+            chunk["is_expired"] = is_expired
 
     # lien_quan_dan_chieu is document-level HTML kept in tbl_legal_document and can
     # reach several MB. Every chunk carries a copy, so only small values are kept,

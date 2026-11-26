@@ -2267,6 +2267,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 elif isinstance(chunk_status, str) and chunk_status.strip():
                     norm = normalize_legal_document_status(chunk_status)
                     chunk_status = norm.get("legal_status_code") or chunk_status
+                if chunk_status == "EXPIRED_PARTIALLY":
+                    chunk_status = "VALID"
                 d["status"] = chunk_status
                 d["effective_from"] = _to_unix_timestamp(
                     d.get("effective_from") or d.get("effective_date")
@@ -2464,6 +2466,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 elif isinstance(chunk_status, str) and chunk_status.strip():
                     norm = normalize_legal_document_status(chunk_status)
                     chunk_status = norm.get("legal_status_code") or chunk_status
+                if chunk_status == "EXPIRED_PARTIALLY":
+                    chunk_status = "VALID"
                 d["status"] = chunk_status
                 d["effective_from"] = _to_unix_timestamp(
                     d.get("effective_from") or d.get("effective_date")
